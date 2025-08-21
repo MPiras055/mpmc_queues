@@ -1,67 +1,70 @@
-In order to support clean integration of new queues that support both bounded and unbounded methods and fields (that will be used in the `UnboundedProxies`) we need to modify the interface architecture.
+# Queue Architecture for Bounded and Unbounded Segments
 
-A bounded queue exposes the following methods:
+## Overview
+
+In order to support the clean integration of new queues that support both bounded and unbounded methods and fields (which will be used in the `UnboundedProxy`), we need to modify the interface architecture.
+
+### Bounded Queue
+A **bounded queue** exposes the following methods:
+
 - `bool enqueue(T item)`
 - `bool dequeue(T& item)`
 - `size_t capacity() const`
 - `size_t size()`
 
-While the same unbounded queue uses bounded queues in a linked list (or other memoization structures) and has to expose (other to the above methods) the following:
+### Unbounded Queue
+An **unbounded queue** uses bounded queues in a linked list (or other memoization structures) and has to expose additional methods:
+
 - `bool isOpen()`
 - `bool isClosed()`
 - `bool close()`
 - `bool open()`
 
-> The open/close mechanic control whether a segment is closed to further insertions, so a new one has to be allocated and linked to the list
+> The `open/close` mechanism controls whether a segment is closed to further insertions. When a segment is closed, a new one must be allocated and linked to the list.
 
-All unbounded methods are only exposed to the specific `UnboundedProxy` that adds the logic to mantain the linked list, while calling internal `enqueue()/dequeue()` on the bounded segments. 
+### Unbounded Methods
+All unbounded methods (e.g., `open()`, `close()`, `isOpen()`, `isClosed()`) are only exposed to the specific **`UnboundedProxy`** that adds the logic to maintain the linked list, while internally calling the `enqueue()`/`dequeue()` methods on the bounded segments.
 
-Other than this we also want unbounded segments to support an additional field (`next*`) that is a pointer to the logical next queue in the linked list.
+Additionally, **unbounded segments** should support an extra field:
 
-We can achieve all this by using `concepts` to define bounded and unbounded segment behaviour, and use a wrapper calls to to encapsulate the `next*` field of an unbounded based segment
+- `next*`: A pointer to the next queue in the logical linked list.
 
-Instead still using interfaces we can do something like this:
+## Interface Architecture
+
+We will achieve this by using **concepts** to define the behavior of both bounded and unbounded segments and use wrapper calls to encapsulate the `next*` field of an unbounded-based segment.
+
+Instead of using traditional interfaces, we can use templates with the following structure:
 
 ```cpp
-
 /*
-IBoundedQueue<T> is interface support for virtual bounded and unbounded proxy methods
-IUnboundedSegment<T> is interface support for virtual private unbounded segmentmethods
+IBoundedQueue<T> is the interface for supporting virtual bounded and unbounded proxy methods.
+IUnboundedSegment<T> is the interface for supporting virtual private unbounded segment methods.
 */
 
-template <typename T>
+template <typename T, bool bounded = true>
 class concreteBoundedSegment: public IQueue<T> {
 public:
-    // bounded methods...
+    // Bounded-specific methods
 private:
-    // maybe some private members only for bounded
+    // Private members for bounded segments
+    
+    bool enqueue(T item) {
+	    if constexpr (!bounded) {
+		    //additional logic for unbounded segments
+		    //default disable in this concrete class
+	    }
+	    
+	    //rest of bounded method
+    
+    }
 };
 
-
-template <typename T, typename UProxy> //CRTP pattern
-class concreteUnboundedSegment : public IUnboundedSegment<T> public concreteBoundedSegment<T> {
+template <typename T, typename UProxy> // CRTP pattern
+class concreteUnboundedSegment : public IUnboundedSegment<T>, public concreteBoundedSegment<T, false> {
     friend class UProxy;  // UProxy can access unbounded private members
 private:
-    // unbounded methods (open, close, isOpen, isClosed, next)
+    // Unbounded-specific methods (open, close, isOpen, isClosed, next)
     // next pointer for linked list
+    
+    // doesn't have to override enqueue since the bounded parameter toggles the behaviour
 };
-
-```
-
-### Unbounded Proxy Example
-```cpp
-
-//Unbounded_Proxy.hpp
-template <typename T, template<typename, typename> class SegmentTemplate>
-class UnboundedProxy {
-public:
-    using Segment = SegmentTemplate<T, UnboundedProxy<T, SegmentTemplate>>;
-};
-
-//main.cpp
-int main(void) {
-	using MyProxy = UnboundedProxy<int, MySegment>;
-	MyProxy proxy;
-}
-
-```

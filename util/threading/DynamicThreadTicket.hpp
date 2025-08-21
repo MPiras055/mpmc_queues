@@ -216,7 +216,7 @@ private:
     static std::atomic<uint64_t> global_instance_counter_;
 };
 
-// Static initialization for the counter across all instances
+// Static initialization for the counter container across all instances
 template <uint64_t MaxInstances>
 thread_local std::array<uint64_t, MaxInstances> DynamicThreadTicket<MaxInstances>::id_cache_ = [] {
     std::array<uint64_t, MaxInstances> init{};
@@ -224,5 +224,6 @@ thread_local std::array<uint64_t, MaxInstances> DynamicThreadTicket<MaxInstances
     return init;
 }();
 
+//static initialization for the counter across all instances
 template<uint64_t MaxInstances>
 std::atomic<uint64_t> DynamicThreadTicket<MaxInstances>::global_instance_counter_{0};

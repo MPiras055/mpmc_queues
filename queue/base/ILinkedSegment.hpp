@@ -1,35 +1,51 @@
 #pragma once
-#include <type_traits>
+#include <IQueue.hpp>
 
-/**
- * Base interface that defines basic contracts for segments that will
- * be used inside linked queues. 
- * 
- * The interface is CRTP to ensure that linked lists can be constructed only
- * amongst segments of the same effective type
- */
+/// @brief Marker type used to detect whether a queue segment is linked.
+/// 
+/// Segments that inherit from `LinkedTag<T>` can be recognized at compile time
+/// as part of a linked-segment structure.
+template <typename T>
+struct LinkedTag {};
 
-template<typename T, typename Derived>
-class ILinkedSegment {
-    static_assert(std::is_pointer_v<T>, "IQueue<T> requires T to be a pointer type");
+/// @brief Helper trait to check whether a given type `T`
+///        is a linked segment (derives from `LinkedTag`).
+/// 
+/// This can be used in `static_assert` or `if constexpr` checks to conditionally
+/// enable logic for linked vs. non-linked queue segments.
+/// 
+/// @tparam T Candidate type to check.
+/// @retval true  if `T` is derived from `LinkedTag`.
+/// @retval false otherwise.
+template <typename T>
+constexpr bool is_linked_segment_v =
+    std::is_base_of_v<LinkedTag<typename T::value_type>, T>;
 
+
+// ==========================
+// Linked Segment Interface
+// ==========================
+
+/// @brief Interface for a queue segment that can be linked with others
+///        to form an unbounded queue structure.
+/// 
+/// Extends the base `IQueue` contract with next-pointer management,
+/// allowing multiple bounded segments to be chained together.
+/// 
+/// @tparam T       Value type stored in the queue (must satisfy `IQueue` contract).
+/// @tparam Derived The concrete linked segment type (CRTP pattern).
+template <typename T, typename Derived>
+class ILinkedSegment : public IQueue<T>, public LinkedTag<T> {
 public:
-    
-    virtual ~ILinkedSegment() = default;
+    /// @brief Retrieves the next segment in the chain.
+    /// 
+    /// @return Pointer to the next segment, or `nullptr` if this is the last segment.
+    virtual Derived* getNext() const = 0;
 
-    //close contract: closes the segment to further insertions
-    virtual void close() = 0;
-
-    //open contract: opens a closed segment
-    virtual void open() = 0;
-
-    //closed check contract: checks if a segment is closed
-    virtual bool isClosed() const = 0;
-
-    //open check contract
-    virtual bool isOpen() const = 0;
-
-    //next contract: returns the next logical linked segment
-    virtual Derived* next() const = 0;
-    
+    /// @brief Sets the next segment in the chain.
+    /// 
+    /// Typically called by a proxy or segment manager when extending the queue.
+    /// 
+    /// @param next Pointer to the segment that should follow this one.
+    virtual void setNext(Derived* next) = 0;
 };
