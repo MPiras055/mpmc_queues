@@ -40,5 +40,8 @@
 # debug information files
 *.dwo
 
+# vscode
+.vscode
+
 # documentation directories
 .obsidian

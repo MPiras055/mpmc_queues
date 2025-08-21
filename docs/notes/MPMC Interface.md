@@ -34,33 +34,3 @@ public:
 };
 ```
 
-## Follow-Up: Concepts
-In order to support clean integration of an implementation both as a bounded segment and as an [[Unbounded Interface|unbounded]] we can also use C++20 `concepts`.
-
-With this we don't need to define a base interface but we can define 2 basic concepts that encapsulate the logic of `bounded` and `unbounded` segments.
-
-```cpp
-//MPMC_Concepts.hpp
-#pragma once
-#include <concepts>
-#include <cstddef>
-template <typename T, typename Q>
-concept BoundedQueue = requires (Q q, T item, T& out) {
-	{q.enqueue(item)} -> std::same_as<bool>;
-	{q.dequeue(out)} -> std::same_as<bool>;
-	{q.capacity()} -> std::convertible_to<size_t>;
-	{q.size()} -> std::convertible_to<size_t>;
-}
-
-template <typename T, typename S>
-concept UnboundedSegment = BoundedQueue<T, S> &&
-requires(S seg) {
-    { seg.open() } -> std::same_as<void>;
-    { seg.close() } -> std::same_as<void>;
-    { seg.isOpen() } -> std::same_as<bool>;
-    { seg.isClosed() } -> std::same_as<bool>;
-    { seg.next } -> std::same_as<S*>;
-};
-```
-
-With this, we don't have to explicitly handle polymorphism and expect everything to work without inheritance. Since concepts are lazy evaluated we can make a specific implementation having all methods

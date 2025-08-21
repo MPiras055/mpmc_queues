@@ -1,58 +1,51 @@
 #pragma once
 
 #include <atomic>
-#include <array>
 #include <stdexcept>
-
-#ifndef STHREAD_TICKET_MAX
-#define STHREAD_TICKET_MAX 128
-#endif
+#include <limits>
 
 /**
- * Used in linked queues to associate to every thread a specified id. The id is thread-local
- * cached per instance of StaticThreadTicket
+ * @brief Associates a unique thread ID for each thread using a static counter.
+ * 
+ * The `StaticThreadTicket` class provides a mechanism to assign a unique ID to each thread.
+ * This ID is cached locally for each thread to avoid recalculating the ID every time it's requested.
+ * The ID is generated based on a static counter, which increments for each new thread that calls `get_id()`.
+ * The counter will not wrap around due to the use of `std::numeric_limits<uint64_t>::max()`, ensuring a virtually
+ * unlimited number of threads can be assigned unique IDs.
  */
-template <size_t MaxInstances = STHREAD_TICKET_MAX>
 class StaticThreadTicket {
 public:
-    explicit StaticThreadTicket(size_t max_threads)
-        : max_threads_(max_threads)
-    {
-        instance_id_ = global_instance_counter_.fetch_add(1, std::memory_order_relaxed);
-        if (instance_id_ >= MaxInstances) {
-            throw std::runtime_error("Too many StaticThreadTicket instances");
-        }
-    }
-
-    size_t get_id() {
-        //every thread caches the whole array
-        thread_local std::array<size_t, MaxInstances> id_cache = [] {
-            std::array<size_t, MaxInstances> init{};
-            init.fill(INVALID_ID);
-            return init;
-        }();
-
-        size_t& local_id = id_cache[instance_id_];
+    /**
+     * @brief Returns the unique thread ID for the current thread.
+     * 
+     * @return The thread ID assigned to the current thread.
+     * @throws std::runtime_error if the maximum number of thread IDs is exceeded.
+     */
+    uint64_t get_id() {
+        // Cache thread-local ID for this instance
+        thread_local uint64_t local_id = INVALID_ID;
+        
+        // If the ID is already cached, return it
         if (local_id != INVALID_ID) return local_id;
 
-        size_t assigned = counter_.fetch_add(1, std::memory_order_relaxed);
-        if (assigned >= max_threads_) {
-            throw std::runtime_error("Exceeded max threads for this StaticThreadTicket instance");
+        // Generate a new unique ID for the current thread
+        uint64_t assigned = counter_.fetch_add(1, std::memory_order_relaxed);
+
+        // Check if we exceeded the maximum possible ID count (std::numeric_limits<uint64_t>::max())
+        if (assigned == std::numeric_limits<uint64_t>::max()) {
+            throw std::runtime_error("Exceeded maximum number of unique thread IDs.");
         }
 
+        // Cache the assigned ID for this thread
         local_id = assigned;
         return assigned;
     }
 
 private:
-    static constexpr size_t INVALID_ID = 0;
+    static constexpr uint64_t INVALID_ID = std::numeric_limits<uint64_t>::max();  // ID representing an invalid or unassigned ID
 
-    size_t instance_id_;                   // unique ID for this instance
-    size_t max_threads_;                   // max threads allowed for this instance
-    std::atomic<size_t> counter_{1};      // counter for thread IDs issued [1-index based]
-
-    static std::atomic<size_t> global_instance_counter_;
+    static std::atomic<uint64_t> counter_;  // Static counter to generate unique thread IDs
 };
 
-template <size_t MaxInstances>
-std::atomic<size_t> StaticThreadTicket<MaxInstances>::global_instance_counter_{0};
+// Static initialization for the counter across all instances
+std::atomic<uint64_t> StaticThreadTicket::counter_{1};
