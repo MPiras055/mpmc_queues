@@ -43,5 +43,9 @@
 # vscode
 .vscode
 
+# cmake
+build
+cmake/*
+
 # documentation directories
 .obsidian

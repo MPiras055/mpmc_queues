@@ -21,22 +21,6 @@
 constexpr size_t CACHE_LINE = 64;
 
 /**
- * @brief A cell storing a pointer, padded to a cache line to avoid false sharing.
- * 
- * @tparam T Pointer type stored in the hazard cell.
- */
-template<typename T>
-struct HazardCell {
-    static_assert(std::is_pointer_v<T>, "HazardCell requires T to be a pointer type");
-
-    /// The hazard pointer, atomic
-    alignas(CACHE_LINE) std::atomic<T> ptr{nullptr};
-
-private:
-    char _pad[CACHE_LINE - sizeof(std::atomic<T>)]; ///< Padding to fill the cache line
-};
-
-/**
  * @brief Vector of hazard pointers with per-thread retired lists.
  * 
  * Implements a hazard pointer pattern for safe memory reclamation in lock-free structures.
@@ -46,6 +30,12 @@ private:
 template<typename T>
 class HazardVector {
     static_assert(std::is_pointer_v<T>, "HazardVector requires T to be a pointer type");
+
+    // Prevent accidental copies/moves (would double-free).
+    HazardVector(const HazardVector&) = delete;
+    HazardVector& operator=(const HazardVector&) = delete;
+    HazardVector(HazardVector&&) = delete;
+    HazardVector& operator=(HazardVector&&) = delete;
 
 public:
     /**
@@ -64,7 +54,7 @@ public:
      */
     ~HazardVector() {
         for (size_t i = 0; i < maxThreads_; ++i) {
-            for (auto obj : retired_[i]) {
+            for (auto obj : retired_[i].v) {
                 delete obj;
             }
         }
@@ -117,25 +107,32 @@ public:
     }
 
     /**
-     * @brief Retires a pointer and tries to reclaim memory if it is safe.
+     * @brief Retires a pointer and tries to reclaim memory from the per-thread ReclaimBucket
      * 
      * @param ptr Pointer to retire.
      * @param tid Thread ID performing the retire.
-     * @param checkThreshold Whether to skip reclamation if retired list is below threshold.
+     * @param checkThreshold [default = false] Whether to skip reclamation if retired list is below threshold.
      * @return Number of objects deleted during this call.
      */
     size_t retire(T ptr, size_t tid, bool checkThreshold = false) {
         assert(tid < maxThreads_);
         if (!ptr) return 0;
 
-        retired_[tid].push_back(ptr);
+        retired_[tid].v.push_back(ptr);
 
-        if (checkThreshold && retired_[tid].size() < THRESHOLD_R)
-            return 0;
+        return checkThreshold && retired_[tid].v.size() < THRESHOLD_R ? 0 : collect(tid);
+    }
 
+    /**
+     * @brief Reclaims memory from the per-thread RetireBucket if possible
+     * 
+     * @param tid Thread ID performing the retire.
+     * @return Number of objects deleted during this call.
+     */
+    size_t collect(size_t tid) {
         size_t deleted = 0;
-        for (size_t i = 0; i < retired_[tid].size(); ) {
-            T obj = retired_[tid][i];
+        for (size_t i = 0; i < retired_[tid].v.size(); ) {
+            T obj = retired_[tid].v[i];
             bool canDelete = true;
 
             // Scan all hazard pointers
@@ -149,8 +146,8 @@ public:
             }
 
             if (canDelete) {
-                std::swap(retired_[tid][i], retired_[tid].back());
-                retired_[tid].pop_back();
+                std::swap(retired_[tid].v[i], retired_[tid].v.back());
+                retired_[tid].v.pop_back();
                 delete obj;
                 ++deleted;
                 continue; // do not increment i, new element at i
@@ -162,11 +159,36 @@ public:
     }
 
 private:
+
+    /**
+     * @brief A cell storing a pointer, padded to a cache line to avoid false sharing.
+     * 
+     * @tparam T Pointer type stored in the hazard cell.
+     */
+    template<typename T1>
+    struct alignas(CACHE_LINE) HazardCell {
+        static_assert(std::is_pointer_v<T1>, "HazardCell requires T to be a pointer type");
+        std::atomic<T1> ptr{nullptr};
+        // Ensure the struct size is at least one full cache line
+        static_assert(sizeof(std::atomic<T1>) <= CACHE_LINE, "atomic<T> bigger than cache line");
+        // Force the element size to one full cache line
+        char _pad[CACHE_LINE - sizeof(std::atomic<T1>) > 0 ? (CACHE_LINE - sizeof(std::atomic<T1>)) : 0];
+    };
+    static_assert(alignof(HazardCell<void*>) == CACHE_LINE);
+    static_assert(sizeof(HazardCell<void*>) % CACHE_LINE == 0);
+
+    template<typename T1>
+    struct alignas(CACHE_LINE) RetiredBucket {
+        std::vector<T1> v;
+        char _pad[CACHE_LINE - (sizeof(std::vector<T1>) % CACHE_LINE ? (sizeof(std::vector<T1>) % CACHE_LINE) : 0)];
+    };
+
+
     size_t maxThreads_; ///< Maximum threads supported
 
     /// Hazard pointer storage: [thread][hazard slot], aligned to cache line
     alignas(CACHE_LINE) HazardCell<T> storage_[HV_MAX_THREADS][HV_MAX_HPS];
 
     /// Per-thread retired objects, aligned to cache line
-    alignas(CACHE_LINE) std::vector<T> retired_[HV_MAX_THREADS];
+    RetiredBucket<T> retired_[HV_MAX_THREADS];
 };
