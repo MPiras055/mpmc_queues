@@ -147,7 +147,7 @@ public:
     using value_type = T;
 
     LinkedSegment* getNext() const override { return next; }
-    void setNext(LinkedSegment* n) override { next = n; }
+    bool setNext(LinkedSegment* n) override { next = n; }
 
 private:
     LinkedSegment* next = nullptr;

@@ -2,6 +2,8 @@
 #include <cstddef>
 #include <IStoragePolicy.hpp>
 
+
+namespace util::memory {
 /**
  * @brief Stack-based storage implementation for queue buffers.
  * 
@@ -47,3 +49,5 @@ public:
 private:
     T buffer_[N]; ///< Fixed-size stack-allocated buffer
 };
+
+}   //namespace util::memory

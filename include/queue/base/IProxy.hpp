@@ -1,6 +1,8 @@
 #pragma once
 #include <ILinkedSegment.hpp>
 
+namespace meta {
+
 /// @brief Base interface for proxy queues that manage linked segments.
 ///
 /// A proxy acts as the user-facing queue, hiding the underlying segments.
@@ -40,3 +42,5 @@ protected:
     /// @return false always
     bool isClosed() final override const { return false; }
 };
+
+} //namespace meta

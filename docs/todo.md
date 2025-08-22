@@ -2,5 +2,8 @@
 - [x] define interfaces `IQueue<T>,IBoundedSegment<T>`
 - [x] define stack-heap storage policy
 - [x] define static and dynamic internal thread tickets (per instance of class)
-- [ ] define hazard pointer integration
-- [ ] define Unbounded Proxy template
+- [x] define hazard pointer integration
+- [x] define Unbounded Proxy template
+
+## Segments
+- [ ] Add CAS-loop segment compliant with bounded and linked interface

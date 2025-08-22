@@ -4,6 +4,8 @@
 #include <stdexcept>
 #include <limits>
 
+
+namespace util::threading {
 /**
  * @brief Associates a unique thread ID for each thread using a static counter.
  * 
@@ -49,3 +51,5 @@ private:
 
 // Static initialization for the counter across all instances
 std::atomic<uint64_t> StaticThreadTicket::counter_{1};
+
+} //namespace util::threading

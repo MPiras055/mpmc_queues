@@ -1,5 +1,7 @@
 #pragma once
 
+namespace util::memory {
+
 /**
  * @brief Abstract base class for storage policies.
  * 
@@ -32,3 +34,5 @@ public:
      */
     virtual ~IStoragePolicy() = default;
 };
+
+} //namespace util::memory

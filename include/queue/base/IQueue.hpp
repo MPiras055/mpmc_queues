@@ -6,6 +6,8 @@
 #include <cstddef>
 #include <type_traits>
 
+namespace meta {
+
 /// @brief Generic queue interface with minimal contracts for enqueue/dequeue operations.
 ///
 /// This interface defines the common queue operations, as well as lifecycle
@@ -87,3 +89,5 @@ protected:
     /// @return true if open, false otherwise.
     virtual bool isOpened() const = 0;
 };
+
+}   //namespace meta

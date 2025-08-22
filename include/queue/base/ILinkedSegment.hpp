@@ -1,6 +1,8 @@
 #pragma once
 #include <IQueue.hpp>
 
+namespace meta {
+
 /// @brief Marker type used to detect whether a queue segment is linked.
 /// 
 /// Segments that inherit from `LinkedTag<T>` can be recognized at compile time
@@ -23,6 +25,13 @@ constexpr bool is_linked_segment_v =
 
 
 // ==========================
+// Helper macro
+// ==========================
+
+#define IS_LINKED is_linked_segment_v<std::decay_t<decltype(*this)>>
+
+
+// ==========================
 // Linked Segment Interface
 // ==========================
 
@@ -41,11 +50,6 @@ public:
     /// 
     /// @return Pointer to the next segment, or `nullptr` if this is the last segment.
     virtual Derived* getNext() const = 0;
-
-    /// @brief Sets the next segment in the chain.
-    /// 
-    /// Typically called by a proxy or segment manager when extending the queue.
-    /// 
-    /// @param next Pointer to the segment that should follow this one.
-    virtual void setNext(Derived* next) = 0;
 };
+
+}   //namespace meta

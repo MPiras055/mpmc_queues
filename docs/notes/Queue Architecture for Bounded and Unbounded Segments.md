@@ -1,4 +1,3 @@
-# Queue Architecture for Bounded and Unbounded Segments
 
 ## Overview
 
