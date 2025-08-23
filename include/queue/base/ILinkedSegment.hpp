@@ -28,7 +28,7 @@ constexpr bool is_linked_segment_v =
 // Helper macro
 // ==========================
 
-#define IS_LINKED is_linked_segment_v<std::decay_t<decltype(*this)>>
+#define IS_LINKED meta::is_linked_segment_v<std::decay_t<decltype(*this)>>
 
 
 // ==========================

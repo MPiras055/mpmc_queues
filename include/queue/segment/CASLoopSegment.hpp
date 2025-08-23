@@ -140,6 +140,16 @@ public:
         return tail_.load(std::memory_order_acquire) - head_.load(std::memory_order_acquire);
     }
 
+    /// @brief Defaulted destructor.
+    ~CASLoopQueue() override = default;
+
+protected:
+    // Only accessible to friends (e.g. Proxy classes) or derived types (LinkedSegments).
+
+    // ==========================
+    // Lifecycle Control (Linked Queues)
+    // ==========================
+
     /**
      * @brief Marks the queue as closed.
      * 
@@ -184,15 +194,9 @@ public:
         return !isClosed();
     }
 
-    /// @brief Defaulted destructor.
-    ~CASLoopQueue() override = default;
-
-private:
-    util::memory::HeapStorage<Cell> array_; ///< Underlying circular buffer storage.
-
-protected:
     std::atomic<uint64_t> head_; ///< Head ticket index for dequeue.
     std::atomic<uint64_t> tail_; ///< Tail ticket index for enqueue.
+    util::memory::HeapStorage<Cell> array_; ///< Underlying circular buffer storage.
 };
 
 
@@ -207,7 +211,7 @@ protected:
  */
 template<typename T, typename Proxy>
 class LinkedCASLoop: 
-    public meta::ILinkedSegment<T>,
+    public meta::ILinkedSegment<T,Proxy>,
     public CASLoopQueue<T> {
     friend Proxy;   ///< Proxy class can access private methods.
 

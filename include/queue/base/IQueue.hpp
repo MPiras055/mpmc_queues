@@ -21,6 +21,8 @@ class IQueue {
     static_assert(std::is_pointer_v<T>, "IQueue requires T to be a pointer type");
 
 public:
+    using value_type = T;
+
     /// @brief Virtual destructor to allow cleanup through base pointer.
     virtual ~IQueue() = default;
 

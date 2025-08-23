@@ -117,8 +117,7 @@ TEST_F(DynamicThreadTicketTest, StressAcquireRelease) {
  *        a ticket again (possibly the same or a different one).
  */
 TEST_F(DynamicThreadTicketTest, TicketIsThreadLocal) {
-    std::uint64_t t1 = DynamicThreadTicket::INVALID_ID;
-    std::uint64_t t2 = DynamicThreadTicket::INVALID_ID;
+    std::uint64_t t1,t2;
 
     // First acquire must succeed
     ASSERT_TRUE(dtt.acquire(t1));
