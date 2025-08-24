@@ -1,7 +1,12 @@
+#include <IQueue.hpp>
 #include <ILinkedSegment.hpp>
 #include <SequencedCell.hpp>
 #include <HeapStorage.hpp>
 #include <atomic>
+
+// Forward declaration
+template<typename T, typename Proxy, bool auto_close>
+class LinkedCASLoop;
 
 /**
  * @brief Lock-free queue implementation using a compare-and-swap loop.
@@ -14,8 +19,9 @@
  * 
  * @tparam T Type of elements stored in the queue.
  */
-template<typename T> 
+template<typename T, typename Derived = void> 
 class CASLoopQueue: public meta::IQueue<T> {
+    using Effective = std::conditional_t<std::is_void_v<Derived>, CASLoopQueue, Derived>;
     using Cell = SequencedCell<T>; ///< Internal buffer cell (value + sequence counter).
 
 public:
@@ -55,7 +61,7 @@ public:
         do {
             tailTicket = tail_.load(std::memory_order_relaxed);
 
-            if constexpr (IS_LINKED) {
+            if constexpr (meta::is_linked_segment_v<Effective>) {
                 if(isClosed()) {
                     return false;
                 }
@@ -71,8 +77,8 @@ public:
                     break;
                 }
             } else if (tailTicket > seq) {
-                if constexpr (IS_LINKED) {
-                    (void)close();
+                if constexpr (meta::is_linked_segment_v<Effective>) {
+                    (void) close();
                 } 
                 return false;
             }
@@ -209,10 +215,10 @@ protected:
  * @tparam T Type of elements stored in the queue.
  * @tparam Proxy Friend class allowed to access private members (e.g., higher-level queue).
  */
-template<typename T, typename Proxy>
+template<typename T, typename Proxy, bool auto_close = true>
 class LinkedCASLoop: 
-    public meta::ILinkedSegment<T,Proxy>,
-    public CASLoopQueue<T> {
+    public CASLoopQueue<T,std::conditional_t<auto_close,LinkedCASLoop<T,Proxy>,void>>,
+    public meta::ILinkedSegment<T,LinkedCASLoop<T,Proxy>> {
     friend Proxy;   ///< Proxy class can access private methods.
 
 public:
@@ -223,7 +229,9 @@ public:
      * @param start Initial sequence number (defaults to 0).
      */
     LinkedCASLoop(size_t size, uint64_t start = 0): 
-        CASLoopQueue<T>(size,start) {}
+        CASLoopQueue<T,LinkedCASLoop<T,Proxy>>(size,start) {
+            assert(meta::is_linked_segment_v<std::decay_t<decltype(*this)>> && "LinkedSegment is not linked");
+        }
 
     /// @brief Defaulted destructor.
     ~LinkedCASLoop() override = default;
