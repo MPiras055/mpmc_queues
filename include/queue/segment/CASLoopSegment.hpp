@@ -2,7 +2,6 @@
 #include <ILinkedSegment.hpp>
 #include <SequencedCell.hpp>
 #include <HeapStorage.hpp>
-#include <atomic>
 
 // Forward declaration
 template<typename T, typename Proxy, bool auto_close>
@@ -18,6 +17,7 @@ class LinkedCASLoop;
  * progress for multiple threads.
  * 
  * @tparam T Type of elements stored in the queue.
+ * @tparam Derived Type of the derived segment (CRTP) default void
  */
 template<typename T, typename Derived = void> 
 class CASLoopQueue: public meta::IQueue<T> {
@@ -143,7 +143,7 @@ public:
      * @return Current number of elements in the queue.
      */
     size_t size() const override {
-        return tail_.load(std::memory_order_acquire) - head_.load(std::memory_order_acquire);
+        return (tail_.load(std::memory_order_acquire)) - head_.load(std::memory_order_acquire);
     }
 
     /// @brief Defaulted destructor.
@@ -221,6 +221,8 @@ class LinkedCASLoop:
     public meta::ILinkedSegment<T,LinkedCASLoop<T,Proxy>> {
     friend Proxy;   ///< Proxy class can access private methods.
 
+    using Base = CASLoopQueue<T,std::conditional_t<auto_close,LinkedCASLoop<T,Proxy>,void>>;
+
 public:
     /**
      * @brief Constructs a linked CAS loop queue segment.
@@ -245,6 +247,19 @@ private:
     LinkedCASLoop* getNext() const override {
         return next_.load(std::memory_order_acquire);
     }
+
+    bool open() final override {
+        if((Base::tail_.fetch_and(~(1ull << 63),std::memory_order_acquire) & 1ull << 63 != 0)) {
+            next_.store(nullptr,std::memory_order_relaxed);
+        }
+        return true;
+    }
+
+    size_t size() const final override {
+        return Base::size() & ~(1ull<<63);
+    }
+
+
 
     std::atomic<LinkedCASLoop*> next_{nullptr}; ///< Pointer to the next segment in the chain.
 };

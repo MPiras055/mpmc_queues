@@ -17,6 +17,7 @@
 #include <vector>
 #include <IProxy.hpp>
 #include <CASLoopSegment.hpp>  // replace with your actual linked segment header
+#include <PRQSegment.hpp>
 
 // =========================================================
 // Test Proxy
@@ -42,6 +43,7 @@ struct TestProxy {
     bool isOpened() const { return seg.isOpened(); }
     bool isClosed() const { return seg.isClosed(); }
     size_t capacity() const { return seg.capacity(); }
+    size_t size() const { return seg.size(); }
 
 private:
     Segment seg;
@@ -51,7 +53,8 @@ private:
 // Test Fixture
 // =========================================================
 typedef ::testing::Types<
-    TestProxy<int *,LinkedCASLoop>  ///< Replace `void` with actual proxy type if needed
+    TestProxy<int *,LinkedCASLoop>,  ///< Replace `void` with actual proxy type if needed
+    TestProxy<int *,LinkedPRQ>
 > LinkedQueueTypes;
 
 template <typename T>
@@ -195,9 +198,14 @@ TYPED_TEST(LinkedSegmentTest, AutoCloseThenReopen) {
     EXPECT_FALSE(this->q.enqueue(&val));
     EXPECT_TRUE(this->q.isClosed());
 
-    // closed segments allow for dequeue
-    EXPECT_TRUE(this->q.dequeue(out));
+    // closed segments allow for dequeue (closed queues should be drained)
+    for(size_t i = 0; i < this->q.capacity(); i++){
+        EXPECT_TRUE(this->q.dequeue(out));
+    }
+    EXPECT_FALSE(this->q.dequeue(out)); //the segment is now empty
+    EXPECT_EQ(this->q.size(),0);
     EXPECT_TRUE(this->q.open());
+    EXPECT_EQ(this->q.size(),0);
 
     // open segments that are not full allow for enqueues
     EXPECT_TRUE(this->q.enqueue(&val));
