@@ -40,8 +40,10 @@
 # debug information files
 *.dwo
 
-# vscode
+# vscode & zed
 .vscode
+.cache
+compile_commands.json
 
 # cmake
 build

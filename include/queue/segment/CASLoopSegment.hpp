@@ -1,10 +1,11 @@
 #pragma once
 #include <IQueue.hpp>
 #include <ILinkedSegment.hpp>
+#include <cassert>
 #include <SequencedCell.hpp>
 #include <HeapStorage.hpp>
 #include <bit.hpp>
-#include <iostream>
+
 
 // Forward declaration
 template<typename T, typename Proxy, bool Pow2, bool auto_close>

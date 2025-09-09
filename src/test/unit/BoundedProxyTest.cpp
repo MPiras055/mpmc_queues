@@ -9,20 +9,18 @@
 #include <PRQSegment.hpp>
 #include <BoundedCounterProxy.hpp>
 #include <BoundedChunkProxy.hpp>
-#include <BoundedMemProxy.hpp>
 
 
-static constexpr size_t segments = 128;
+static constexpr size_t segments = 4;
 static constexpr size_t full_capacity = 1024 * 16;
 static constexpr size_t segment_capacity = full_capacity / segments;
 
 // ---- List of queue implementations to test ----
 typedef ::testing::Types<
-    // BoundedChunkProxy<int*,LinkedCASLoop,segments>,
-    // BoundedCounterProxy<int*,LinkedCASLoop,segments>,
-    // BoundedCounterProxy<int*,LinkedPRQ,segments>,
-    // BoundedChunkProxy<int*,LinkedPRQ,segments>,
-    BoundedMemProxy<int*,LinkedCASLoop,segments>
+    BoundedChunkProxy<int*,LinkedCASLoop,segments>,
+    BoundedCounterProxy<int*,LinkedCASLoop,segments>,
+    BoundedCounterProxy<int*,LinkedPRQ,segments>,
+    BoundedChunkProxy<int*,LinkedPRQ,segments>
 
 
     //, Other queues to add here
@@ -198,7 +196,6 @@ TYPED_TEST(QueueTest, MultiProducerMultiConsumer) {
                 while (!this->q.enqueue(val)){}
             }
             this->q.release(); //each thread successfuly releases the ticket from the queue
-            std::puts("Producer exiting");
         });
     }
 

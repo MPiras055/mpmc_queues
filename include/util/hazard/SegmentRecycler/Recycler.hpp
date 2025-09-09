@@ -1,6 +1,6 @@
 #pragma once
 #include <IndexQueue.hpp>
-#include <CASLoopSegment.hpp>
+#include "CASLoopSegment.hpp"
 #include <HazardCell.hpp>
 #include <SingleWriterCell.hpp>
 #include <PtrLookup.hpp>
@@ -66,7 +66,7 @@ public:
    */
     template<typename... Args>
     Recycler(size_t tracked, size_t thread_count, Args&&... tml_args)
-            :   epoch{0},
+            :   epoch_{0},
                 reclaim_avail_{0},
                 thread_local_storage_{thread_count},
                 buckets_(4,tracked),
@@ -93,7 +93,7 @@ public:
                 bool ok = cache_.enqueue(i);
                 assert(ok && "Recycler: initial cache enqueue failed");
             } else {
-                bool ok = free_bucket_for_epoch(epoch.load(std::memory_order_relaxed)).enqueue(i);
+                bool ok = free_bucket_for_epoch(epoch_.load(std::memory_order_relaxed)).enqueue(i);
                 assert(ok && "Recycler: initial free bucket enqueue failed");
             }
         }
@@ -122,7 +122,7 @@ public:
    * @param ticket Thread-local index (0 <= ticket < thread_local_storage_.size()).
    */
     void protect_epoch(uint64_t ticket) {
-        const uint64_t snapshot = epoch.load(std::memory_order_acquire);
+        const uint64_t snapshot = epoch_.load(std::memory_order_acquire);
         thread_local_cell(ticket).activate(snapshot);
     }
 
@@ -214,10 +214,8 @@ public:
     void retire(Tml in, uint64_t ticket, bool dropProtection = true) {
         assert(thread_local_cell(ticket).isActive() && 
             "Recycler::retire: thread must protect an epoch to retire a TML");
-
-        const uint64_t e = epoch.load(std::memory_order_acquire);
         
-        bool ok = current_bucket_for_epoch(epoch.load(std::memory_order_acquire)).enqueue(in);
+        bool ok = current_bucket_for_epoch(epoch_.load(std::memory_order_acquire)).enqueue(in);
         assert(ok && 
             "Recycler::retire: CurrentBucket should always allow for enqueues");
 
@@ -255,20 +253,20 @@ public:
             if(!available()) return false;
 
             // protect current epoch while inspecting free bucket for that epoch
-            uint64_t snapshot = protect_epoch_and_load(ticket,epoch);
+            uint64_t snapshot = protect_epoch_and_load(ticket,epoch_);
             got = get_from_free_bucket(out,snapshot);
             clear_epoch(ticket);
             if(got) return true;
         
             //don't protect in here
-            snapshot = epoch.load(std::memory_order_acquire);
+            snapshot = epoch_.load(std::memory_order_acquire);
             // check if the epoch can be safely advanced (no active thread holds a prior epoch),
             // attempt to CAS increment epoch by 1
             if(can_advance_epoch(snapshot)) { 
 
                 uint64_t nextEpoch = snapshot + 1;
-                (void)epoch.compare_exchange_strong(snapshot,nextEpoch,std::memory_order_acq_rel);
-                snapshot = protect_epoch_and_load(ticket,epoch);
+                (void)epoch_.compare_exchange_strong(snapshot,nextEpoch,std::memory_order_acq_rel);
+                snapshot = protect_epoch_and_load(ticket,epoch_);
                 got = get_from_free_bucket(out,snapshot);
                 clear_epoch(ticket);
                 if(got) return true;
@@ -384,7 +382,7 @@ private:
     // Member variables
     // -------------------------
 
-    std::atomic<uint64_t> epoch{0};             ///< global epoch counter
+    std::atomic<uint64_t> epoch_{0};             ///< global epoch counter
     std::atomic<uint32_t> reclaim_avail_{0};    ///< how many items in quarantine
     util::memory::HeapStorage<ThreadHazard> thread_local_storage_;///< per-thread hazard cells (SingleWriter)
     util::memory::HeapStorage<Bucket> buckets_;                   ///< circular set of 4 buckets
