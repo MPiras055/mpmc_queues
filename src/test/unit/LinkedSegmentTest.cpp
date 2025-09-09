@@ -14,7 +14,6 @@
  */
 
 #include <gtest/gtest.h>
-#include <vector>
 #include <IProxy.hpp>
 #include <CASLoopSegment.hpp>  // replace with your actual linked segment header
 #include <PRQSegment.hpp>
@@ -43,7 +42,7 @@ struct TestProxy {
     bool isOpened() const { return seg.isOpened(); }
     bool isClosed() const { return seg.isClosed(); }
     size_t capacity() const { return seg.capacity(); }
-    size_t size() const { return seg.size(); }
+    size_t size() { return seg.size(); }
 
 private:
     Segment seg;

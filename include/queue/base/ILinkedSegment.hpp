@@ -1,6 +1,6 @@
 #pragma once
 
-namespace meta {
+namespace base {
 
 // ==========================
 // Linked Segment Interface
@@ -24,6 +24,8 @@ public:
     /// 
     /// @return Pointer to the next segment, or `nullptr` if this is the last segment.
     virtual Derived* getNext() const = 0;
+
+    virtual uint64_t getNextStartIndex() const = 0;
 
     using linked_segment_tag = void;
 };

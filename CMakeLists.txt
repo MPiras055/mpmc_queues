@@ -46,8 +46,11 @@ foreach(test_src ${UNIT_TEST_SOURCES})
     # Create executable
     add_executable(${test_name} ${test_src})
     
-    # Link GoogleTest
-    target_link_libraries(${test_name} gtest_main)
+    # Compile with address sanitizer
+    target_compile_options(${test_name} PUBLIC -fsanitize=address -g)
+
+    # link gtest and fsanitize
+    target_link_libraries(${test_name} gtest_main -fsanitize=address )
     
     # Register with CTest
     add_test(NAME ${test_name} COMMAND ${test_name})
@@ -60,5 +63,8 @@ foreach(test_src ${INTEGRATION_TEST_SOURCES})
     
     add_executable(${test_name} ${test_src})
     target_link_libraries(${test_name} gtest_main)
+    #target_compile_options(${test_name} PUBLIC -O3 -march=native -funroll-loops -fno-rtti)
+    target_compile_options(${test_name} PUBLIC -O3)
+    target_link_options(${test_name} PUBLIC)
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()

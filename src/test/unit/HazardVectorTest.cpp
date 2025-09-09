@@ -17,7 +17,7 @@
 #include <atomic>
 #include <barrier>
 
-using namespace std;
+namespace util::hazard {
 
 /**
  * @class HazardVectorTest
@@ -124,8 +124,8 @@ TEST_F(HazardVectorTest, RetireWithOtherThreadProtection) {
  */
 TEST_F(HazardVectorTest, MultiThreadProtectAndRetire) {
     const size_t threads = maxThreads;
-    vector<thread> ths;
-    vector<int*> objs(threads);
+    std::vector<std::thread> ths;
+    std::vector<int*> objs(threads);
     std::atomic<size_t> atom_deleted{0};
     for (size_t i = 0; i < threads; ++i) objs[i] = new int((int)i);
 
@@ -172,3 +172,5 @@ TEST_F(HazardVectorTest, ManyRetireCollect) {
     deleted += hv.collect(0);
     ASSERT_EQ(deleted, N);
 }
+
+} //namespace util::hazard

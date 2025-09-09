@@ -2,7 +2,7 @@
 #include <IQueue.hpp>
 #include <ILinkedSegment.hpp>
 
-namespace meta {
+namespace base {
 
 /// @brief Base interface for proxy queues that manage linked segments.
 ///
@@ -21,8 +21,26 @@ class IProxy : public IQueue<T> {
                   "Proxy interfaces only allow Linked Segments");
 
 public:
+    using proxy_tag = void;
+
     /// @brief Virtual destructor to ensure proper cleanup of derived proxies.
     virtual ~IProxy() = default;
+
+    /// @brief books a slot for the current thread
+    /// @returns true if the thread successfuly acquired a slot false otherwise
+    ///
+    /// @warning if no slot can be acquired using the data structure results in undefined
+    /// behaviour
+    ///
+    virtual bool acquire() = 0;
+
+    /// @brief clears a booked slot
+    /// @returns true (always successful)
+    ///
+    /// @note the method must be idenpotent (calling it multiple times results
+    /// in no side effects)
+    ///
+    virtual void release() = 0;
 
 protected:
     // -------------------------------------------------------------------------
@@ -46,5 +64,29 @@ protected:
     /// @return false always
     bool isClosed() const final override { return false; }
 };
+
+// ===========================================================
+// Helper trait to detect whether an instance is a Proxy
+// ===========================================================
+
+template<typename, typename = void>
+struct is_proxy : std::false_type {};
+
+template<typename T>
+struct is_proxy<T, std::void_t<typename T::proxy_tag>> : std::true_type {};
+
+/// @brief Helper trait to check whether a given type `T`
+///        is a linked segment (derives from `LinkedTag`).
+/// 
+/// This can be used in `static_assert` or `if constexpr` checks to conditionally
+/// enable logic for linked vs. non-linked queue segments.
+/// 
+/// @tparam T Candidate type to check.
+/// @retval true  if `T` is derived from `LinkedTag`.
+/// @retval false otherwise.
+template<typename T>
+inline constexpr bool is_proxy_v = is_proxy<T>::value;
+
+
 
 } // namespace meta

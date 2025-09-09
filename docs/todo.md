@@ -5,5 +5,14 @@
 - [x] define hazard pointer integration
 - [x] define Unbounded Proxy template
 
+## Proxies
+- [ ] Add linked proxy compliant with iproxy interface
+- [ ] Add memory reuse option (copying collection gc)
+
 ## Segments
-- [ ] Add CAS-loop segment compliant with bounded and linked interface
+- [x] Add CAS-loop segment compliant with bounded and linked interface
+- [x] Add PRQ segment compliant with bounded and linked interface
+
+## Testing
+- [x] Add test interface for all classes
+- [ ] 

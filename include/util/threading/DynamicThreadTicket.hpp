@@ -132,56 +132,6 @@ public:
         // No free tickets.
         return false;
     }
-    // bool acquire(std::uint64_t& out_ticket) {
-    //     std::uint64_t& local_id = tls_id_cache()[instance_id_];
-
-    //     // Fast path: already have a ticket
-    //     if (local_id != INVALID_ID) {
-    //         out_ticket = local_id;
-    //         return true;
-    //     }
-
-    //     // -----------------------
-    //     // Slow path: ticket lottery
-    //     // -----------------------
-
-    //     // Pick starting cell per thread (wrap-around)
-    //     thread_local std::array<std::uint64_t, MaxInstances> tls_start_cell{};
-    //     std::uint64_t start_cell = tls_start_cell[instance_id_] % NumCells;
-    //     if (tls_start_cell[instance_id_] == 0) {
-    //         // Initialize pseudo-random start once per thread-instance
-    //         tls_start_cell[instance_id_] = std::hash<std::thread::id>{}(std::this_thread::get_id()) % NumCells;
-    //         start_cell = tls_start_cell[instance_id_];
-    //     }
-
-    //     for (std::uint64_t i = 0; i < NumCells; ++i) {
-    //         std::uint64_t cell = (start_cell + i) % NumCells;
-    //         std::uint64_t cur = storage_[cell].load(std::memory_order_relaxed);
-
-    //         while (cur != 0) {
-    //             unsigned bit = count_trailing_zeros(cur);   // lowest set bit
-    //             std::uint64_t ticket = cell * 64 + bit;
-    //             if (ticket >= maxThreads_) break;
-
-    //             std::uint64_t mask    = std::uint64_t{1} << bit;
-    //             std::uint64_t desired = cur & ~mask;
-
-    //             if (storage_[cell].compare_exchange_weak(
-    //                     cur, desired,
-    //                     std::memory_order_acquire,
-    //                     std::memory_order_relaxed)) {
-    //                 local_id   = ticket;    // cache in TLS
-    //                 out_ticket = ticket;
-    //                 return true;
-    //             }
-    //             // CAS failed; cur updated, try next bit
-    //         }
-    //     }
-
-    //     // No free tickets
-    //     return false;
-    // }
-
 
     /**
      * @brief Release the ticket held by the calling thread (if any).

@@ -1,9 +1,13 @@
+#pragma once
 #include <IQueue.hpp>
 #include <ILinkedSegment.hpp>
 #include <SequencedCell.hpp>
 #include <HeapStorage.hpp>
-#include <functional>
-#include <thread>
+#include <StaticThreadTicket.hpp>
+#include <specs.hpp>
+#include <bit.hpp>
+
+
 
 // Forward declaration
 template<typename T, typename Proxy, bool auto_close>
@@ -15,7 +19,8 @@ class LinkedPRQ;
  * @tparam T Type of elements stored in the queue
  */
 template<typename T, typename Derived = void>
-class PRQueue: public meta::IQueue<T> {
+class PRQueue: public base::IQueue<T> {
+
     using Effective = std::conditional_t<std::is_void_v<Derived>,PRQueue,Derived>;
     using Cell = SequencedCell<T>;
 
@@ -30,9 +35,10 @@ public:
      * @param start Initial sequence number (defaults to 0).
      */
     explicit PRQueue(size_t size, uint64_t start = 0): array_(size) {
-        for(uint64_t i = 0; i < array_.capacity(); i++) {
-            array_[i].val = nullptr;
-            array_[i].seq.store(i + start, std::memory_order_relaxed);
+        assert(size != 0 && "Null capacity");
+        for(uint64_t i = start; i < start + size; i++) {
+            array_[i % size].val = T{nullptr};
+            array_[i % size].seq.store(i, std::memory_order_relaxed);
         }
 
         head_.store(start, std::memory_order_relaxed);
@@ -47,37 +53,33 @@ public:
      * @return false If the queue is full or closed.
      */
     bool enqueue(T item) final override {
-        thread_local T tagged = [] {
-            std::size_t hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
-            uintptr_t encoded = static_cast<uintptr_t>(hash) << 1 | 1;
-            return reinterpret_cast<T>(encoded);
-        }();
+        T tagged = threadReserved();
 
         while(1) {
-            if constexpr(meta::is_linked_segment_v<Effective>) {
-                if(isClosed())
+            uint64_t tailTicket = tail_.fetch_add(1);
+            if constexpr(base::is_linked_segment_v<Effective>) {
+                if(is_closed_(tailTicket))
                     return false;
             }
 
-            uint64_t tailTicket = tail_.fetch_add(1,std::memory_order_acq_rel);
             Cell& cell = array_[tailTicket % array_.capacity()];
-            uint64_t seq = cell.seq.load(std::memory_order_acquire);
-            T val = cell.val.load(std::memory_order_acquire);
+            uint64_t seq = cell.seq.load();
+            T val = cell.val.load();
             
-            if( val == nullptr &&
-                get63LSB(seq) <= tailTicket &&
-                (!getMSB(seq) || head_.load(std::memory_order_relaxed) <= tailTicket)
+            if( (val == nullptr) &&
+                (bit::get63LSB(seq) <= tailTicket) &&
+                (!bit::getMSB64(seq) || head_.load() <= tailTicket)
             ) {
-                if(cell.val.compare_exchange_strong(val,tagged,std::memory_order_acq_rel)) {
-                    if (cell.seq.compare_exchange_strong(seq,tailTicket + array_.capacity(),std::memory_order_acq_rel) &&
-                        cell.val.compare_exchange_strong(tagged,item,std::memory_order_acq_rel)
+                if(cell.val.compare_exchange_strong(val,tagged)) {
+                    if (cell.seq.compare_exchange_strong(seq,tailTicket + array_.capacity()) &&
+                        cell.val.compare_exchange_strong(tagged,item)
                     ) return true;
-                } else cell.val.compare_exchange_strong(tagged,nullptr,std::memory_order_relaxed);
+                } else cell.val.compare_exchange_strong(tagged,T{nullptr});
             }
 
-            if(tailTicket >= (head_.load(std::memory_order_acquire) + capacity())) {
-                if constexpr (meta::is_linked_segment_v<Effective>) {
-                    (void)close();
+            if(tailTicket >= (head_.load() + array_.capacity())) {
+                if constexpr (base::is_linked_segment_v<Effective>) {
+                    (void) close();
                 }
                 return false;
             }
@@ -103,46 +105,49 @@ public:
             uint64_t tailTicket,tailIndex,tailClosed;
 
             while(1) {
-                uint64_t packed_seq = cell.seq.load(std::memory_order_acquire);
-                uint64_t unsafe = getMSB(packed_seq);
-                uint64_t seq = get63LSB(packed_seq);
-                T val = cell.val.load(std::memory_order_acquire);
+                uint64_t packed_seq = cell.seq.load();
+                uint64_t unsafe = bit::getMSB64(packed_seq);
+                uint64_t seq = bit::get63LSB(packed_seq);
+                T val = cell.val.load();
 
-                if(packed_seq != cell.seq.load(std::memory_order_acquire))
+                //inconsistent view of the cell
+                if(packed_seq != cell.seq.load())
                     continue;
+
                 if(seq > (headTicket + array_.capacity()))
                     break;
+                    
                 if((val != nullptr) && !isReserved(val)) {
-                    if(seq == headTicket + array_.capacity()) {
-                        cell.val.store(nullptr,std::memory_order_relaxed);
+                    if(seq == (headTicket + array_.capacity())) {
+                        cell.val.store(nullptr);
                         container = val;
                         return true;
                     } else {
                         if(unsafe) {
-                            if(cell.seq.load(std::memory_order_acquire) == packed_seq)
+                            if(cell.seq.load() == packed_seq)
                                 break;
                         } else {
-                            if(cell.seq.compare_exchange_strong(packed_seq,setMSB(seq),std::memory_order_acq_rel))
+                            if(cell.seq.compare_exchange_strong(packed_seq,bit::setMSB64(seq)))
                                 break;
                         }
                     }
                 } else {
                     if((retry & MAX_RELOAD) == 0) {
-                        tailTicket = tail_.load(std::memory_order_relaxed);
-                        tailIndex = get63LSB(tailTicket);
+                        tailTicket = tail_.load();
+                        tailIndex = bit::get63LSB(tailTicket);
                         tailClosed = tailTicket - tailIndex;
                     }
-                    if(unsafe || tailTicket < headTicket + 1 || tailClosed || retry > MAX_RETRY) {
-                        if(isReserved(val) && !(cell.val.compare_exchange_strong(val,nullptr,std::memory_order_acq_rel)))
+                    if(unsafe || tailIndex < (headTicket + 1) || tailClosed || retry > MAX_RETRY) {
+                        if(isReserved(val) && !(cell.val.compare_exchange_strong(val,nullptr)))
                             continue;
-                        if(cell.seq.compare_exchange_strong(packed_seq,unsafe | headTicket + array_.capacity(),std::memory_order_acq_rel))
+                        if(cell.seq.compare_exchange_strong(packed_seq,unsafe | (headTicket + array_.capacity())))
                             break;
                     }
                 }
                 ++retry;
             }
 
-            if(get63LSB(tail_.load(std::memory_order_acquire)) <= headTicket + 1) {
+            if(bit::get63LSB(tail_.load(std::memory_order_acquire)) <= (headTicket + 1)) {
                 fixState();
                 return false;
             }
@@ -168,8 +173,10 @@ public:
      * 
      * @warning this value may be approximated
      */
-    size_t size() const override {
-        return tail_.load(std::memory_order_relaxed) - head_.load(std::memory_order_acquire);
+    size_t size() override {
+        uint64_t t = bit::get63LSB(tail_.load(std::memory_order_relaxed));
+        uint64_t h = head_.load(std::memory_order_acquire);
+        return t > h? t - h : 0;
     }
 
     /// @brief Defaulted destructor.
@@ -190,7 +197,7 @@ protected:
      * @return Always true.
      */
     bool close() override {
-        tail_.fetch_or(1ull<<63, std::memory_order_release);
+        tail_.fetch_or(bit::MSB64, std::memory_order_release);
         return true;
     }
 
@@ -202,7 +209,7 @@ protected:
      * @return Always true.
      */
     bool open() override {
-        tail_.fetch_and(~(1ull<<63), std::memory_order_relaxed);
+        tail_.fetch_and(bit::LSB63_MASK, std::memory_order_relaxed);
         return true;
     }
 
@@ -213,7 +220,8 @@ protected:
      * @return false If the queue is open.
      */
     bool isClosed() const override {
-        return (tail_.load(std::memory_order_relaxed) & (1ull<<63)) != 0;
+        uint64_t tail = tail_.load(std::memory_order_relaxed);
+        return is_closed_(tail);
     }
 
     /**
@@ -226,8 +234,10 @@ protected:
         return !isClosed();
     }
 
-    std::atomic<uint64_t> head_; ///< Head ticket index for dequeue.
-    std::atomic<uint64_t> tail_; ///< Tail ticket index for enqueue.
+    alignas(CACHE_LINE) std::atomic<uint64_t> head_; ///< Head ticket index for dequeue.
+    char pad_head_[CACHE_LINE - sizeof(std::atomic<uint64_t>)];
+    alignas(CACHE_LINE)std::atomic<uint64_t> tail_; ///< Tail ticket index for enqueue.
+    char pad_tail_[CACHE_LINE - sizeof(std::atomic<uint64_t>)];
     util::memory::HeapStorage<Cell> array_; ///< Underlying circular buffer storage.
 
 private:
@@ -244,15 +254,17 @@ private:
      * 
      * @note uses thread-local storage to cache the result
      * 
-     * @deprecated now hardcoded in `enqueue` method
      */
-    void* threadReserved() const {
-        thread_local void* reserved = [] {
-            std::size_t hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
-            uintptr_t encoded = static_cast<uintptr_t>(hash) << 1 | 1;
-            return reinterpret_cast<T>(encoded);
+    T threadReserved() const {
+        thread_local static T tid = [] {
+            static std::atomic<int> counter{1};
+            return reinterpret_cast<T>((counter.fetch_add(1) << 1) | 1);
         }();
-        return reserved;
+        return tid;
+    }
+
+    bool is_closed_(uint64_t val) const {
+        return bit::getMSB64(val);
     }
 
 
@@ -268,20 +280,20 @@ private:
 
     void fixState() {
         while(1) {
-            uint64_t t = tail_.load(std::memory_order_relaxed);
-            uint64_t h = head_.load(std::memory_order_relaxed);
+            uint64_t t = tail_.load();
+            uint64_t h = head_.load();
             
-            if(t != tail_.load(std::memory_order_acquire))
+            if(t != tail_.load()) // inconsistent tail
                 continue;
-            if(h > t && !tail_.compare_exchange_strong(t,h,std::memory_order_acq_rel))
-                continue;
+
+            if(h > t) { 
+                if(!tail_.compare_exchange_strong(t,h))
+                    continue;
+            }
+
             return;  
         }
     }
-
-    static uint64_t get63LSB(uint64_t v) {   return v & ~(1ull << 63);}
-    static uint64_t getMSB(uint64_t v) {     return v & (1ull << 63);}
-    static uint64_t setMSB(uint64_t v) {     return v | (1ull << 63);}
 };
 
 /**
@@ -296,16 +308,13 @@ private:
 template<typename T, typename Proxy, bool auto_close = true>
 class LinkedPRQ: 
     public PRQueue<T,std::conditional_t<auto_close,LinkedPRQ<T,Proxy>,void>>,
-    public meta::ILinkedSegment<T,LinkedPRQ<T,Proxy>> {
+    public base::ILinkedSegment<T,LinkedPRQ<T,Proxy>> {
     friend Proxy;   ///< Proxy class can access private methods.
 
     using Base = PRQueue<T,std::conditional_t<auto_close,LinkedPRQ<T,Proxy>,void>>;
+    static constexpr bool AUTO_CLOSE = auto_close;
 
 public:
-    /// @brief Defaulted destructor.
-    ~LinkedPRQ() override = default;
-
-private:
     /**
      * @brief Constructs a linked CAS loop queue segment.
      * 
@@ -314,6 +323,11 @@ private:
      */
     LinkedPRQ(size_t size, uint64_t start = 0): 
         PRQueue<T,LinkedPRQ<T,Proxy>>(size,start) {}
+
+    /// @brief Defaulted destructor.
+    ~LinkedPRQ() override = default;
+
+private:
 
     /**
      * @brief Returns the next linked segment in the chain.
@@ -324,15 +338,21 @@ private:
         return next_.load(std::memory_order_acquire);
     }
 
+
+    uint64_t getNextStartIndex() const override {
+        uint64_t tail = Base::tail_.load(std::memory_order_relaxed);
+        return bit::get63LSB(tail) - 1;
+    }
+
     bool open() final override {
-        if((Base::tail_.fetch_and(~(1ull << 63),std::memory_order_acquire) & 1ull << 63 != 0)) {
+        if(bit::getMSB64(Base::tail_.fetch_and(bit::LSB63_MASK)) != 0) {
             next_.store(nullptr,std::memory_order_relaxed);
         }
         return true;
     }
 
-    size_t size() const final override {
-        return Base::size() & ~(1ull<<63);
+    size_t size() final override {
+        return bit::get63LSB(Base::size());
     }
 
     std::atomic<LinkedPRQ*> next_{nullptr}; ///< Pointer to the next segment in the chain.

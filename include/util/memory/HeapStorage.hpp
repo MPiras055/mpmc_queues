@@ -1,8 +1,12 @@
 #pragma once
 #include <IStoragePolicy.hpp>
 #include <stdexcept>
+#include <new>
+#include <utility>
+#include <type_traits>
 
 namespace util::memory {
+
 /**
  * @brief Heap-based storage implementation for queue buffers.
  * 
@@ -12,57 +16,72 @@ namespace util::memory {
  * @tparam T Type of elements stored in the buffer.
  */
 template<typename T>
-class HeapStorage: public IStoragePolicy<T> {
+class HeapStorage : public IStoragePolicy<T> {
 public:
     /**
      * @brief Constructs a heap storage buffer with the specified capacity.
      * 
-     * Allocates a dynamic array of size @p capacity on the heap.
+     * Allocates raw memory for @p capacity elements and constructs each element
+     * with the forwarded arguments.
      * 
-     * @param capacity Number of elements the buffer can hold.
+     * @tparam Args Constructor arguments for T
+     * @param capacity Number of elements
+     * @param args Arguments to forward to T constructor
      * 
-     * @throws std::invalid_argument If @p capacity is zero.
-     * @throws std::bad_alloc If memory allocation fails.
+     * @throws std::invalid_argument If capacity is zero
+     * @throws std::bad_alloc If allocation fails
      */
-    explicit HeapStorage(size_t capacity)
-        : capacity_(capacity), buffer_(new T[capacity]){
-            if (capacity_ == 0)
-                throw std::invalid_argument("HeapStorage requires non-null capacity"); 
+    template<typename... Args>
+    explicit HeapStorage(size_t capacity, Args&&... args)
+        : capacity_(capacity), buffer_(nullptr) {
+        if (capacity_ == 0)
+            throw std::invalid_argument("HeapStorage requires non-zero capacity");
+
+        // Allocate aligned raw memory
+        buffer_ = static_cast<T*>(
+            ::operator new(sizeof(T) * capacity_, std::align_val_t(alignof(T)))
+        );
+
+        // Construct each element with forwarded arguments
+        try {
+            for (size_t i = 0; i < capacity_; ++i) {
+                new (&buffer_[i]) T(std::forward<Args>(args)...);
+            }
+        } catch (...) {
+            // If constructor throws, destroy constructed elements and free memory
+            for (size_t i = 0; i < capacity_; ++i)
+                buffer_[i].~T();
+            ::operator delete(buffer_, std::align_val_t(alignof(T)));
+            throw;
         }
+    }
 
-    /**
-     * @brief Destructor that deallocates the heap buffer.
-     */
+    // Disable copy
+    HeapStorage(const HeapStorage&) = delete;
+    HeapStorage& operator=(const HeapStorage&) = delete;
+
+    // Enable move
+    HeapStorage(HeapStorage&& other) noexcept
+        : capacity_(other.capacity_), buffer_(other.buffer_) {
+        other.buffer_ = nullptr;
+    }
+
+    HeapStorage& operator=(HeapStorage&& other) noexcept {
+        if (this != &other) {
+            destroy_buffer();
+            buffer_ = other.buffer_;
+            other.buffer_ = nullptr;
+        }
+        return *this;
+    }
+
     ~HeapStorage() override {
-        delete[] buffer_;
+        destroy_buffer();
     }
 
-    /**
-     * @brief Returns a pointer to the underlying buffer.
-     * 
-     * @return Pointer to the dynamically allocated buffer.
-     */
-    T* data() override {
-        return buffer_;
-    }
+    T* data() override { return buffer_; }
+    size_t capacity() const override { return capacity_; }
 
-    /**
-     * @brief Returns the capacity of the storage buffer.
-     * 
-     * @return Maximum number of elements that can be stored.
-     */
-    size_t capacity() const override {
-        return capacity_;
-    }
-
-    /**
-     * @brief Provides non-const access to an element by index.
-     * 
-     * @param index Position of the element in the buffer.
-     * @return Reference to the element at the given index.
-     * 
-     * @throws std::out_of_range If @p index is greater or equal to capacity.
-     */
     T& operator[](size_t index) {
 #ifndef NDEBUG
         if (index >= capacity_)
@@ -71,14 +90,6 @@ public:
         return buffer_[index];
     }
 
-    /**
-     * @brief Provides const access to an element by index.
-     * 
-     * @param index Position of the element in the buffer.
-     * @return Const reference to the element at the given index.
-     * 
-     * @throws std::out_of_range If @p index is greater or equal to capacity.
-     */
     const T& operator[](size_t index) const {
 #ifndef NDEBUG
         if (index >= capacity_)
@@ -88,8 +99,18 @@ public:
     }
 
 private:
-    const size_t capacity_; ///< Maximum number of elements the buffer can hold
-    T* buffer_;             ///< Pointer to the dynamically allocated buffer
+    void destroy_buffer() noexcept {
+        if (buffer_) {
+            for (size_t i = 0; i < capacity_; ++i) {
+                buffer_[i].~T();
+            }
+            ::operator delete(buffer_, std::align_val_t(alignof(T)));
+            buffer_ = nullptr;
+        }
+    }
+
+    const size_t capacity_;
+    T* buffer_;
 };
 
-} //namespace util::memory
+} // namespace util::memory

@@ -1,18 +1,30 @@
 #include <gtest/gtest.h>
 #include <thread>
 #include <atomic>
+#include <barrier>
 #include <vector>
 #include <random>
 #include <chrono>
-#include <iostream>
 #include <CASLoopSegment.hpp>
 #include <PRQSegment.hpp>
 #include <BoundedCounterProxy.hpp>
+#include <BoundedChunkProxy.hpp>
+#include <BoundedMemProxy.hpp>
+
+
+static constexpr size_t segments = 128;
+static constexpr size_t full_capacity = 1024 * 16;
+static constexpr size_t segment_capacity = full_capacity / segments;
 
 // ---- List of queue implementations to test ----
 typedef ::testing::Types<
-    CASLoopQueue<int*>,
-    PRQueue<int*>
+    // BoundedChunkProxy<int*,LinkedCASLoop,segments>,
+    // BoundedCounterProxy<int*,LinkedCASLoop,segments>,
+    // BoundedCounterProxy<int*,LinkedPRQ,segments>,
+    // BoundedChunkProxy<int*,LinkedPRQ,segments>,
+    BoundedMemProxy<int*,LinkedCASLoop,segments>
+
+
     //, Other queues to add here
 > QueueTypes;
 
@@ -20,7 +32,8 @@ typedef ::testing::Types<
 template <typename T>
 class QueueTest : public ::testing::Test {
 protected:
-    T q{32 * 1024,8}; // construct with capacity 128
+    T q{full_capacity,20}; //queues where each segment has capacity of 128 and can be used by 8 threads concurrently
+
 };
 TYPED_TEST_SUITE(QueueTest, QueueTypes);
 
@@ -46,13 +59,39 @@ TYPED_TEST(QueueTest, EnqueueDequeueBasic) {
     EXPECT_FALSE(this->q.dequeue(out)); // empty
 }
 
-TYPED_TEST(QueueTest, CapacityRespected) {
+TYPED_TEST(QueueTest, FreshAllocation) {
+    EXPECT_TRUE(this->q.acquire());
     int dummy;
-    for (size_t i = 0; i < this->q.capacity(); i++) {
-        EXPECT_TRUE(this->q.enqueue(&dummy));
+    int *dummy_out;
+    EXPECT_EQ(this->q.size(), 0);
+
+    //fill the queue
+    for(size_t i = 0; i < segments; i++) {
+        for(size_t i = 0; i < segment_capacity; i++) {
+            EXPECT_TRUE(this->q.enqueue(&dummy));
+        }
+        //for each segment check if the size is correct
+        EXPECT_EQ(this->q.size(), segment_capacity * (i + 1));
     }
-    EXPECT_EQ(this->q.size(), this->q.capacity());
-    EXPECT_FALSE(this->q.enqueue(&dummy)); // full
+
+    EXPECT_EQ(this->q.size(),this->q.capacity());
+
+    //check if capacity constraint is respected
+    //check if fragmentation constraint is respected
+    for(size_t i = 0; i < segment_capacity; i++) {
+        EXPECT_FALSE(this->q.enqueue(&dummy));
+    }
+
+    //empty the queue, and for each segment emptied check if size matches
+    for(signed int i = segments - 1; i >= 0; i--) {
+        for(size_t i = 0; i < segment_capacity; i++) {
+            EXPECT_TRUE(this->q.dequeue(dummy_out));
+        }
+    }
+
+    EXPECT_FALSE(this->q.dequeue(dummy_out));
+    EXPECT_EQ(this->q.size(),0);
+    this->q.release();
 }
 
 // ------------------------------------------------
@@ -60,29 +99,36 @@ TYPED_TEST(QueueTest, CapacityRespected) {
 // ------------------------------------------------
 
 TYPED_TEST(QueueTest, DequeueFromEmpty) {
+    EXPECT_TRUE(this->q.acquire());
     int* out = nullptr;
     EXPECT_FALSE(this->q.dequeue(out)); // should not crash or succeed
+    this->q.release();
 }
 
 TYPED_TEST(QueueTest, FillAndEmpty) {
+    EXPECT_TRUE(this->q.acquire());
     int dummy;
     int* out = nullptr;
+    const size_t segments_fill = segments - 1;
+    assert(segments_fill != 0 && "Wrong test parameter");
 
     EXPECT_EQ(this->q.size(),0u);  // empty
 
-    for (size_t i = 0; i < this->q.capacity(); i++) {
+    //completely fills most segments of the queue
+    for (size_t i = 0; i < segment_capacity * segments_fill; i++) {
         EXPECT_TRUE(this->q.enqueue(&dummy));
     }
-    EXPECT_EQ(this->q.size(), this->q.capacity());  // full
 
-    EXPECT_FALSE(this->q.enqueue(&dummy));
+    EXPECT_EQ(this->q.size(), (segments - 1) * segment_capacity);  // check if size matches
 
-    for (size_t i = 0; i < this->q.capacity(); i++) {
+    //completely drains 2 segments of the queue
+    for (size_t i = 0; i < segments_fill * segment_capacity; i++) {
         EXPECT_TRUE(this->q.dequeue(out));
     }
 
     EXPECT_FALSE(this->q.dequeue(out)); // empty again
     EXPECT_EQ(this->q.size(), 0);
+    this->q.release();
 }
 
 // ------------------------------------------------
@@ -90,32 +136,27 @@ TYPED_TEST(QueueTest, FillAndEmpty) {
 // ------------------------------------------------
 
 TYPED_TEST(QueueTest, SingleProducerSingleConsumer) {
-    const int N = 2000000;
+    const int N = (1024 * 1024);
     std::atomic<long long> sum{0};
     int* out = nullptr;
 
     std::thread prod([&] {
-        int yield_count = 0;
+        EXPECT_TRUE(this->q.acquire()); //each thread should get a slot
         for (int i = 1; i <= N; i++) {
             int* val = new int(i); // simulate dynamic allocation
-            while (!this->q.enqueue(val)) {} // spin
-            yield_count = 0;
+            while(!this->q.enqueue(val)){};   //unbounded queues are always successful on enqueues
         }
+        this->q.release();
     });
 
     std::thread cons([&] {
-        int yield_count = 0;
+        EXPECT_TRUE(this->q.acquire());
         for (int i = 1; i <= N; i++) {
-            // this makes livelock (in livelock prone segments)
-            // harder to occur
-            while (!this->q.dequeue(out)) {
-                std::this_thread::sleep_for(std::chrono::microseconds{10});
-            }
-
-            yield_count = 0;
+            while (!this->q.dequeue(out)) {}
             sum.fetch_add(*out, std::memory_order_relaxed);
             delete out; // cleanup
         }
+        this->q.release();
     });
 
     prod.join();
@@ -126,7 +167,7 @@ TYPED_TEST(QueueTest, SingleProducerSingleConsumer) {
 }
 
 TYPED_TEST(QueueTest, MultiProducerMultiConsumer) {
-    const int N = 2000000, P = 4, C = 4, MAX_SLEEP = 5;
+    const int N = (1024 * 1024 * 10), P = 8, C = 8;
     
     std::vector<int*> produced;
     produced.reserve(N);
@@ -142,38 +183,39 @@ TYPED_TEST(QueueTest, MultiProducerMultiConsumer) {
     std::atomic<long long> sum{0};
     std::vector<std::thread> producers, consumers;
     std::vector<std::atomic<int>> seen(N + 1); // index by value, count occurrences
+    std::barrier b(P + 1);
     for (auto& s : seen) s.store(0, std::memory_order_relaxed);
 
     // Enqueue pointers partitioned by producer
     for (int p = 0; p < P; ++p) {
         producers.emplace_back([&, p]{
-            int yield_count = 0;
+            EXPECT_TRUE(this->q.acquire()); //each thread should successfuly acquire a ticket from the queue
+            b.arrive_and_wait();
             int start = p * (N / P) + 1;
             int end   = (p + 1) * (N / P);
             for (int i = start; i <= end; ++i) {
                 int* val = produced[i-1];
-                while (!this->q.enqueue(val)) {}
-                yield_count = 0;
+                while (!this->q.enqueue(val)){}
             }
+            this->q.release(); //each thread successfuly releases the ticket from the queue
+            std::puts("Producer exiting");
         });
     }
+
+    b.arrive_and_wait();
 
     // Consumers: no delete; just record and sum
     for (int c = 0; c < C; ++c) {
         consumers.emplace_back([&]{
+            EXPECT_TRUE(this->q.acquire()); //each thread should successfuly acquire a ticket from the queue
             int* out = nullptr;
-            int yield_count = 0;
             for (int i = 0; i < N / C; ++i) {
-                while (!this->q.dequeue(out)) {
-                    yield_count++;
-                    for(size_t i = 0; i < std::max(yield_count,MAX_SLEEP); i++) {
-                        std::this_thread::sleep_for(std::chrono::microseconds{100});
-                    }
-                }
-                yield_count = 0;
+                size_t attempt = 0;
+                while (!this->q.dequeue(out)) {}
                 sum.fetch_add(*out, std::memory_order_relaxed);
                 seen[*out].fetch_add(1, std::memory_order_relaxed);
             }
+            this->q.release(); //each thread successfuly releases the previously acquired ticket
         });
     }
 
@@ -195,7 +237,7 @@ TYPED_TEST(QueueTest, MultiProducerMultiConsumer) {
 // ------------------------------------------------
 
 TYPED_TEST(QueueTest, RandomizedWorkload) {
-    const int OPS = 10000;
+    const int OPS = 1024 * 1024 * 20;
     int a = 42;
     int* out = nullptr;
     std::mt19937 rng(12345);

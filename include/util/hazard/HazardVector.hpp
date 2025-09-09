@@ -4,6 +4,10 @@
 #include <vector>
 #include <type_traits>
 #include <cassert>
+#include <specs.hpp>
+#include <HazardCell.hpp>
+
+namespace util::hazard {
 
 #ifndef HV_MAX_THREADS
 #define HV_MAX_THREADS 256
@@ -17,9 +21,6 @@
 #define THRESHOLD_R 0
 #endif
 
-/// Cache line size for alignment
-constexpr size_t CACHE_LINE = 64;
-
 /**
  * @brief Vector of hazard pointers with per-thread retired lists.
  * 
@@ -27,7 +28,7 @@ constexpr size_t CACHE_LINE = 64;
  * 
  * @tparam T Pointer type for hazard cells.
  */
-template<typename T>
+template<typename T, typename Meta = void>
 class HazardVector {
     static_assert(std::is_pointer_v<T>, "HazardVector requires T to be a pointer type");
 
@@ -47,6 +48,7 @@ public:
         : maxThreads_(maxThreads)
     {
         assert(maxThreads_ <= HV_MAX_THREADS && "maxThreads exceeds HV_MAX_THREADS");
+        storage_init();
     }
 
     /**
@@ -61,6 +63,93 @@ public:
     }
 
     /**
+     *  @brief Iterate on all threads metadata
+     *  @param fn Lambda that operates on a const reference to metadata
+     *  @warning This method can only be used on a HazardVector instance that declares
+     *           a metadata type (i.e., not void)
+     */
+    template<typename Func>
+    void metadataIter(Func&& fn) const {
+        if constexpr (!std::is_same_v<Meta,void>) {
+            for (size_t tid = 0; tid < maxThreads_; ++tid) {
+            const auto& cell = storage_[tid];
+            fn(cell.get_metadata_ronly()); // passes const Meta&
+        }
+        } else {
+            static_assert(!sizeof(Meta),"metadataIter is noly available when Meta is non-void");
+        }
+    }
+
+
+    /**
+     * @brief checks if a raw pointer is being held by any thread
+     * 
+     * @param ptr Pointer to protect.
+     * @param tid Thread ID.
+     * @param hpid Hazard pointer slot ID (default 0).
+     * @param firstToHold reference to be filled with any cell that holds the ptr
+     * @return true if any thread holds the pointer false otherwise
+     * @warning it doesn't check if the calling thread is holding the pointer
+     */
+    bool isProtected(T to_check, uint64_t ticket, size_t& firstToHold) {
+        for(size_t i = 0; i < maxThreads_; i++) {
+            if(i == ticket)
+                continue;
+            
+            for(size_t j = 0; j < HV_MAX_HPS; j++) {
+                if(to_check == storage_[i].data[j].load(std::memory_order_acquire)) {
+                    firstToHold = i;
+                    return true;
+                }
+            }
+        }
+        return false;
+    } 
+
+    /**
+     * @brief checks if a raw pointer is being held by any thread
+     * 
+     * @param ptr Pointer to protect.
+     * @param tid Thread ID.
+     * @return true if any thread holds the pointer false otherwise
+     * @warning it doesn't check if the calling thread is currently
+     * holding the pointer
+     */
+    bool isProtected(T to_check, uint64_t ticket) {
+        for(size_t i = 0; i < maxThreads_; i++) {
+            if(i == ticket)
+                continue;
+            
+            for(size_t j = 0; j < HV_MAX_HPS; j++) {
+                if(to_check == storage_[i].data[j].load(std::memory_order_acquire)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    } 
+
+    /**
+     * @brief checks if a raw pointer is being held by any thread
+     * 
+     * @param ptr Pointer to protect.
+     * 
+     * @return true if any thread holds the pointer false otherwise
+     * 
+     */
+    bool isProtected(T to_check) {
+        for(size_t i = 0; i < maxThreads_; i++) {
+            for(size_t j = 0; j < HV_MAX_HPS; j++) {
+                if(to_check == storage_[i].data[j].load(std::memory_order_acquire)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    
+
+    /**
      * @brief Protects a raw pointer in a hazard cell.
      * 
      * @param ptr Pointer to protect.
@@ -68,9 +157,9 @@ public:
      * @param hpid Hazard pointer slot ID (default 0).
      * @return The protected pointer.
      */
-    T protect(T ptr, size_t tid, size_t hpid = 0) {
+    inline T protect(T ptr, size_t tid, size_t hpid = 0) {
         assert(tid < maxThreads_ && hpid < HV_MAX_HPS);
-        storage_[tid][hpid].ptr.store(ptr, std::memory_order_release);
+        storage_[tid].data[hpid].store(ptr, std::memory_order_release);
         return ptr;
     }
 
@@ -84,15 +173,15 @@ public:
      * @param hpid Hazard pointer slot ID (default 0).
      * @return The protected pointer.
      */
-    T protect(const std::atomic<T>& atom, size_t tid, size_t hpid = 0){
+    inline T protect(const std::atomic<T>& atom, size_t tid, size_t hpid = 0){
         assert(tid < maxThreads_ && hpid < HV_MAX_HPS);
-        T n = nullptr;
-        T ret;
-        while ((ret = atom.load(std::memory_order_acquire)) != n) {
-            storage_[tid][hpid].ptr.store(ret, std::memory_order_release);
-            n = ret;
+        while(true) {
+            T tmp = atom.load(std::memory_order_acquire);
+            storage_[tid].data[hpid].store(tmp,std::memory_order_release);
+            if(atom.load(std::memory_order_acquire) == tmp) {
+                return tmp;
+            }
         }
-        return ret;
     }
 
     /**
@@ -101,10 +190,22 @@ public:
      * @param tid Thread ID.
      * @param hpid Hazard pointer slot ID (default 0).
      */
-    void clear(size_t tid, size_t hpid = 0) {
+    inline void clear(size_t tid, size_t hpid = 0) {
         assert(tid < maxThreads_ && hpid < HV_MAX_HPS);
-        storage_[tid][hpid].ptr.store(nullptr, std::memory_order_release);
+        storage_[tid].data[hpid].store(nullptr, std::memory_order_release);
     }
+
+    /**
+     * @brief getter for the metadata field
+     * 
+     * @note each thread can have some metadata that they can access and modify
+     */
+    template<
+        typename M = Meta,
+        typename Enable = std::enable_if_t<!std::is_same_v<M, void>>
+    >
+    M& getMetadata(size_t tid);
+
 
     /**
      * @brief Retires a pointer and tries to reclaim memory from the per-thread ReclaimBucket
@@ -138,7 +239,7 @@ public:
             // Scan all hazard pointers
             for (size_t t = 0; t < maxThreads_ && canDelete; ++t) {
                 for (size_t h = 0; h < HV_MAX_HPS; ++h) {
-                    if (storage_[t][h].ptr.load(std::memory_order_acquire) == obj) {
+                    if (storage_[t].data[h].load(std::memory_order_acquire) == obj) {
                         canDelete = false;
                         break;
                     }
@@ -161,21 +262,21 @@ public:
 private:
 
     /**
-     * @brief A cell storing a pointer, padded to a cache line to avoid false sharing.
-     * 
-     * @tparam T Pointer type stored in the hazard cell.
+     * @brief private method to initialize the underlying storage
      */
-    template<typename T1>
-    struct alignas(CACHE_LINE) HazardCell {
-        static_assert(std::is_pointer_v<T1>, "HazardCell requires T to be a pointer type");
-        std::atomic<T1> ptr{nullptr};
-        // Ensure the struct size is at least one full cache line
-        static_assert(sizeof(std::atomic<T1>) <= CACHE_LINE, "atomic<T> bigger than cache line");
-        // Force the element size to one full cache line
-        char _pad[CACHE_LINE - sizeof(std::atomic<T1>) > 0 ? (CACHE_LINE - sizeof(std::atomic<T1>)) : 0];
-    };
-    static_assert(alignof(HazardCell<void*>) == CACHE_LINE);
-    static_assert(sizeof(HazardCell<void*>) % CACHE_LINE == 0);
+    void storage_init() {
+        for(size_t i = 0; i < maxThreads_; i++) {
+            auto& cell = storage_[i];
+            auto& data = cell.getData();
+            for(size_t j = 0; j < HV_MAX_HPS; j++){
+                data[j].store(nullptr,std::memory_order_relaxed);
+            }
+            if constexpr (!std::is_same_v<Meta,void>) {
+                cell.meta.init();  //default construct metadata   
+            }
+        }
+    }
+
 
     template<typename T1>
     struct alignas(CACHE_LINE) RetiredBucket {
@@ -187,8 +288,17 @@ private:
     size_t maxThreads_; ///< Maximum threads supported
 
     /// Hazard pointer storage: [thread][hazard slot], aligned to cache line
-    alignas(CACHE_LINE) HazardCell<T> storage_[HV_MAX_THREADS][HV_MAX_HPS];
+    alignas(CACHE_LINE) HazardCell<std::atomic<T>[HV_MAX_HPS],Meta> storage_[HV_MAX_THREADS];
 
     /// Per-thread retired objects, aligned to cache line
     RetiredBucket<T> retired_[HV_MAX_THREADS];
 };
+
+    // Definition outside class
+    template<typename T, typename Meta>
+    template<typename M, typename>
+    inline M& HazardVector<T, Meta>::getMetadata(size_t tid) {
+        return storage_[tid].getMetadata();
+    }
+
+}   //namespace util::hazard

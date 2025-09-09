@@ -6,7 +6,7 @@
 #include <cstddef>
 #include <type_traits>
 
-namespace meta {
+namespace base {
 
 /// @brief Generic queue interface with minimal contracts for enqueue/dequeue operations.
 ///
@@ -18,7 +18,7 @@ namespace meta {
 template <typename T>
 class IQueue {
     // Restrict to pointer types (can be relaxed if needed)
-    static_assert(std::is_pointer_v<T>, "IQueue requires T to be a pointer type");
+    // static_assert(std::is_pointer_v<T>, "IQueue requires T to be a pointer type");
 
 public:
     using value_type = T;
@@ -57,7 +57,7 @@ public:
     /// For concurrent queues, this value may be approximate.
     ///
     /// @return The number of elements currently stored.
-    virtual size_t size() const = 0;
+    virtual size_t size() = 0;
 
 protected: 
     // Only accessible to friends (e.g. Proxy classes) or derived types (LinkedSegments).
