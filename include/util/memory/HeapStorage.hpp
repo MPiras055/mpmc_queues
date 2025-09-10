@@ -3,7 +3,6 @@
 #include <stdexcept>
 #include <new>
 #include <utility>
-#include <type_traits>
 
 namespace util::memory {
 

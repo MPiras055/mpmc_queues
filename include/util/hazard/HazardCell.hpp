@@ -1,7 +1,6 @@
 #pragma once
-#include <atomic>
+#include <cstddef>
 #include <specs.hpp>    // for cache line
-#include <type_traits>  // for class type evaluation
 
 namespace util::hazard {
     /**

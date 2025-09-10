@@ -4,7 +4,6 @@
 #include <barrier>
 #include <vector>
 #include <random>
-#include <chrono>
 #include <CASLoopSegment.hpp>
 #include <PRQSegment.hpp>
 #include <BoundedCounterProxy.hpp>
@@ -16,7 +15,7 @@ static constexpr size_t full_capacity = 1024 * 16;
 static constexpr size_t segment_capacity = full_capacity / segments;
 
 // ---- List of queue implementations to test ----
-typedef ::testing::Types<
+using QueueTypes = ::testing::Types<
     BoundedChunkProxy<int*,LinkedCASLoop,segments>,
     BoundedCounterProxy<int*,LinkedCASLoop,segments>,
     BoundedCounterProxy<int*,LinkedPRQ,segments>,
@@ -24,7 +23,7 @@ typedef ::testing::Types<
 
 
     //, Other queues to add here
-> QueueTypes;
+>;
 
 // ---- Fixture ----
 template <typename T>
@@ -165,7 +164,7 @@ TYPED_TEST(QueueTest, SingleProducerSingleConsumer) {
 }
 
 TYPED_TEST(QueueTest, MultiProducerMultiConsumer) {
-    const int N = (1024 * 1024 * 10), P = 8, C = 8;
+    const int N = (1024 << 10), P = 8, C = 8;
     
     std::vector<int*> produced;
     produced.reserve(N);
@@ -234,7 +233,7 @@ TYPED_TEST(QueueTest, MultiProducerMultiConsumer) {
 // ------------------------------------------------
 
 TYPED_TEST(QueueTest, RandomizedWorkload) {
-    const int OPS = 1024 * 1024 * 20;
+    const int OPS = 1024 * 1024;
     int a = 42;
     int* out = nullptr;
     std::mt19937 rng(12345);

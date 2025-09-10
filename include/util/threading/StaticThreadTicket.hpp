@@ -50,6 +50,6 @@ private:
 };
 
 // Static initialization for the counter across all instances
-std::atomic<uint64_t> StaticThreadTicket::counter_{1};
+inline std::atomic<uint64_t> StaticThreadTicket::counter_{1};
 
 } //namespace util::threading

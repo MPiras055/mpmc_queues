@@ -4,6 +4,7 @@
 #include <SequencedCell.hpp>
 #include <HeapStorage.hpp>
 #include <StaticThreadTicket.hpp>
+#include <cassert>
 #include <specs.hpp>
 #include <bit.hpp>
 

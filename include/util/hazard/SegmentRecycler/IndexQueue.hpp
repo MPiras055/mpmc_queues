@@ -5,9 +5,8 @@
 #include <limits>
 #include <cstdint>
 #include <cassert>
-#include <chrono>
+#include <algorithm>
 #include <random>
-#include <vector>
 #include <thread>
 
 namespace util::hazard {
@@ -71,7 +70,7 @@ public:
                  * enqueues take cells with old sequence numbers and empty
                  * and "renew" their sequence number
                  */
-                if( (c_seq < tailCycle) && (c_val == e_val_) && 
+                if( (c_seq < tailCycle) && (c_val == e_val_) &&
                     (c_safe || (head_.load() <= tailTicket))
                 ) {
                     c_new = Cell::pack(tailCycle,true,idx);
@@ -85,7 +84,7 @@ public:
                         threshold.store((3 * size_) - 1, std::memory_order_release);
 #endif
                     return true;
-                } else { 
+                } else {
                     break;  // inner loop
                 }
 
@@ -94,7 +93,7 @@ public:
             if(tailTicket >= head_.load(std::memory_order_acquire) + size_) {
                 return false;   //full queue
             }
-            
+
         }
     }
 
@@ -120,7 +119,7 @@ public:
                 headCycle   = static_cast<uint32_t>(headTicket / size_);   //compute the headCycle
                 headMod     = headTicket % size_;
             }
-            Cell& cell = storage_[headMod];  
+            Cell& cell = storage_[headMod];
             while(1) {
                 c_state = cell.pack_.load(std::memory_order_acquire);
                 Cell::unpack(c_state, c_seq, c_safe, c_val);
@@ -137,8 +136,8 @@ public:
                         continue;
                 }
                 break;
-            } 
-            
+            }
+
             uint64_t tail = tail_.load(std::memory_order_acquire);
             if(tail <= headTicket + 1) {
 #ifdef IDXQUEUE_THRESH
@@ -154,7 +153,7 @@ public:
         }
 
     }
-    
+
 
 private:
 
@@ -185,9 +184,9 @@ private:
 
 class IndexQueueTest {
 public:
-    IndexQueueTest(uint32_t size) 
-        : queue_(size), 
-          insertions_(0), 
+    IndexQueueTest(uint32_t size)
+        : queue_(size),
+          insertions_(0),
           extractions_(0) {}
 
     void testConcurrency() {
@@ -288,9 +287,3 @@ private:
 
 
 }
-
-
-
-
-
-
