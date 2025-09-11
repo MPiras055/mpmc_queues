@@ -8,7 +8,7 @@ namespace base {
 ///
 /// A proxy acts as the user-facing queue, hiding the underlying segments.
 /// Only linked segments are allowed as the underlying storage for proxies.
-/// 
+///
 /// @tparam T            Type of elements stored in the queue (must satisfy `IQueue` contract).
 /// @tparam DerivedProxy The derived proxy class (CRTP style).
 /// @tparam SegmentType  The linked segment template (template template parameter)
@@ -77,10 +77,10 @@ struct is_proxy<T, std::void_t<typename T::proxy_tag>> : std::true_type {};
 
 /// @brief Helper trait to check whether a given type `T`
 ///        is a linked segment (derives from `LinkedTag`).
-/// 
+///
 /// This can be used in `static_assert` or `if constexpr` checks to conditionally
 /// enable logic for linked vs. non-linked queue segments.
-/// 
+///
 /// @tparam T Candidate type to check.
 /// @retval true  if `T` is derived from `LinkedTag`.
 /// @retval false otherwise.

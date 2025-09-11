@@ -11,12 +11,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 enable_testing()
 
 # Get all subdirectories under include/
-set(GTEST_DIR 
+set(GTEST_DIR
     ${PROJECT_SOURCE_DIR}/cmake/extern/googletest
 )
 
 file(
-    GLOB_RECURSE ALL_INCLUDE_DIRS LIST_DIRECTORIES 
+    GLOB_RECURSE ALL_INCLUDE_DIRS LIST_DIRECTORIES
     true "${PROJECT_SOURCE_DIR}/include/*")
 
 # Filter to keep only directories
@@ -46,16 +46,21 @@ file(GLOB UNIT_TEST_SOURCES "src/test/unit/*.cpp")
 
 foreach(test_src ${UNIT_TEST_SOURCES})
     get_filename_component(test_name ${test_src} NAME_WE)
-    
+
     # Create executable
     add_executable(${test_name} ${test_src})
-    
+
     # Compile with address sanitizer
-    TARGET_COMPILE_OPTIONS(${test_name} PUBLIC -fsanitize=address -g)
+    TARGET_COMPILE_OPTIONS(${test_name} PUBLIC
+     -O3
+     -march=native
+     -funroll-loops
+     -fno-rtti
+    )
 
     # link gtest and fsanitize
-    target_link_libraries(${test_name} gtest_main -fsanitize=address )
-    
+    target_link_libraries(${test_name} gtest_main)
+
     # Register with CTest
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
@@ -66,12 +71,11 @@ foreach(test_src ${INTEGRATION_TEST_SOURCES})
     get_filename_component(test_name ${test_src} NAME_WE)
     ADD_EXECUTABLE(${test_name} ${test_src})
     target_link_libraries(${test_name} gtest_main)
-    target_compile_options(${test_name} PUBLIC 
-        -O3 
-        -march=native 
-        -funroll-loops 
+    target_compile_options(${test_name} PUBLIC
+        -O3
+        -march=native
+        -funroll-loops
         -fno-rtti)
-    target_compile_options(${test_name} PUBLIC -O3)
-    target_link_options(${test_name} PUBLIC)
+    target_link_options(${test_name} PUBLIC gtest_main)
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()

@@ -1,6 +1,5 @@
 #pragma once
 #include <cstdint>
-#include <iostream> 
 
 namespace bit {
 
@@ -150,7 +149,7 @@ namespace bit {
 
         // Compute next power of 2
         n--;
-        
+
         // Number of bits in T
         constexpr unsigned bits = sizeof(T) * 8;
 

@@ -26,7 +26,7 @@ namespace util::hazard {
  *  - Storage for S objects is created at construction and owned by Recycler (RAII).
  *  - The external types IndexQueue, CASLoopQueue, PtrLookup, HeapStorage are expected to
  *    provide minimal interfaces described in comments above.
- * 
+ *
  *  the recycler uses 4 buckets for any epoch e:
  *  current_bucket   = `buckets[e % 4]`    -> buckets where retire Tmls
  *  grace_bucket     = `buckets[(e+1) % 4]`-> internal bucket used to account for epoch shifts
@@ -40,14 +40,14 @@ namespace util::hazard {
  * Warning:
  *  - This implementation uses assertions for bucket overflow assumptions.
  */
-template<typename S, typename Meta = void, bool use_cache = true>
+template<typename S, typename Meta = void, bool use_cache = true, bool usePow2 = true>
 class Recycler {
 public:
     using Tml = uint32_t;
 private:
     using ThreadHazard = HazardCell<SingleWriterCell,void>;   //padded HazardCells
-    using Bucket = IndexQueue<true>;
-    using Cache = CASLoopQueue<Tml,true>;
+    using Bucket = IndexQueue<usePow2>;
+    using Cache = CASLoopQueue<Tml,usePow2>;
 public:
     /**
    * @brief Construct a Recycler.
@@ -81,11 +81,11 @@ public:
 
         /**
          *  Initialize the Tml status.
-         * 
+         *
          *  If cache is abilited, then all the Tmls are in cache
          *  else all the Tmls are in the FreeBucket and the available counter is
          *  adjusted
-         * 
+         *
          *  @note cache and/or free_bucket capacity is always assumed sufficient
          */
         for(Tml i = 0; i < tracked_count_; ++i) {
@@ -131,10 +131,10 @@ public:
      *
      * Repeatedly protects the epoch and reads the given atomic until two successive
      * reads are equal (ensuring a stable read while holding an epoch protection).
-     * 
+     *
      * @warning this method sets the calling thread as active on the first epoch when
      * the value is found stable
-     * 
+     *
      * @tparam T Atomic inner type.
      * @param ticket thread ticket index.
      * @param atom reference to atomic to read.
@@ -145,7 +145,7 @@ public:
         T1 val;
         do {
             protect_epoch(ticket);
-            val = atom.load(std::memory_order_acquire); 
+            val = atom.load(std::memory_order_acquire);
         } while(val != atom.load(std::memory_order_acquire));
         return val;
     }
@@ -177,8 +177,8 @@ public:
      * @brief Try to put a free tracked index into the fast-path cache.
      * @param in tracked index to push into cache.
      * @return true if enqueued successfully, false otherwise.
-     * 
-     * @warning the tracked index must translate to a pointer that is private to the caller 
+     *
+     * @warning the tracked index must translate to a pointer that is private to the caller
      */
     bool put_cache(Tml in) noexcept {
         if constexpr (use_cache) {
@@ -187,7 +187,7 @@ public:
             return true;
         } else {
             //if cache is disabled, callers should call `retire` instead
-            return false; 
+            return false;
         }
     }
 
@@ -212,11 +212,11 @@ public:
      * @param drop_protection when true, the thread's protection is dropped after retiring.
      */
     void retire(Tml in, uint64_t ticket, bool dropProtection = true) {
-        assert(thread_local_cell(ticket).isActive() && 
+        assert(thread_local_cell(ticket).isActive() &&
             "Recycler::retire: thread must protect an epoch to retire a TML");
-        
+
         bool ok = current_bucket_for_epoch(epoch_.load(std::memory_order_acquire)).enqueue(in);
-        assert(ok && 
+        assert(ok &&
             "Recycler::retire: CurrentBucket should always allow for enqueues");
 
         //increment the available counter
@@ -232,7 +232,7 @@ public:
      *
      * The caller must not be currently protecting an epoch (i.e., not inside
      * protect_epoch). The method tries to obtain a free index that is safe to reuse.
-     * 
+     *
      * @note in order to minimize wasted epoch cycles due to concurrent updates, each caller
      * protects the current epoch in order to try and advance it, this allows for fairness, but
      * shorter protection windows could optimize the system for better responsiveness
@@ -243,7 +243,7 @@ public:
      */
     bool reclaim(Tml& out,uint64_t ticket) {
         //used to try and reclaim something from the quarantine
-        assert(!thread_local_cell(ticket).isActive() && 
+        assert(!thread_local_cell(ticket).isActive() &&
             "Cannot reclaim while protecting an epoch");
 
         bool got = false;
@@ -257,12 +257,12 @@ public:
             got = get_from_free_bucket(out,snapshot);
             clear_epoch(ticket);
             if(got) return true;
-        
+
             //don't protect in here
             snapshot = epoch_.load(std::memory_order_acquire);
             // check if the epoch can be safely advanced (no active thread holds a prior epoch),
             // attempt to CAS increment epoch by 1
-            if(can_advance_epoch(snapshot)) { 
+            if(can_advance_epoch(snapshot)) {
 
                 uint64_t nextEpoch = snapshot + 1;
                 (void)epoch_.compare_exchange_strong(snapshot,nextEpoch,std::memory_order_acq_rel);
@@ -273,7 +273,7 @@ public:
             }
 
             // spin again and check if any more items are available
-            
+
         }
 
         //clear the epoch before exiting
@@ -289,7 +289,7 @@ private:
      * @brief Initialize underlying S* storage and return a PtrLookup wrapper.
      *
      * @param size number of items to construct
-     * @param tml_args argument forward from the constructor 
+     * @param tml_args argument forward from the constructor
      * @return PtrLookup<S*> with ownership of the storage
      */
     template<typename... Args>
@@ -343,7 +343,7 @@ private:
             return true;
         }
         return false;
-        
+
     }
 
     /**
@@ -357,13 +357,13 @@ private:
     /**
      * @brief check whether an epoch can safely advance
      * @par snapshot of the global epoch
-     * 
+     *
      * The epoch can be advanced only if every actrive thread either:
      * - is inactive or
      * - has the same snapshot value (so advancing won't break their invariants)
-     * 
+     *
      * @returns true if the epoch can be safely advanced, false otherwise
-     * 
+     *
      * @warning the following method returns false if the calling thread is active on
      * a prior epoch
      */
@@ -389,6 +389,6 @@ private:
     PtrLookup<S*> lookup_;                      ///< index => pointer translation (immutable)
     Cache cache_;                               ///< optional fast path cache
     const uint32_t tracked_count_{};            ///< how many globally tracked Tmls
-                                            
+
 };
 }   //namespace util::hazard

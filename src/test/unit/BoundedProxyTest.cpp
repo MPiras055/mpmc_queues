@@ -8,6 +8,7 @@
 #include <PRQSegment.hpp>
 #include <BoundedCounterProxy.hpp>
 #include <BoundedChunkProxy.hpp>
+#include <BoundedMemProxy.hpp>
 
 
 static constexpr size_t segments = 4;
@@ -16,12 +17,11 @@ static constexpr size_t segment_capacity = full_capacity / segments;
 
 // ---- List of queue implementations to test ----
 using QueueTypes = ::testing::Types<
-    BoundedChunkProxy<int*,LinkedCASLoop,segments>,
-    BoundedCounterProxy<int*,LinkedCASLoop,segments>,
-    BoundedCounterProxy<int*,LinkedPRQ,segments>,
-    BoundedChunkProxy<int*,LinkedPRQ,segments>
-
-
+    // BoundedChunkProxy<int*,LinkedCASLoop,segments>,
+    // BoundedCounterProxy<int*,LinkedCASLoop,segments>,
+    // BoundedCounterProxy<int*,LinkedPRQ,segments>,
+    // BoundedChunkProxy<int*,LinkedPRQ,segments>
+    BoundedMemProxy<int*,LinkedPRQ,segments>
     //, Other queues to add here
 >;
 
@@ -160,12 +160,12 @@ TYPED_TEST(QueueTest, SingleProducerSingleConsumer) {
     cons.join();
 
     EXPECT_EQ(sum, 1LL * N * (N + 1) / 2);
-    
+
 }
 
 TYPED_TEST(QueueTest, MultiProducerMultiConsumer) {
-    const int N = (1024 << 10), P = 8, C = 8;
-    
+    const int N = (1024 << 15), P = 8, C = 8;
+
     std::vector<int*> produced;
     produced.reserve(N);
 

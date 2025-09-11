@@ -1,276 +1,243 @@
-#include <IProxy.hpp>               // proxy interface
-#include <DynamicThreadTicket.hpp>  // cached thread tickets for hazard pointers
-#include <SegmentRecycler.hpp>      // hazard segment recycle
-#include <HeapStorage.hpp>              // for segment storage
-#include <specs.hpp>                // padding definition
-#include <bit.hpp>                  // bit manipulation
+#include <IProxy.hpp>               //proxy interface
+#include <DynamicThreadTicket.hpp>  //cached thread tickets
+#include <Recycler.hpp>             //memory recycler
+#include <atomic>
+#include <cstdint>
+#include <specs.hpp>                //padding definition
+#include <bit.hpp>                  //bitwise manipulation
 
-template <typename T, template<typename,typename> typename Seg, size_t Seg_count = 1024>
-class BoundedMemProxy: public base::IProxy<T,Seg> {
-    using Segment = Seg<T, BoundedMemProxy>;
-    static constexpr bool is_unbounded = true;
-    static inline thread_local uint64_t success = 0;
+template <
+    typename T, //type of the queue item
+    template<typename T1,typename Proxy, bool p = true, bool auto_close = true> typename SegmentType, //deferred segment type
+    size_t ChunkFactor = 4,     //recycler's pool size
+    bool Pow2 = true,           //segment pow2
+    bool RecyclerPow2 = true,   //enable pow2 optimization for recycler queues
+    bool useCache = true        //enable recycler's cache
+> class BoundedMemProxy: public base::IProxy<T, SegmentType> {
 
-public: 
-    explicit BoundedMemProxy(size_t cap, size_t maxThreads) : 
-        ticketing_{maxThreads}, recycler_{Seg_count,cap / Seg_count,maxThreads}, seg_capacity_{cap / Seg_count} {
-        Segment *sentinel = nullptr;
-        assert(recycler_.getCache(sentinel) && "BoundedMemProxy - constructor - no segment got form recycler cache");
-        tail_.store(sentinel,std::memory_order_relaxed);
-        head_.store(sentinel,std::memory_order_relaxed);
-    }
+    using Segment = SegmentType<T,BoundedMemProxy,Pow2,true>;
+    //for this design we NECESSARILY need the recycler to use the cache
+    using Recycler = util::hazard::Recycler<Segment,void,true,RecyclerPow2>;
+    using VersionedIndex = uint64_t;
+    using Index = Recycler::Tml;
+    using Version = uint32_t;
+    using Ticket = uint64_t;
+    using TaggedPtr = uint64_t;
+    static constexpr uint32_t INC_VERSION = 2;
 
-    ~BoundedMemProxy() {
-        T ignore;
-        while(dequeue(ignore)); //implicitly returns segments to the recycler
+    static_assert(
+                ((sizeof(Version) + sizeof(Index)) <= sizeof(VersionedIndex)) &&
+                (sizeof(VersionedIndex) <= sizeof(Segment*)),
+                    "Version and index cannot fit in a single memory word"
+    );
+
+public:
+
+    explicit BoundedMemProxy(size_t capacity, size_t maxThreads):
+            ticketing_(maxThreads),
+            seg_capacity_((Pow2? bit::next_power_of_two(capacity) : capacity) / ChunkFactor),
+            recycler_(ChunkFactor,maxThreads,seg_capacity_) {
+
+        assert(seg_capacity_ != 0 && "Segment Capacity is null (if Pow2 abilitated check division underflow)");
+        assert(maxThreads != 0 && "The managed number of threads must be non null");
+
+        if(!useCache) {
+            std::abort();
+        }
+
+        Index SentinelIndex;
+        if(!recycler_.get_cache(SentinelIndex)) {
+            assert(false && "CANNOT GET SENTINEL FROM CACHE");
+        }
+        Version v = versionPool_.fetch_add(INC_VERSION);
+        TaggedPtr Sentinel = getTagged(v, SentinelIndex);
+        head_.store(Sentinel);
+        tail_.store(Sentinel);
+
+        //check if next pointer is setted correctly
+        assert(
+            recycler_.decode(SentinelIndex)->getNext() == nullptr &&
+            "Constructor: next pointer not correct"
+        );
+
     }
 
     bool enqueue(T item) override {
-        uint64_t ticket = get_ticket_();    //get per thread ticket
-        recycler_.protect(ticket);  //before getting any shared pointers we need to protect the epoch
-        Segment* tail = tail_.load(std::memory_order_acquire);
-        Segment* localNext = nullptr;
-        uint64_t local_version = ~0ull;
+        Ticket t = get_ticket_();
+        bool failedReclaim{false};
 
-        static thread_local int64_t retries = -1;
-
-        //start retry loop
         while(1) {
-            if(retries % 1000000 == 0) {
-                std::cout << "FATAL: enqueue livelock" << std::endl;
-                std::abort();
-            }
-            retries++;
-            recycler_.protect(ticket);  //protection before acquiring a shared pointers
-            Segment *tail2 = tail_.load(std::memory_order_acquire);
-            if(tail != tail2) {
-                tail = tail2;
-                continue;   //until tail stabilizes
-            }
+            TaggedPtr taggedTail = recycler_.protect_epoch_and_load(t,tail_);
 
-            //check if the next field was setted
-            //no need to acquire protection since next is a field of the tail (if we protected tail we are also protecting next)
-            Segment *next = tail->getNext();
-            if(next != nullptr) {
-                //try to CAS it as new global tail
-                (void)(tail_.compare_exchange_strong(tail, next,std::memory_order_release));
+            if(updateNextTail(taggedTail)){
                 continue;
             }
 
-            //we are protecting tail
-            if(safeEnqueue_(tail,item)) {
-                recycler_.clear(ticket);
-                if(localNext != nullptr)
-                    putBack(localNext);
-                retries = -1;
+            if(safeEnqueue(taggedTail,item)) {
+                recycler_.clear_epoch(t);
                 return true;
             }
 
-            //local version is setted if get() fails
-            if(local_version == version.load(std::memory_order_acquire)) {
-                recycler_.clear(ticket);
-                return false;   
-            }
-
-            //the current segment was closed
-            if(localNext == nullptr) {  //we need to acquire a local copy
-                recycler_.clear(ticket);    //dropping epoch protection
-                local_version = version.load(std::memory_order_acquire);
-                if(recycler_.get(localNext,ticket)) {
-                    local_version = ~0ull; //got a new segment so reset the version
-                    bool ret = localNext->open();
-                    ret = ret && localNext->enqueue(item);  //we insert the item here
-                    assert(ret && "Problems opening the segment");
+            //failed we have to check and reclaim
+            Index newQueueIndex = 0;
+            if(recycler_.get_cache(newQueueIndex)) {
+                //reset the reclaim flag
+                failedReclaim = false;
+                //enqueue your item
+                Segment *newQueue = recycler_.decode(newQueueIndex);
+                (void)newQueue->enqueue(item);
+                Version v = versionPool_.fetch_add(INC_VERSION);
+                newQueue = ptrCast(getTagged(v,newQueueIndex));
+                Segment *nullNode = nullptr;
+                Segment *currentTail = recycler_.decode(getIndex(taggedTail));
+                //try to link
+                if(currentTail->next_.compare_exchange_strong(nullNode,newQueue)) {
+                    //link successful
+                    (void) tail_.compare_exchange_strong(taggedTail,taggedCast(newQueue));
+                    recycler_.clear_epoch(t);
+                    return true;
+                }  else {
+                    //dequeue your item and place
+                    T ignore;
+                    (void) recycler_.decode(newQueueIndex)->dequeue(ignore);
+                    recycler_.put_cache(newQueueIndex);
                 }
-
-                recycler_.protect(ticket);
-                tail = tail_.load(std::memory_order_acquire);
-                continue;   //need to make sure we get a reliable snapshot of the tail
-            } 
-
-            next = nullptr;
-            //we are still protecting the tail so we can attempt a CAS
-            if(tail->next_.compare_exchange_strong(next,localNext)) { //we successfuly linked our segment
-                //successfuly linked [update version to signal new tail]
-                version.fetch_add(1,std::memory_order_acq_rel);
-                //still protecting tail [update the current global tail]
-                (void) tail_.compare_exchange_strong(tail,localNext);
-                recycler_.clear(ticket);
-                retries = -1;
-                return true;
+            } else {
+                //try to reclaim
+                recycler_.clear_epoch(t);
+                if(recycler_.reclaim(newQueueIndex,t)) {
+                    //clear this queue and place it in cache
+                    Segment* reclaimedQueue = recycler_.decode(newQueueIndex);
+                    //open the previously cloead queue
+                    (void) reclaimedQueue->open();
+                    recycler_.put_cache(newQueueIndex);
+                } else if(failedReclaim) {
+                    return false;
+                } else {
+                    failedReclaim = true;
+                }
             }
-
-
         }
     }
 
-    /**
-     * @brief puts back a segment in the recycler cache
-     * @par seg: segment pointer
-     * @warning after this method the segment is not usable anymore
-     */
-    void putBack(Segment* ptr) {
-        T ignore{nullptr};
-        int success = 0;
-        int nulls = 0;
-        while(ptr->dequeue(ignore)) {
-            success++;
-        }
-        assert(success != 0 && "Empty Segment should have supported a single dequeue");
-        assert(success == 1 && "Multiple dequeues on the same segment");
-        recycler_.putCache(ptr);
-    }
-
-
-
-    bool dequeue(T& out) override {
-        uint64_t ticket = get_ticket_();
-
-        recycler_.protect(ticket);  //update protection
-        Segment *head = head_.load(std::memory_order_acquire);
+    bool dequeue(T& item) override {
+        Ticket t = get_ticket_();
         while(1) {
-            //check for head consistency
-            recycler_.protect(ticket);  //update protection
-            Segment* head2 = head_.load(std::memory_order_acquire);
-            if(head != head2) {
-                head = head2;
-                continue; //until head stabilizes
-            }
-
-            //try to dequeue on current segment
-            if(!head->dequeue(out)) {
-                //if segment empty check for next
-                
-
-                Segment *next = head->getNext();
+            TaggedPtr taggedHead = recycler_.protect_epoch_and_load(t,head_);
+            Segment* head = recycler_.decode(getIndex(taggedHead));
+            if(!head->dequeue(item)) {
+                //check next
+                Segment* next = head->getNext();
                 if(next == nullptr) {
-                    //if no next then nothing to dequeue
-                    recycler_.clear(ticket);
+                    //empty queue
+                    recycler_.clear_epoch(t);
                     return false;
                 }
 
-                //next was setted: try one more time to dequeue on the current segment
-                if(!head->dequeue(out)) {
-                    //if dequeue failed then no-one will enqueue on this segment
-                    //try to update the current head
-                    Segment* exp = head;
-                    if(head_.compare_exchange_strong(exp,next)) {
-                        recycler_.recycle(head); //put the segment in the recycler
-                        head = next;    //successfuly updated to next
-                    } else {
-                        head = exp; //failed somebody updated the head before us
+                if(!head->dequeue(item)) {
+                    //try to cas the new next
+                    if(head_.compare_exchange_strong(taggedHead,taggedCast(next))) {
+                        //drop protection
+                        recycler_.retire(getIndex(taggedHead),t,true);
                     }
-
                     continue;
                 }
             }
 
-            recycler_.clear(ticket);
+            recycler_.clear_epoch(t);
             return true;
         }
     }
 
-
-    /**
-     * @brief get the underlying segment capacity
-     * @returns `size_t` capacity of all segments
-     */
-    size_t capacity() const override { return seg_capacity_ * Seg_count; }
-
-    /**
-     * @brief get an approximation of the total number of elements the queue holds
-     * 
-     * @warning requires the thread to have acquired an operation slot
-     */
-    size_t size() override {
-        uint64_t tail,head;
-        uint64_t ticket = get_ticket_();
-        recycler_.protect(ticket);  //operating on shared memory
-        Segment *tail_seg = tail_.load(std::memory_order_acquire);
-        tail = bit::get63LSB(tail_seg->tail_.load(std::memory_order_acquire));
-        Segment *head_seg = head_.load(std::memory_order_acquire);
-        head = head_seg->head_.load(std::memory_order_acquire); 
-        recycler_.clear(ticket);
-        return head > tail ? 0 : tail - head;
-    }
-
-    /**
-     * @brief books a ticket for the calling thread
-     * 
-     * Operation on proxy requires all threads to be tracked for memory management.
-     * A threads that intends to operate on the data structure requires to acquire
-     * a slot.
-     * 
-     * @return true if the slot has been acquired false otherwise
-     * @warning operating on the data structure without acquiring a slot results in 
-     * undefined behaviour
-     */
     bool acquire() override {
-        uint64_t ignore;
+        Ticket ignore;
         return ticketing_.acquire(ignore);
- 
     }
 
-    /**
-     * @brief clears the calling thread ticket
-     * 
-     * @return void
-     * @note this method is idempotent (calling it multiple times results in no
-     * side effects)
-     */
     void release() override {
-        return ticketing_.release();
+        ticketing_.release();
     }
+
+    size_t size() override {
+        return 0;
+    }
+
+    size_t capacity() const override {
+        return seg_capacity_ * ChunkFactor;
+    }
+
 
 private:
 
-    /**
-     * @brief wrapper for enqueue on segment (livelock prevention)
-     * 
-     * Segments have a `close` flag that blocks further insertions.
-     * On some segments, if the flag is setted, trying further insertions
-     * can make dequeues have to do extra work (to reallineate indexes) and 
-     * in some cases lead to livelock phoenomena. 
-     * 
-     * This method uses a TLS cached tail pointer, to avoid calling inner 
-     * segment enqueues if the segment was already recorded as close
-     * 
-     *  @warning requires the pointer to be hazard protected
-     */
-    inline bool safeEnqueue_(Segment *tail, T item) {
-    // Thread-local pointer to track the last seen tail that was closed or full
-        static thread_local uint64_t lastSeen = ~0ull;
-        uint64_t localVersion = version.load(std::memory_order_acquire);
-        if ((lastSeen == localVersion) && tail->isClosed()) {
-            return false;  // Don't attempt enqueue if the segment is already closed
-
-        } if (!tail->enqueue(item)) {
-            lastSeen = localVersion;
-            return false;  // Enqueue failed, mark the segment as stale/full
+    inline bool safeEnqueue(TaggedPtr tail, T item) {
+        static thread_local Version lastV = 0; //reserved for nullptr
+        Segment * ptr = recycler_.decode(getIndex(tail));
+        Version v = getVersion(tail);
+        if(v == lastV && ptr->isClosed()) {
+            return false;
+        } else if (ptr->enqueue(item)) {
+            lastV = 0;
+            return true;
+        } else {
+            lastV = v;
+            return false;
         }
-
-        return true;
     }
-
 
     /**
-     * @brief internal get_ticket function
-     * 
-     * @note asserts that the calling thread possesses a ticket
+     * @brief checks if a new next tail exists
+     * @return true if the tail was updated false otherwise
      */
-    inline uint64_t get_ticket_() {
-        uint64_t retval;
-        assert(ticketing_.acquire(retval) && "Warning: no ticket could be acquired");
-        return retval;
+    inline bool updateNextTail(TaggedPtr tail) {
+        Segment* ptr    = recycler_.decode(getIndex(tail));
+        Segment* next   = ptr->getNext();
+        if(next == nullptr) {
+            return false;
+        }
+        //try to cas the tail to the next tail
+        (void)tail_.compare_exchange_strong(tail,taggedCast(next));
+        return true;
+
     }
 
-    alignas(CACHE_LINE) std::atomic<Segment*> head_{nullptr};
-    char pad_head_[CACHE_LINE - sizeof(std::atomic<Segment *>)];
-    alignas(CACHE_LINE) std::atomic<Segment*> tail_{nullptr};
-    char pad_tail_[CACHE_LINE - sizeof(std::atomic<Segment *>)];
-    alignas(CACHE_LINE) std::atomic<uint64_t> version{0}; //ABA prevention
-    char pad_new_[CACHE_LINE - sizeof(std::atomic<uint64_t>)];
+    inline Ticket get_ticket_() {
+        Ticket t;
+        bool ok = ticketing_.acquire(t);
+        assert(ok && "No ticket could have bee acquired");
+        return t;
+    }
+
+    // ========================
+    // Casting & Tagged Methods
+    // ========================
+
+    inline TaggedPtr taggedCast(Segment* ptr) const {
+        return reinterpret_cast<TaggedPtr>(ptr);
+    }
+
+    TaggedPtr getTagged(Version v, Index i) const {
+        return bit::merge(v,i);
+    }
+
+    inline Segment* ptrCast(TaggedPtr ptr) const {
+        return reinterpret_cast<Segment*>(ptr);
+    }
+
+    inline Index getIndex(TaggedPtr p) const {
+        return bit::keep_low(p);
+    }
+
+    inline Version getVersion(TaggedPtr p) const {
+        return bit::keep_high(p);
+    }
+
+    alignas(CACHE_LINE) std::atomic<TaggedPtr> tail_{0};   //matches the nullptr value
+    char pad_tail_[CACHE_LINE - sizeof(std::atomic<TaggedPtr>)];
+    alignas(CACHE_LINE) std::atomic<TaggedPtr> head_{0};   //matches the nullptr value
+    char pad_head_[CACHE_LINE - sizeof(std::atomic<TaggedPtr>)];
+    alignas(CACHE_LINE) std::atomic<Version> versionPool_{1};   //all versions must be odd (version 0 is reserved for nullptr)
+    char pad_version_[CACHE_LINE - sizeof(std::atomic<Version>)];
     util::threading::DynamicThreadTicket ticketing_;
-    util::hazard::SegmentRecycler<Segment> recycler_;
     size_t const seg_capacity_;
+    Recycler recycler_;
 };
