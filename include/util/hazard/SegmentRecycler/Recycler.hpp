@@ -4,6 +4,7 @@
 #include <HazardCell.hpp>
 #include <SingleWriterCell.hpp>
 #include <PtrLookup.hpp>
+#include <iostream>
 
 namespace util::hazard {
 
@@ -37,6 +38,12 @@ namespace util::hazard {
  *  - Public methods are thread-safe following the algorithm's design; many assertions
  *    represent debug-time invariants only (they are not release-time error handling).
  *
+ * Indexing:
+ * - In order to provide for ABA safety, recyclers interface methods take or return `uint32_t` base
+ * indexes. Indexes map to pointer and the `T* decode(uint32_t method)` is used to convert. Indexes
+ * make easier to store deferred pointers along with version counters that only take one word of
+ * memory.
+ *
  * Warning:
  *  - This implementation uses assertions for bucket overflow assumptions.
  */
@@ -45,7 +52,7 @@ class Recycler {
 public:
     using Tml = uint32_t;
 private:
-    using ThreadHazard = HazardCell<SingleWriterCell,void>;   //padded HazardCells
+    using ThreadHazard = HazardCell<SingleWriterCell,Meta>;   //padded HazardCells
     using Bucket = IndexQueue<usePow2>;
     using Cache = CASLoopQueue<Tml,usePow2>;
 public:
@@ -74,6 +81,8 @@ public:
                 cache_{tracked},
                 tracked_count_{static_cast<Tml>(tracked)} {
         static_assert(std::is_same_v<Tml,uint32_t>,"Tml must be uint32_t");
+
+        // std::cout << "CACHE_" << cache_.capacity() << " TRACKED " << tracked << "\n";
 
         assert(tracked < static_cast<size_t>(UINT32_MAX) && "Recycler: Cannot track more than (UINT32_MAX - 1) elements");
         assert(tracked > 0 && "Recycler: tracked count must be non-null");
@@ -124,6 +133,43 @@ public:
     void protect_epoch(uint64_t ticket) {
         const uint64_t snapshot = epoch_.load(std::memory_order_acquire);
         thread_local_cell(ticket).activate(snapshot);
+    }
+
+    /**
+     * @brief gets a reference to threads metadata
+     *
+     * @note enable only if metadata is set to non-void
+     *
+     * @param ticket that unvocly identifies the thread
+     *
+     * @returns reference to threads associated metadata
+     *
+     * @warning To avoid cache invalidation each thread should only
+     * access to modify its own metadata, use `metadataIter` to operate
+     * on thread metadata
+     */
+    template<
+        typename M = Meta,
+        typename Enable = std::enable_if_t<!std::is_same_v<M,void>>
+    >
+    M& getMetadata(uint64_t ticket);
+
+    /**
+     *  @brief Iterate on all threads metadata
+     *  @param fn Lambda that operates on a const reference to metadata
+     *  @warning This method can only be used on a HazardVector instance that declares
+     *           a metadata type (i.e., not void)
+     */
+    template<typename Func>
+    void metadataIter(Func&& fn) {
+        if constexpr (!std::is_same_v<Meta,void>) {
+            for (uint64_t tid = 0; tid < thread_local_storage_.capacity(); ++tid) {
+            const Meta& cell = thread_local_hazard(tid).get_metadata_ronly_();
+            fn(cell); // passes const Meta&
+        }
+        } else {
+            static_assert(!sizeof(Meta),"metadataIter is noly available when Meta is non-void");
+        }
     }
 
     /**
@@ -325,6 +371,13 @@ private:
     }
 
     /**
+     * @brief helper to get a HazardCell for a given ticket
+     */
+     inline HazardCell<SingleWriterCell,Meta>& thread_local_hazard(uint64_t ticket) {
+         return thread_local_storage_[ticket];
+     }
+
+    /**
      * @brief helper to get a constant view of a thread_local SWL for a given ticket
      */
     inline const SingleWriterCell& thread_local_cell_const(uint64_t ticket) const {
@@ -391,4 +444,12 @@ private:
     const uint32_t tracked_count_{};            ///< how many globally tracked Tmls
 
 };
+
+    // Definition outside class
+    template<typename T, typename Meta, bool Pow2, bool useCache>
+    template<typename M, typename>
+    inline M& Recycler<T, Meta, Pow2, useCache>::getMetadata(uint64_t ticket) {
+        return thread_local_hazard(ticket).getMetadata();
+    }
+
 }   //namespace util::hazard

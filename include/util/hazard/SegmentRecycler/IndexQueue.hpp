@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <random>
 #include <thread>
+#include <iostream>
 
 namespace util::hazard {
 
@@ -15,8 +16,8 @@ namespace util::hazard {
 // #define IDXQUEUE_THRESH 1
 /**
  * @brief Lockless queue for `uint32_t` index values
- * 
- * @note based off of LPRQ with modification since CAS2 is not required for single word cells 
+ *
+ * @note based off of LPRQ with modification since CAS2 is not required for single word cells
  */
 template<bool pow_2 = false>
 class IndexQueue {
@@ -24,12 +25,13 @@ class IndexQueue {
 
 public:
     IndexQueue(uint32_t size, uint32_t e_val = MAX) noexcept:
-        size_{pow_2? bit::next_power_of_two(size) : size},
+        size_{pow_2? bit::next_pow2(size) : size},
+        mask_{size_ - 1},
         shift_{pow_2? bit::log2(size_) : 0},
         storage_{size_},
         e_val_{e_val} {
         assert((size != 0) && "IndexQueue: size non-nullable");
- 
+
         head_.store(size_,std::memory_order_relaxed);
         tail_.store(size_,std::memory_order_relaxed);
 
@@ -54,7 +56,7 @@ public:
             tailTicket = tail_.fetch_add(1,std::memory_order_acq_rel);
             if constexpr (pow_2) {
                 tailCycle = static_cast<uint32_t>(tailTicket >> shift_);
-                tailMod   = static_cast<uint32_t>(tailTicket & (size_ - 1));
+                tailMod   = static_cast<uint32_t>(tailTicket & mask_);
             } else {
                 tailCycle = static_cast<uint32_t>(tailTicket / size_);  //compute the tailCycle
                 tailMod = tailTicket % size_;
@@ -114,7 +116,7 @@ public:
             headTicket  = head_.fetch_add(1,std::memory_order_acq_rel);
             if constexpr (pow_2) {
                 headCycle   = static_cast<uint32_t>(headTicket >> shift_);
-                headMod     = static_cast<uint32_t>(headTicket & (size_ - 1));
+                headMod     = static_cast<uint32_t>(headTicket & mask_);
             } else {
                 headCycle   = static_cast<uint32_t>(headTicket / size_);   //compute the headCycle
                 headMod     = headTicket % size_;
@@ -176,8 +178,9 @@ private:
     alignas(CACHE_LINE) std::atomic<int64_t> threshold{-1};
     char pad_thresh_[PAD_SIZE];
 #endif
-    const size_t size_;      //size of the queue
-    const size_t shift_;
+    const size_t size_;         //size of the queue
+    const size_t mask_;
+    const size_t shift_;        //log2 shift division
     util::memory::HeapStorage<Cell> storage_;
     const uint32_t e_val_;  //empty value
 };

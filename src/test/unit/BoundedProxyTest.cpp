@@ -6,7 +6,7 @@
 #include <random>
 #include <CASLoopSegment.hpp>
 #include <PRQSegment.hpp>
-#include <BoundedCounterProxy.hpp>
+// #include <BoundedCounterProxy.hpp>
 #include <BoundedChunkProxy.hpp>
 #include <BoundedMemProxy.hpp>
 
@@ -21,7 +21,10 @@ using QueueTypes = ::testing::Types<
     // BoundedCounterProxy<int*,LinkedCASLoop,segments>,
     // BoundedCounterProxy<int*,LinkedPRQ,segments>,
     // BoundedChunkProxy<int*,LinkedPRQ,segments>
-    BoundedMemProxy<int*,LinkedPRQ,segments>
+    // BoundedChunkProxy<int*,LinkedPRQ,segments>
+    // BoundedMemProxy<int*,LinkedCASLoop,segments>,
+    BoundedChunkProxy<int*,LinkedCASLoop,segments>
+
     //, Other queues to add here
 >;
 
@@ -164,8 +167,7 @@ TYPED_TEST(QueueTest, SingleProducerSingleConsumer) {
 }
 
 TYPED_TEST(QueueTest, MultiProducerMultiConsumer) {
-    const int N = (1024 << 15), P = 8, C = 8;
-
+    const int N = (1024 * 1024 * 50), P = 8, C = 8;
     std::vector<int*> produced;
     produced.reserve(N);
 

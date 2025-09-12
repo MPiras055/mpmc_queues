@@ -4,12 +4,12 @@
 #include <specs.hpp>                //padding definition
 #include <bit.hpp>                  //bit manipulation
 
-template <typename T, template<typename,typename> typename Seg>
+template <typename T, template<typename,typename,bool,bool> typename Seg>
 class UnboundedProxy: public base::IProxy<T,Seg> {
-    using Segment = Seg<T, UnboundedProxy>;
+    using Segment = Seg<T, UnboundedProxy,true,true>;
 
-public: 
-    explicit UnboundedProxy(size_t cap, size_t maxThreads) : 
+public:
+    explicit UnboundedProxy(size_t cap, size_t maxThreads) :
         ticketing_{maxThreads},hazard_{maxThreads},seg_capacity_{cap} {
         assert(cap != 0 && "Segment Capacity must be non-null");
         Segment* sentinel = new Segment(cap,0);
@@ -123,7 +123,7 @@ public:
 
     /**
      * @brief get an approximation of the total number of elements the queue holds
-     * 
+     *
      * @warning requires the thread to have acquired an operation slot
      */
     size_t size() override {
@@ -139,24 +139,24 @@ public:
 
     /**
      * @brief books a ticket for the calling thread
-     * 
+     *
      * Operation on proxy requires all threads to be tracked for memory management.
      * A threads that intends to operate on the data structure requires to acquire
      * a slot.
-     * 
+     *
      * @return true if the slot has been acquired false otherwise
-     * @warning operating on the data structure without acquiring a slot results in 
+     * @warning operating on the data structure without acquiring a slot results in
      * undefined behaviour
      */
     bool acquire() override {
         uint64_t ignore;
         return ticketing_.acquire(ignore);
- 
+
     }
 
     /**
      * @brief clears the calling thread ticket
-     * 
+     *
      * @return void
      * @note this method is idempotent (calling it multiple times results in no
      * side effects)
@@ -169,7 +169,7 @@ private:
 
     /**
      * @brief internal get_ticket function
-     * 
+     *
      * @note asserts that the calling thread possesses a ticket
      */
     inline uint64_t get_ticket_() {
@@ -185,5 +185,5 @@ private:
     util::threading::DynamicThreadTicket ticketing_;
     util::hazard::HazardVector<Segment*> hazard_;
     const size_t seg_capacity_;
-    
+
 };

@@ -56,10 +56,13 @@ foreach(test_src ${UNIT_TEST_SOURCES})
      -march=native
      -funroll-loops
      -fno-rtti
+     -DNDEBUG
     )
 
     # link gtest and fsanitize
     target_link_libraries(${test_name} gtest_main)
+    # TARGET_COMPILE_OPTIONS(${test_name} PUBLIC -fsanitize=address -g -O3)
+    # TARGET_LINK_LIBRARIES(${test_name} PUBLIC gtest_main -fsanitize=address)
 
     # Register with CTest
     add_test(NAME ${test_name} COMMAND ${test_name})

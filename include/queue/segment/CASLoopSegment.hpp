@@ -39,15 +39,16 @@ public:
      * @param start Initial sequence number (defaults to 0).
      */
     CASLoopQueue(size_t size, uint64_t start = 0):
-        array_(Pow2? bit::next_power_of_two(size) : size),
-        mask_(array_.capacity() - (Pow2? 1 : 0))
+        size_(Pow2? bit::next_pow2(size) : size),
+        mask_{size_ - 1},
+        array_{size_}
     {
-        assert(size != 0 && "Null capacity");
-        assert(array_.capacity() == size  && "HeapStorage doesn't match required size");
-        for(uint64_t i = start; i < start + size; i++) {
-            array_[i % size].val = T{};
-            array_[i % size].seq.store(i, std::memory_order_relaxed);
 
+        assert(size_ != 0 && "Null capacity");
+        assert((!Pow2 || (size_ != 1)) && "Pow2 enabled with size 1");
+
+        for(uint64_t i = start; i < start + size_; i++) {
+            array_[i % size_].seq.store(i, std::memory_order_relaxed);
         }
 
         head_.store(start, std::memory_order_relaxed);
@@ -69,18 +70,18 @@ public:
     size_t index;
 
     do {
-        tailTicket = bit::get63LSB(tail_.load(std::memory_order_relaxed));
+        tailTicket = tail_.load(std::memory_order_relaxed);
 
         if constexpr (base::is_linked_segment_v<Effective>) {
-            if (isClosed()) {
-                return false;
+            if (is_closed_(tailTicket)) {
+                return false;   //tail is closed
             }
         }
 
         if constexpr (Pow2) {
             index = tailTicket & mask_;
         } else {
-            index = tailTicket % mask_;
+            index = tailTicket % size_;
         }
 
         Cell& node = array_[index];
@@ -127,7 +128,7 @@ public:
             if constexpr (Pow2) {
                 index = headTicket & mask_;
             } else {
-                index = headTicket % mask_;
+                index = headTicket % size_;
             }
             Cell& node = (array_[index]);
             seq  = node.seq.load(std::memory_order_acquire);
@@ -139,13 +140,11 @@ public:
                     headTicket, headTicket + 1,
                     std::memory_order_relaxed)) {
                     container = node.val.load(std::memory_order_acquire);
-                    node.seq.store(headTicket + array_.capacity(), std::memory_order_release);
+                    node.seq.store(headTicket + size_, std::memory_order_release);
                     return true;
                 }
-            } else if(diff < 0){
-                if(size() == 0) {
-                    return false;
-                }
+            } else if(diff < 0 && (size() == 0)){
+                return false;
             }
 
         } while(true);
@@ -190,7 +189,7 @@ protected:
      * @return Always true.
      */
     bool close() override {
-        tail_.fetch_or(bit::MSB64, std::memory_order_release);
+        tail_.fetch_or(bit::MSB64, std::memory_order_acq_rel);
         return true;
     }
 
@@ -202,8 +201,11 @@ protected:
      * @return Always true.
      */
     bool open() override {
-        tail_.store(head_.load(std::memory_order_acquire),std::memory_order_release);
         return true;
+    }
+
+    bool is_closed_(uint64_t tail) const {
+        return bit::getMSB64(tail) != 0;
     }
 
     /**
@@ -214,8 +216,9 @@ protected:
      */
     bool isClosed() const override {
         uint64_t tail = tail_.load(std::memory_order_relaxed);
-        return bit::getMSB64(tail) != 0;
+        return is_closed_(tail);
     }
+
 
     /**
      * @brief Checks if the queue is open.
@@ -231,8 +234,10 @@ protected:
     char pad_head_[CACHE_LINE - sizeof(std::atomic<uint64_t>)];
     alignas(CACHE_LINE)std::atomic<uint64_t> tail_; ///< Tail ticket index for enqueue.
     char pad_tail_[CACHE_LINE - sizeof(std::atomic<uint64_t>)];
-    util::memory::HeapStorage<Cell> array_; ///< Underlying circular buffer storage.
+    const size_t size_;
     const size_t mask_;
+    util::memory::HeapStorage<Cell> array_; ///< Underlying circular buffer storage.
+
 };
 
 
@@ -283,7 +288,8 @@ public:
      */
     LinkedCASLoop(size_t size, uint64_t start = 0):
         Base(size,start) {
-            assert(base::is_linked_segment_v<std::decay_t<decltype(*this)>> && "LinkedSegment is not linked");
+            assert(base::is_linked_segment_v<std::decay_t<decltype(*this)>>
+                && "LinkedSegment is not linked");
         }
 
     /// @brief Defaulted destructor.
@@ -300,8 +306,12 @@ private:
     }
 
     bool open() final override {
-        (void)Base::open();     //align the indexes
-        next_.store(nullptr,std::memory_order_release);
+        uint64_t tail = Base::tail_.load(std::memory_order_relaxed);
+        if(Base::is_closed_(tail)) {
+            uint64_t head = Base::head_.load(std::memory_order_relaxed);
+            next_.store(nullptr,std::memory_order_relaxed);
+            Base::tail_.compare_exchange_strong(tail,head,std::memory_order_acq_rel);
+        }
         return true;
     }
 

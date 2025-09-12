@@ -4,16 +4,17 @@
 #include <specs.hpp>                //padding definition
 #include <bit.hpp>                  //bit manipulation
 
-template <typename T, template<typename,typename> typename Seg, size_t Seg_count = 4>
+template <typename T, template<typename,typename,bool,bool> typename Seg, size_t Seg_count = 4>
 class BoundedChunkProxy: public base::IProxy<T,Seg> {
-    using Segment = Seg<T, BoundedChunkProxy>;
+    using Segment = Seg<T, BoundedChunkProxy,false,true>;
     static constexpr bool is_unbounded = true;
 
-public: 
-    explicit BoundedChunkProxy(size_t cap, size_t maxThreads) : 
+public:
+    explicit BoundedChunkProxy(size_t cap, size_t maxThreads) :
         ticketing_{maxThreads},hazard_{maxThreads},seg_capacity_{cap / Seg_count},full_capacity_{cap} {
         assert(cap != 0 && "Segment Capacity must be non-null");
         assert(cap / Seg_count > 0 && "Underlying segment capacity overflow");
+        assert(maxThreads > 0 && "Cannot manage 0 threads");
         Segment* sentinel = new Segment(seg_capacity_,0);
         head_.store(sentinel,std::memory_order_relaxed);
         tail_.store(sentinel,std::memory_order_relaxed);
@@ -70,8 +71,8 @@ public:
                 //try to update the global tail pointer
                 (void)tail_.compare_exchange_strong(tail, newTail);
                 break;
-            } 
-                
+            }
+
             delete newTail; //failed: another tail was already linked
             //acquire protection on the current new tail
             tail = hazard_.protect(null, ticket);
@@ -133,7 +134,7 @@ public:
 
     /**
      * @brief get an approximation of the total number of elements the queue holds
-     * 
+     *
      * @warning requires the thread to have acquired an operation slot
      */
     size_t size() override {
@@ -149,24 +150,24 @@ public:
 
     /**
      * @brief books a ticket for the calling thread
-     * 
+     *
      * Operation on proxy requires all threads to be tracked for memory management.
      * A threads that intends to operate on the data structure requires to acquire
      * a slot.
-     * 
+     *
      * @return true if the slot has been acquired false otherwise
-     * @warning operating on the data structure without acquiring a slot results in 
+     * @warning operating on the data structure without acquiring a slot results in
      * undefined behaviour
      */
     bool acquire() override {
         uint64_t ignore;
         return ticketing_.acquire(ignore);
- 
+
     }
 
     /**
      * @brief clears the calling thread ticket
-     * 
+     *
      * @return void
      * @note this method is idempotent (calling it multiple times results in no
      * side effects)
@@ -179,38 +180,38 @@ private:
 
     /**
      * @brief wrapper for enqueue on segment (livelock prevention)
-     * 
+     *
      * Segments have a `close` flag that blocks further insertions.
      * On some segments, if the flag is setted, trying further insertions
-     * can make dequeues have to do extra work (to reallineate indexes) and 
-     * in some cases lead to livelock phoenomena. 
-     * 
-     * This method uses a TLS cached tail pointer, to avoid calling inner 
+     * can make dequeues have to do extra work (to reallineate indexes) and
+     * in some cases lead to livelock phoenomena.
+     *
+     * This method uses a TLS cached tail pointer, to avoid calling inner
      * segment enqueues if the segment was already recorded as close
-     * 
+     *
      *  @warning requires the pointer to be hazard protected
      */
     inline bool safeEnqueue_(Segment *tail, T item) {
     // Thread-local pointer to track the last seen tail that was closed or full
-        static thread_local Segment *lastSeen = nullptr;
+        static thread_local uint64_t lastSeen = 0;
 
-        if (lastSeen == tail && tail->isClosed()) {
+        if ((lastSeen == tail_idx_.load()) && tail->isClosed()) {
             return false;  // Don't attempt enqueue if the segment is already closed
         }
-        
+
         if (!tail->enqueue(item)) {
-            lastSeen = tail;
+            lastSeen = tail_idx_.load();
             return false;  // Enqueue failed, mark the segment as stale/full
         }
 
-        lastSeen = nullptr;
+        lastSeen = 0;
         return true;
     }
 
 
     /**
      * @brief checks if a successful enqueue would respect the capacity provided
-     * 
+     *
      * @note checks if the max number of segments was allocated
      */
     inline bool capacity_respected_() const {
@@ -224,12 +225,13 @@ private:
 
     /**
      * @brief internal get_ticket function
-     * 
+     *
      * @note asserts that the calling thread possesses a ticket
      */
     inline uint64_t get_ticket_() {
         uint64_t retval;
-        assert(ticketing_.acquire(retval) && "Warning: no ticket could be acquired");
+        bool ok = ticketing_.acquire(retval);
+        assert(ok && "Warning: no ticket could be acquired");
         return retval;
     }
 
@@ -237,13 +239,13 @@ private:
     char pad_head_[CACHE_LINE - sizeof(std::atomic<Segment *>)];
     alignas(CACHE_LINE) std::atomic<Segment*> tail_{nullptr};
     char pad_tail_[CACHE_LINE - sizeof(std::atomic<Segment *>)];
-    alignas(CACHE_LINE) std::atomic<uint64_t> tail_idx_{0};
+    alignas(CACHE_LINE) std::atomic<uint64_t> tail_idx_{1};
     char pad_tail_idx_[CACHE_LINE - sizeof(std::atomic<uint64_t>)];
-    alignas(CACHE_LINE) std::atomic<uint64_t> head_idx_{0};
+    alignas(CACHE_LINE) std::atomic<uint64_t> head_idx_{1};
     char pad_head_idx_[CACHE_LINE - sizeof(std::atomic<uint64_t>)];
     util::threading::DynamicThreadTicket ticketing_;
     util::hazard::HazardVector<Segment*> hazard_;
     const size_t seg_capacity_;
     const size_t full_capacity_;
-    
+
 };

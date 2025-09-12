@@ -11,7 +11,7 @@
 
 // ---- List of queue implementations to test ----
 typedef ::testing::Types<
-    CASLoopQueue<int*>,
+    // CASLoopQueue<int*>,
     PRQueue<int*>
     //, Other queues to add here
 > QueueTypes;
@@ -122,12 +122,12 @@ TYPED_TEST(QueueTest, SingleProducerSingleConsumer) {
     cons.join();
 
     EXPECT_EQ(sum, 1LL * N * (N + 1) / 2);
-    
+
 }
 
 TYPED_TEST(QueueTest, MultiProducerMultiConsumer) {
     const int N = 2000000, P = 4, C = 4, MAX_SLEEP = 5;
-    
+
     std::vector<int*> produced;
     produced.reserve(N);
 

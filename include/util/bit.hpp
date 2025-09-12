@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <type_traits>
 
 namespace bit {
 
@@ -134,18 +135,18 @@ namespace bit {
     }
 
     template <typename T>
-    constexpr bool is_power_of_two(T n) {
+    constexpr bool is_pow2(T n) {
         static_assert(std::is_unsigned_v<T>, "T must be unsigned integral type");
         return n != 0 && ( (n & (n - 1)) == 0 );
     }
 
     template <typename T>
-    constexpr T next_power_of_two(T n) {
+    constexpr T next_pow2(T n) {
         static_assert(std::is_unsigned_v<T>, "T must be unsigned integral type");
 
         if (n == 0) return 1;
 
-        if (is_power_of_two(n)) return n;
+        if (is_pow2(n)) return n;
 
         // Compute next power of 2
         n--;

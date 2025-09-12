@@ -23,9 +23,9 @@ namespace util::hazard {
 
 /**
  * @brief Vector of hazard pointers with per-thread retired lists.
- * 
+ *
  * Implements a hazard pointer pattern for safe memory reclamation in lock-free structures.
- * 
+ *
  * @tparam T Pointer type for hazard cells.
  */
 template<typename T, typename Meta = void>
@@ -41,7 +41,7 @@ class HazardVector {
 public:
     /**
      * @brief Constructs a HazardVector for a given number of threads.
-     * 
+     *
      * @param maxThreads Maximum number of threads that will use this hazard vector.
      */
     explicit HazardVector(size_t maxThreads)
@@ -83,7 +83,7 @@ public:
 
     /**
      * @brief checks if a raw pointer is being held by any thread
-     * 
+     *
      * @param ptr Pointer to protect.
      * @param tid Thread ID.
      * @param hpid Hazard pointer slot ID (default 0).
@@ -95,7 +95,7 @@ public:
         for(size_t i = 0; i < maxThreads_; i++) {
             if(i == ticket)
                 continue;
-            
+
             for(size_t j = 0; j < HV_MAX_HPS; j++) {
                 if(to_check == storage_[i].data[j].load(std::memory_order_acquire)) {
                     firstToHold = i;
@@ -104,11 +104,11 @@ public:
             }
         }
         return false;
-    } 
+    }
 
     /**
      * @brief checks if a raw pointer is being held by any thread
-     * 
+     *
      * @param ptr Pointer to protect.
      * @param tid Thread ID.
      * @return true if any thread holds the pointer false otherwise
@@ -119,7 +119,7 @@ public:
         for(size_t i = 0; i < maxThreads_; i++) {
             if(i == ticket)
                 continue;
-            
+
             for(size_t j = 0; j < HV_MAX_HPS; j++) {
                 if(to_check == storage_[i].data[j].load(std::memory_order_acquire)) {
                     return true;
@@ -127,15 +127,15 @@ public:
             }
         }
         return false;
-    } 
+    }
 
     /**
      * @brief checks if a raw pointer is being held by any thread
-     * 
+     *
      * @param ptr Pointer to protect.
-     * 
+     *
      * @return true if any thread holds the pointer false otherwise
-     * 
+     *
      */
     bool isProtected(T to_check) {
         for(size_t i = 0; i < maxThreads_; i++) {
@@ -147,11 +147,11 @@ public:
         }
         return false;
     }
-    
+
 
     /**
      * @brief Protects a raw pointer in a hazard cell.
-     * 
+     *
      * @param ptr Pointer to protect.
      * @param tid Thread ID.
      * @param hpid Hazard pointer slot ID (default 0).
@@ -165,9 +165,9 @@ public:
 
     /**
      * @brief Protects a pointer loaded from an atomic.
-     * 
+     *
      * Spins until the value stabilizes.
-     * 
+     *
      * @param atom Atomic pointer to load and protect.
      * @param tid Thread ID.
      * @param hpid Hazard pointer slot ID (default 0).
@@ -186,7 +186,7 @@ public:
 
     /**
      * @brief Clears a hazard pointer.
-     * 
+     *
      * @param tid Thread ID.
      * @param hpid Hazard pointer slot ID (default 0).
      */
@@ -197,7 +197,7 @@ public:
 
     /**
      * @brief getter for the metadata field
-     * 
+     *
      * @note each thread can have some metadata that they can access and modify
      */
     template<
@@ -209,7 +209,7 @@ public:
 
     /**
      * @brief Retires a pointer and tries to reclaim memory from the per-thread ReclaimBucket
-     * 
+     *
      * @param ptr Pointer to retire.
      * @param tid Thread ID performing the retire.
      * @param checkThreshold [default = false] Whether to skip reclamation if retired list is below threshold.
@@ -221,12 +221,12 @@ public:
 
         retired_[tid].v.push_back(ptr);
 
-        return checkThreshold && retired_[tid].v.size() < THRESHOLD_R ? 0 : collect(tid);
+        return (checkThreshold && retired_[tid].v.size() < THRESHOLD_R) ? 0 : collect(tid);
     }
 
     /**
      * @brief Reclaims memory from the per-thread RetireBucket if possible
-     * 
+     *
      * @param tid Thread ID performing the retire.
      * @return Number of objects deleted during this call.
      */
@@ -272,7 +272,7 @@ private:
                 data[j].store(nullptr,std::memory_order_relaxed);
             }
             if constexpr (!std::is_same_v<Meta,void>) {
-                cell.meta.init();  //default construct metadata   
+                cell.meta.init();  //default construct metadata
             }
         }
     }

@@ -12,12 +12,12 @@ namespace base {
 /// @tparam T            Type of elements stored in the queue (must satisfy `IQueue` contract).
 /// @tparam DerivedProxy The derived proxy class (CRTP style).
 /// @tparam SegmentType  The linked segment template (template template parameter)
-template <  typename T, template<typename,typename> class SegmentType>
+template <  typename T, template<typename,typename,bool,bool> class SegmentType>
 class IProxy : public IQueue<T> {
     // -------------------------------------------------------------------------
     // Static assertion to ensure SegmentType is a linked segment
     // -------------------------------------------------------------------------
-    static_assert(is_linked_segment_v<SegmentType<T,void>>,
+    static_assert(is_linked_segment_v<SegmentType<T,void,true,true>>,
                   "Proxy interfaces only allow Linked Segments");
 
 public:

@@ -17,7 +17,7 @@ template <
 
     using Segment = SegmentType<T,BoundedMemProxy,Pow2,true>;
     //for this design we NECESSARILY need the recycler to use the cache
-    using Recycler = util::hazard::Recycler<Segment,void,true,RecyclerPow2>;
+    using Recycler = util::hazard::Recycler<Segment,std::atomic<int64_t>,true,RecyclerPow2>;
     using VersionedIndex = uint64_t;
     using Index = Recycler::Tml;
     using Version = uint32_t;
@@ -35,7 +35,7 @@ public:
 
     explicit BoundedMemProxy(size_t capacity, size_t maxThreads):
             ticketing_(maxThreads),
-            seg_capacity_((Pow2? bit::next_power_of_two(capacity) : capacity) / ChunkFactor),
+            seg_capacity_((Pow2? bit::next_pow2(capacity) : capacity) / ChunkFactor),
             recycler_(ChunkFactor,maxThreads,seg_capacity_) {
 
         assert(seg_capacity_ != 0 && "Segment Capacity is null (if Pow2 abilitated check division underflow)");
@@ -47,12 +47,16 @@ public:
 
         Index SentinelIndex;
         if(!recycler_.get_cache(SentinelIndex)) {
-            assert(false && "CANNOT GET SENTINEL FROM CACHE");
+            assert(false && "Cannot get segment from cache");
         }
         Version v = versionPool_.fetch_add(INC_VERSION);
         TaggedPtr Sentinel = getTagged(v, SentinelIndex);
         head_.store(Sentinel);
         tail_.store(Sentinel);
+
+        for(size_t i = 0; i < maxThreads; i++) {
+            recycler_.getMetadata(i).store(0,std::memory_order_relaxed);
+        }
 
         //check if next pointer is setted correctly
         assert(
@@ -75,6 +79,7 @@ public:
 
             if(safeEnqueue(taggedTail,item)) {
                 recycler_.clear_epoch(t);
+                recycler_.getMetadata(t).fetch_add(1,std::memory_order_relaxed);
                 return true;
             }
 
@@ -85,6 +90,9 @@ public:
                 failedReclaim = false;
                 //enqueue your item
                 Segment *newQueue = recycler_.decode(newQueueIndex);
+                assert(newQueue->isOpened() && "Private queue from cache wasn't opened");
+                T ignore;
+                assert(newQueue->dequeue(ignore) == false && "Not expected dequeue from private segment");
                 (void)newQueue->enqueue(item);
                 Version v = versionPool_.fetch_add(INC_VERSION);
                 newQueue = ptrCast(getTagged(v,newQueueIndex));
@@ -95,11 +103,16 @@ public:
                     //link successful
                     (void) tail_.compare_exchange_strong(taggedTail,taggedCast(newQueue));
                     recycler_.clear_epoch(t);
+                    recycler_.getMetadata(t).fetch_add(1,std::memory_order_relaxed);
                     return true;
                 }  else {
                     //dequeue your item and place
                     T ignore;
-                    (void) recycler_.decode(newQueueIndex)->dequeue(ignore);
+                    size_t success = 0;
+                    while(recycler_.decode(newQueueIndex)->dequeue(ignore)) {
+                        success++;
+                    }
+                    assert(success == 1 && "More enqueues from private segment than expected");
                     recycler_.put_cache(newQueueIndex);
                 }
             } else {
@@ -108,6 +121,7 @@ public:
                 if(recycler_.reclaim(newQueueIndex,t)) {
                     //clear this queue and place it in cache
                     Segment* reclaimedQueue = recycler_.decode(newQueueIndex);
+                    assert(reclaimedQueue->isClosed() && "Reclaimed queue wasn't closed");
                     //open the previously cloead queue
                     (void) reclaimedQueue->open();
                     recycler_.put_cache(newQueueIndex);
@@ -145,6 +159,7 @@ public:
             }
 
             recycler_.clear_epoch(t);
+            recycler_.getMetadata(t).fetch_sub(1,std::memory_order_relaxed);
             return true;
         }
     }
@@ -159,8 +174,14 @@ public:
     }
 
     size_t size() override {
-        return 0;
+        int64_t total = 0;
+        recycler_.metadataIter([&total](const std::atomic<int64_t>& m) {
+            total += m.load(std::memory_order_relaxed);
+        });
+        assert(total >= 0 && "Negative size detected");
+        return static_cast<size_t>(total);
     }
+
 
     size_t capacity() const override {
         return seg_capacity_ * ChunkFactor;
@@ -173,7 +194,7 @@ private:
         static thread_local Version lastV = 0; //reserved for nullptr
         Segment * ptr = recycler_.decode(getIndex(tail));
         Version v = getVersion(tail);
-        if(v == lastV && ptr->isClosed()) {
+        if((v == lastV) && ptr->isClosed()) {
             return false;
         } else if (ptr->enqueue(item)) {
             lastV = 0;

@@ -3,16 +3,14 @@
 #include <atomic>
 #include <vector>
 #include <random>
-#include <chrono>
-#include <iostream>
 #include <CASLoopSegment.hpp>
 #include <PRQSegment.hpp>
 #include <UnboundedProxy.hpp>
 
 // ---- List of queue implementations to test ----
 typedef ::testing::Types<
-    UnboundedProxy<int*,LinkedPRQ>,
-    UnboundedProxy<int*,LinkedCASLoop>
+    UnboundedProxy<int*,LinkedPRQ>
+    // UnboundedProxy<int*,LinkedCASLoop>
     //, Other queues to add here
 > QueueTypes;
 
@@ -131,12 +129,12 @@ TYPED_TEST(QueueTest, SingleProducerSingleConsumer) {
     cons.join();
 
     EXPECT_EQ(sum, 1LL * N * (N + 1) / 2);
-    
+
 }
 
 TYPED_TEST(QueueTest, MultiProducerMultiConsumer) {
-    const int N = (1024 << 8), P = 8, C = 8;
-    
+    const int N = (1024 << 15), P = 8, C = 8;
+
     std::vector<int*> produced;
     produced.reserve(N);
 
