@@ -41,28 +41,6 @@ public:
     /// in no side effects)
     ///
     virtual void release() = 0;
-
-protected:
-    // -------------------------------------------------------------------------
-    // Disable lifecycle methods for proxies
-    // These operations are managed by the underlying segments
-    // -------------------------------------------------------------------------
-
-    /// @brief Disabled for proxies. Segments control the lifecycle.
-    /// @return false always
-    bool open() final override { return false; }
-
-    /// @brief Disabled for proxies. Segments control the lifecycle.
-    /// @return false always
-    bool close() final override { return false; }
-
-    /// @brief Disabled for proxies. Segments control the lifecycle.
-    /// @return true always
-    bool isOpened() const final override { return true; }
-
-    /// @brief Disabled for proxies. Segments control the lifecycle.
-    /// @return false always
-    bool isClosed() const final override { return false; }
 };
 
 // ===========================================================

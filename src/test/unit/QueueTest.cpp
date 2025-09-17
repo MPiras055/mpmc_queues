@@ -4,7 +4,6 @@
 #include <vector>
 #include <random>
 #include <chrono>
-#include <iostream>
 #include <CASLoopSegment.hpp>
 #include <PRQSegment.hpp>
 #include <BoundedCounterProxy.hpp>

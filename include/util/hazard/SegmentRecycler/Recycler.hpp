@@ -4,7 +4,6 @@
 #include <HazardCell.hpp>
 #include <SingleWriterCell.hpp>
 #include <PtrLookup.hpp>
-#include <iostream>
 
 namespace util::hazard {
 
@@ -161,10 +160,10 @@ public:
      *           a metadata type (i.e., not void)
      */
     template<typename Func>
-    void metadataIter(Func&& fn) {
+    void metadataIter(Func&& fn) const  {
         if constexpr (!std::is_same_v<Meta,void>) {
             for (uint64_t tid = 0; tid < thread_local_storage_.capacity(); ++tid) {
-            const Meta& cell = thread_local_hazard(tid).get_metadata_ronly_();
+            const Meta& cell = thread_local_storage_[tid].get_metadata_ronly_();
             fn(cell); // passes const Meta&
         }
         } else {
@@ -312,10 +311,10 @@ public:
 
                 uint64_t nextEpoch = snapshot + 1;
                 (void)epoch_.compare_exchange_strong(snapshot,nextEpoch,std::memory_order_acq_rel);
-                snapshot = protect_epoch_and_load(ticket,epoch_);
-                got = get_from_free_bucket(out,snapshot);
-                clear_epoch(ticket);
-                if(got) return true;
+                // snapshot = protect_epoch_and_load(ticket,epoch_);
+                // got = get_from_free_bucket(out,snapshot);
+                // clear_epoch(ticket);
+                // if(got) return true;
             }
 
             // spin again and check if any more items are available

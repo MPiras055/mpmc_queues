@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <stdexcept>
+#include <specs.hpp>
 
 #ifndef DTT_MAX_BITS
 #define DTT_MAX_BITS 1024
@@ -36,6 +37,8 @@ public:
 
     /// Sentinel for "no ticket".
     static constexpr std::uint64_t INVALID_ID   = std::uint64_t(-1);
+
+    using Ticket = uint64_t;
 
     /**
      * @brief Construct a manager with a runtime cap on tickets.
@@ -94,7 +97,7 @@ public:
      * @param out_ticket written with the acquired ticket on success
      * @return true if a ticket was acquired (or reused), false if none available
      */
-    bool acquire(std::uint64_t& out_ticket) {
+    bool acquire(Ticket& out_ticket) {
         std::uint64_t& local_id = tls_id_cache()[instance_id_];
 
         // Fast path: already have a ticket for this instance.
@@ -218,7 +221,7 @@ private:
     std::uint64_t maxThreads_;    ///< Runtime cap on tickets for this instance.
 
     // Ticket bitset: storage_[i] has 1-bits for free tickets, 0-bits for held tickets.
-    std::array<std::atomic<std::uint64_t>, NumCells> storage_{};
+    align std::array<std::atomic<std::uint64_t>, NumCells> storage_{};
 
     // Global bitset of free instance IDs: 1=free, 0=used (low MaxInstances bits used).
     static inline std::atomic<std::uint64_t> instance_bitmap_{

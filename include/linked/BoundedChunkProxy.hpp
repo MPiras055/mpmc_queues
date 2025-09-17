@@ -4,12 +4,19 @@
 #include <specs.hpp>                //padding definition
 #include <bit.hpp>                  //bit manipulation
 
-template <typename T, template<typename,typename,bool,bool> typename Seg, size_t Seg_count = 4>
+template <
+    typename T,
+    template<typename,typename,bool,bool> typename Seg,
+    size_t Seg_count = 4,
+    bool Pow2 = false
+>
 class BoundedChunkProxy: public base::IProxy<T,Seg> {
-    using Segment = Seg<T, BoundedChunkProxy,false,true>;
-    static constexpr bool is_unbounded = true;
+    using Segment = Seg<T, BoundedChunkProxy,Pow2,true>;
+    using ThreadRecord = std::atomic<int64_t>;  //for accurate length computation
+    using Ticket = util::threading::DynamicThreadTicket::Ticket;    //ticket for thread access
 
 public:
+    static constexpr size_t Segments = Seg_count;
     explicit BoundedChunkProxy(size_t cap, size_t maxThreads) :
         ticketing_{maxThreads},hazard_{maxThreads},seg_capacity_{cap / Seg_count},full_capacity_{cap} {
         assert(cap != 0 && "Segment Capacity must be non-null");
@@ -27,20 +34,15 @@ public:
     }
 
     bool enqueue(T item) override {
-        uint64_t ticket = get_ticket_();
-
-        Segment* tail = hazard_.protect(tail_.load(std::memory_order_relaxed), ticket);
+        Ticket ticket = get_ticket_();
 
         while (true) {
             //check for tail consistency
-            Segment* tail2 = tail_.load(std::memory_order_acquire);
-            if (tail != tail2) {
-                tail = hazard_.protect(tail2, ticket);
-                continue;
-            }
+            Segment* tail= hazard_.protect(tail_,ticket);
 
             //check if next ptr was setted
             Segment* next = tail->getNext();
+
             if (next != nullptr) {
                 //try update the tail pointer globally
                 bool ret = tail_.compare_exchange_strong(tail,next);
@@ -72,27 +74,22 @@ public:
                 (void)tail_.compare_exchange_strong(tail, newTail);
                 break;
             }
-
-            delete newTail; //failed: another tail was already linked
-            //acquire protection on the current new tail
             tail = hazard_.protect(null, ticket);
+            delete newTail; //failed: another tail was already linked
+
         }
         hazard_.clear(ticket);
+        recordEnqueue(ticket);
         return true;
     }
 
 
 
     bool dequeue(T& out) override {
-        uint64_t ticket = get_ticket_();
-        Segment *head = hazard_.protect(head_.load(std::memory_order_relaxed),ticket);
+        Ticket ticket = get_ticket_();
         while(1) {
             //check for head consistency
-            Segment* head2 = head_.load(std::memory_order_acquire);
-            if(head != head2) {
-                head = hazard_.protect(head2,ticket);
-                continue;
-            }
+            Segment* head = hazard_.protect(head_,ticket);
 
             //try to dequeue on current segment
             if(!head->dequeue(out)) {
@@ -110,9 +107,12 @@ public:
                     //try to update the current head
                     if(head_.compare_exchange_strong(head,next)) {
                         head_idx_.fetch_add(1,std::memory_order_release);
-                        //retire the current segment
-                        hazard_.retire(head,ticket);
+                        //record the current segment
+                        Segment *old = head;
+                        //update protection on the current segment
                         head = hazard_.protect(next,ticket);
+                        //retire the old segment
+                        hazard_.retire(old,ticket);
                     } else {
                         head = hazard_.protect(head,ticket);
                     }
@@ -121,6 +121,7 @@ public:
             }
 
             hazard_.clear(ticket);
+            recordDequeue(ticket);
             return true;
         }
     }
@@ -133,19 +134,17 @@ public:
     size_t capacity() const override { return full_capacity_; }
 
     /**
-     * @brief get an approximation of the total number of elements the queue holds
+     * @brief size method
      *
-     * @warning requires the thread to have acquired an operation slot
+     * @note doesn't require a thread to have acquired an operational slot
      */
-    size_t size() override {
-        uint64_t tail,head;
-        uint64_t ticket = get_ticket_();
-        Segment *tail_seg = hazard_.protect(tail_,ticket);
-        tail = bit::get63LSB(tail_seg->tail_.load(std::memory_order_relaxed));
-        Segment *head_seg = hazard_.protect(head_,ticket);
-        head = head_seg->head_.load(std::memory_order_acquire);
-        hazard_.clear(get_ticket_());
-        return head > tail ? 0 : tail - head;
+    size_t size() const override {
+        int64_t total = 0;
+        hazard_.metadataIter([&total](const std::atomic<int64_t>& m) {
+            total += m.load(std::memory_order_relaxed);
+        });
+        assert(total >= 0 && "Negative size detected");
+        return static_cast<size_t>(total);
     }
 
     /**
@@ -160,7 +159,7 @@ public:
      * undefined behaviour
      */
     bool acquire() override {
-        uint64_t ignore;
+        Ticket ignore;
         return ticketing_.acquire(ignore);
 
     }
@@ -179,6 +178,20 @@ public:
 private:
 
     /**
+    * @brief records an enqueue in the caller thread metadata section
+    */
+    inline void recordEnqueue(Ticket t) {
+        hazard_.getMetadata(t).fetch_add(1,std::memory_order_relaxed);
+    }
+
+    /**
+    * @brief records a dequeue in the caller thread metadata section
+    */
+    inline void recordDequeue(Ticket t) {
+        hazard_.getMetadata(t).fetch_sub(1,std::memory_order_relaxed);
+    }
+
+    /**
      * @brief wrapper for enqueue on segment (livelock prevention)
      *
      * Segments have a `close` flag that blocks further insertions.
@@ -195,12 +208,12 @@ private:
     // Thread-local pointer to track the last seen tail that was closed or full
         static thread_local uint64_t lastSeen = 0;
 
-        if ((lastSeen == tail_idx_.load()) && tail->isClosed()) {
+        if ((lastSeen == tail_idx_.load(std::memory_order_relaxed)) && tail->isClosed()) {
             return false;  // Don't attempt enqueue if the segment is already closed
         }
 
         if (!tail->enqueue(item)) {
-            lastSeen = tail_idx_.load();
+            lastSeen = tail_idx_.load(std::memory_order_acquire);
             return false;  // Enqueue failed, mark the segment as stale/full
         }
 
@@ -235,16 +248,16 @@ private:
         return retval;
     }
 
-    alignas(CACHE_LINE) std::atomic<Segment*> head_{nullptr};
-    char pad_head_[CACHE_LINE - sizeof(std::atomic<Segment *>)];
-    alignas(CACHE_LINE) std::atomic<Segment*> tail_{nullptr};
-    char pad_tail_[CACHE_LINE - sizeof(std::atomic<Segment *>)];
-    alignas(CACHE_LINE) std::atomic<uint64_t> tail_idx_{1};
-    char pad_tail_idx_[CACHE_LINE - sizeof(std::atomic<uint64_t>)];
-    alignas(CACHE_LINE) std::atomic<uint64_t> head_idx_{1};
-    char pad_head_idx_[CACHE_LINE - sizeof(std::atomic<uint64_t>)];
+    align std::atomic<Segment*> head_{nullptr};
+    CACHE_PAD_TYPES(std::atomic<Segment*>);
+    align std::atomic<Segment*> tail_{nullptr};
+    CACHE_PAD_TYPES(std::atomic<Segment*>);
+    align std::atomic<uint64_t> tail_idx_{1};
+    CACHE_PAD_TYPES(std::atomic<uint64_t>);
+    align std::atomic<uint64_t> head_idx_{1};
+    CACHE_PAD_TYPES(std::atomic<uint64_t>);
     util::threading::DynamicThreadTicket ticketing_;
-    util::hazard::HazardVector<Segment*> hazard_;
+    util::hazard::HazardVector<Segment*,ThreadRecord> hazard_;
     const size_t seg_capacity_;
     const size_t full_capacity_;
 

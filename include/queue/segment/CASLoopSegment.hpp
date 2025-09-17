@@ -1,6 +1,8 @@
 #pragma once
+#include "specs.hpp"
 #include <IQueue.hpp>
 #include <ILinkedSegment.hpp>
+#include <atomic>
 #include <cassert>
 #include <SequencedCell.hpp>
 #include <HeapStorage.hpp>
@@ -65,49 +67,49 @@ public:
      * @return true If the enqueue succeeds.
      * @return false If the queue is full or closed.
      */
-    bool enqueue(T item) final override {
-    uint64_t tailTicket, seq;
-    size_t index;
+        bool enqueue(T item) final override {
+        uint64_t tailTicket, seq;
+        size_t index;
 
-    do {
-        tailTicket = tail_.load(std::memory_order_relaxed);
+        do {
+            tailTicket = tail_.load(std::memory_order_relaxed);
 
-        if constexpr (base::is_linked_segment_v<Effective>) {
-            if (is_closed_(tailTicket)) {
-                return false;   //tail is closed
-            }
-        }
-
-        if constexpr (Pow2) {
-            index = tailTicket & mask_;
-        } else {
-            index = tailTicket % size_;
-        }
-
-        Cell& node = array_[index];
-        seq = node.seq.load(std::memory_order_acquire);
-
-        if (tailTicket == seq) {
-            bool success = tail_.compare_exchange_weak(
-                tailTicket, tailTicket + 1,
-                std::memory_order_relaxed);
-            //if cas was successful then update the entry
-            if (success) {
-                node.val.store(item,std::memory_order_relaxed);
-                node.seq.store(seq + 1, std::memory_order_release);
-                return true;
-            }
-
-        } else if (tailTicket > seq) {
             if constexpr (base::is_linked_segment_v<Effective>) {
-                (void) close();
+                if (static_cast<Effective*>(this)->is_closed_(tailTicket)) {
+                    return false;   //tail is closed
+                }
             }
-            return false;
-        }
 
-        //CAS failed: retry
-    } while (true);
-}
+            if constexpr (Pow2) {
+                index = tailTicket & mask_;
+            } else {
+                index = tailTicket % size_;
+            }
+
+            Cell& node = array_[index];
+            seq = node.seq.load(std::memory_order_acquire);
+
+            if (tailTicket == seq) {
+                bool success = tail_.compare_exchange_weak(
+                    tailTicket, tailTicket + 1,
+                    std::memory_order_relaxed);
+                //if cas was successful then update the entry
+                if (success) {
+                    node.val.store(item,std::memory_order_relaxed);
+                    node.seq.store(seq + 1, std::memory_order_release);
+                    return true;
+                }
+
+            } else if (tailTicket > seq) {
+                if constexpr (base::is_linked_segment_v<Effective>) {
+                    (void)static_cast<Effective*>(this)->close();
+                }
+                return false;
+            }
+
+            //CAS failed: retry
+        } while (true);
+    }
 
 
     /**
@@ -167,7 +169,7 @@ public:
      *
      * @return Current number of elements in the queue.
      */
-    size_t size() override {
+    size_t size() const override {
         return bit::get63LSB(tail_.load(std::memory_order_acquire)) - head_.load(std::memory_order_acquire);
     }
 
@@ -175,65 +177,12 @@ public:
     ~CASLoopQueue() override = default;
 
 protected:
-    // Only accessible to friends (e.g. Proxy classes) or derived types (LinkedSegments).
+    // Only accessible to LinkedSegment version
 
-    // ==========================
-    // Lifecycle Control (Linked Queues)
-    // ==========================
-
-    /**
-     * @brief Marks the queue as closed.
-     *
-     * Once closed, further enqueue attempts will fail.
-     *
-     * @return Always true.
-     */
-    bool close() override {
-        tail_.fetch_or(bit::MSB64, std::memory_order_acq_rel);
-        return true;
-    }
-
-    /**
-     * @brief Reopens a previously closed queue.
-     *
-     * Allows enqueue operations again.
-     *
-     * @return Always true.
-     */
-    bool open() override {
-        return true;
-    }
-
-    bool is_closed_(uint64_t tail) const {
-        return bit::getMSB64(tail) != 0;
-    }
-
-    /**
-     * @brief Checks if the queue is closed.
-     *
-     * @return true If the queue is closed.
-     * @return false If the queue is open.
-     */
-    bool isClosed() const override {
-        uint64_t tail = tail_.load(std::memory_order_relaxed);
-        return is_closed_(tail);
-    }
-
-
-    /**
-     * @brief Checks if the queue is open.
-     *
-     * @return true If the queue is open.
-     * @return false If the queue is closed.
-     */
-    bool isOpened() const override {
-        return !isClosed();
-    }
-
-    alignas(CACHE_LINE) std::atomic<uint64_t> head_; ///< Head ticket index for dequeue.
-    char pad_head_[CACHE_LINE - sizeof(std::atomic<uint64_t>)];
-    alignas(CACHE_LINE)std::atomic<uint64_t> tail_; ///< Tail ticket index for enqueue.
-    char pad_tail_[CACHE_LINE - sizeof(std::atomic<uint64_t>)];
+    align std::atomic_uint64_t head_; ///< Head ticket index for dequeue.
+    CACHE_PAD_TYPES(std::atomic_uint64_t);
+    align std::atomic_uint64_t tail_; ///< Tail ticket index for enqueue.
+    CACHE_PAD_TYPES(std::atomic_uint64_t);
     const size_t size_;
     const size_t mask_;
     util::memory::HeapStorage<Cell> array_; ///< Underlying circular buffer storage.
@@ -260,7 +209,8 @@ class LinkedCASLoop:
             auto_close,
             LinkedCASLoop<
                 T,
-                Proxy
+                Proxy,
+                Pow2
             >,
         void>
     >,
@@ -275,9 +225,10 @@ class LinkedCASLoop:
         >
     >
 {
-    friend Proxy;   ///< Proxy class can access private methods.
 
-    using Base = CASLoopQueue<T,Pow2,std::conditional_t<auto_close,LinkedCASLoop<T,Proxy>,void>>;
+    using Base = CASLoopQueue<T,Pow2,std::conditional_t<auto_close,LinkedCASLoop<T,Proxy,Pow2>,void>>;
+    friend Base;    ///< Base class can access lifecycle methods
+    friend Proxy;   ///< Proxy class can access private methods.
 
 public:
     /**
@@ -295,7 +246,7 @@ public:
     /// @brief Defaulted destructor.
     ~LinkedCASLoop() override = default;
 
-private:
+protected:
     /**
      * @brief Returns the next linked segment in the chain.
      *
@@ -305,14 +256,46 @@ private:
         return next_.load(std::memory_order_acquire);
     }
 
+    /**
+     * @brief internal method to check if the queue is closed
+     */
+    static bool is_closed_(uint64_t tail) {
+        return bit::getMSB64(tail) != 0;
+    }
+
+    /**
+     * @brief reopens a previously closed segment
+     *
+     * Checks if the closure bit is setted, if so it alignes the head and tail index
+     * via CAS and clears the next pointer.
+     *
+     * @warning it is supposed that this method gets called on a fully drained queue,
+     * undefined behaviour can occur if it's not the case.
+     */
     bool open() final override {
         uint64_t tail = Base::tail_.load(std::memory_order_relaxed);
-        if(Base::is_closed_(tail)) {
+        if(bit::getMSB64(tail) != 0) {
             uint64_t head = Base::head_.load(std::memory_order_relaxed);
-            next_.store(nullptr,std::memory_order_relaxed);
+            next_.store(nullptr,std::memory_order_relaxed); //this is guarded by the CAS
             Base::tail_.compare_exchange_strong(tail,head,std::memory_order_acq_rel);
         }
         return true;
+    }
+
+    /**
+     * @brief closes the queue to further insertions (until open() is called)
+     */
+    bool close() final override {
+        Base::tail_.fetch_or(bit::MSB64,std::memory_order_acq_rel);
+        return true;
+    }
+
+    bool isClosed() const final override {
+        return is_closed_(Base::tail_);
+    }
+
+    bool isOpened() const final override {
+        return !isClosed();
     }
 
     uint64_t getNextStartIndex() const override {
@@ -320,5 +303,6 @@ private:
         return bit::get63LSB(tail);
     }
 
-    std::atomic<LinkedCASLoop*> next_{nullptr}; ///< Pointer to the next segment in the chain.
+    align std::atomic<LinkedCASLoop*> next_{nullptr}; ///< Pointer to the next segment in the chain.
+    CACHE_PAD_TYPES(std::atomic<LinkedCASLoop*>);
 };

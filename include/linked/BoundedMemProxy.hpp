@@ -21,7 +21,7 @@ template <
     using VersionedIndex = uint64_t;
     using Index = Recycler::Tml;
     using Version = uint32_t;
-    using Ticket = uint64_t;
+    using Ticket = util::threading::DynamicThreadTicket::Ticket;
     using TaggedPtr = uint64_t;
     static constexpr uint32_t INC_VERSION = 2;
 
@@ -32,7 +32,7 @@ template <
     );
 
 public:
-
+    static constexpr size_t Segments = ChunkFactor;
     explicit BoundedMemProxy(size_t capacity, size_t maxThreads):
             ticketing_(maxThreads),
             seg_capacity_((Pow2? bit::next_pow2(capacity) : capacity) / ChunkFactor),
@@ -66,10 +66,20 @@ public:
 
     }
 
+    ~BoundedMemProxy() {
+        T ignore;
+        while(dequeue(ignore));
+    }
+
+    /**
+     * @brief proxy enqueue operation
+     *
+     * @debug: have to rework the protection scheme in order to minimize
+     * protection windows. Make the link logic easier
+     */
     bool enqueue(T item) override {
         Ticket t = get_ticket_();
         bool failedReclaim{false};
-
         while(1) {
             TaggedPtr taggedTail = recycler_.protect_epoch_and_load(t,tail_);
 
@@ -79,7 +89,7 @@ public:
 
             if(safeEnqueue(taggedTail,item)) {
                 recycler_.clear_epoch(t);
-                recycler_.getMetadata(t).fetch_add(1,std::memory_order_relaxed);
+                recordEnqueue(t);
                 return true;
             }
 
@@ -103,11 +113,10 @@ public:
                     //link successful
                     (void) tail_.compare_exchange_strong(taggedTail,taggedCast(newQueue));
                     recycler_.clear_epoch(t);
-                    recycler_.getMetadata(t).fetch_add(1,std::memory_order_relaxed);
+                    recordEnqueue(t);
                     return true;
                 }  else {
                     //dequeue your item and place
-                    T ignore;
                     size_t success = 0;
                     while(recycler_.decode(newQueueIndex)->dequeue(ignore)) {
                         success++;
@@ -159,7 +168,7 @@ public:
             }
 
             recycler_.clear_epoch(t);
-            recycler_.getMetadata(t).fetch_sub(1,std::memory_order_relaxed);
+            recordDequeue(t);
             return true;
         }
     }
@@ -173,7 +182,12 @@ public:
         ticketing_.release();
     }
 
-    size_t size() override {
+    /**
+     * @brief size method
+     *
+     * @note doesn't require a thread to have acquired an operational slot
+     */
+    size_t size() const override {
         int64_t total = 0;
         recycler_.metadataIter([&total](const std::atomic<int64_t>& m) {
             total += m.load(std::memory_order_relaxed);
@@ -190,6 +204,31 @@ public:
 
 private:
 
+    /**
+     * @brief records an enqueue in the caller thread metadata section
+     */
+    inline void recordEnqueue(Ticket t) {
+        recycler_.getMetadata(t).fetch_add(1,std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief records a dequeue in the caller thread metadata section
+     */
+    inline void recordDequeue(Ticket t) {
+        recycler_.getMetadata(t).fetch_sub(1,std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Safe enqueue operation
+     *
+     * @note calling plain `q->enqueue()` on a previously closed segment
+     * can cause delays due to index disalignment. This method records the
+     * last known Version (monotonic counter), and checks if the queue is closed
+     * if the version matches.
+     *
+     * @debug: might have to rework this, if the version is set maybe there's no
+     * need in checking the queue, ABA prevention counts for ~ 2 million iterations
+     */
     inline bool safeEnqueue(TaggedPtr tail, T item) {
         static thread_local Version lastV = 0; //reserved for nullptr
         Segment * ptr = recycler_.decode(getIndex(tail));
@@ -207,14 +246,16 @@ private:
 
     /**
      * @brief checks if a new next tail exists
+     *
+     * @warning supposes the caller is protecting the tail
+     *
      * @return true if the tail was updated false otherwise
      */
     inline bool updateNextTail(TaggedPtr tail) {
         Segment* ptr    = recycler_.decode(getIndex(tail));
         Segment* next   = ptr->getNext();
-        if(next == nullptr) {
-            return false;
-        }
+        if(next == nullptr) return false;
+
         //try to cas the tail to the next tail
         (void)tail_.compare_exchange_strong(tail,taggedCast(next));
         return true;
@@ -252,13 +293,13 @@ private:
         return bit::keep_high(p);
     }
 
-    alignas(CACHE_LINE) std::atomic<TaggedPtr> tail_{0};   //matches the nullptr value
-    char pad_tail_[CACHE_LINE - sizeof(std::atomic<TaggedPtr>)];
-    alignas(CACHE_LINE) std::atomic<TaggedPtr> head_{0};   //matches the nullptr value
-    char pad_head_[CACHE_LINE - sizeof(std::atomic<TaggedPtr>)];
-    alignas(CACHE_LINE) std::atomic<Version> versionPool_{1};   //all versions must be odd (version 0 is reserved for nullptr)
-    char pad_version_[CACHE_LINE - sizeof(std::atomic<Version>)];
-    util::threading::DynamicThreadTicket ticketing_;
+    align std::atomic<TaggedPtr> tail_{0};   //matches the nullptr value
+    CACHE_PAD_TYPES(std::atomic<TaggedPtr>);
+    align std::atomic<TaggedPtr> head_{0};   //matches the nullptr value
+    CACHE_PAD_TYPES(std::atomic<TaggedPtr>);
+    align std::atomic<Version> versionPool_{1};   //all versions must be odd (version 0 is reserved for nullptr)
+    CACHE_PAD_TYPES(std::atomic<Version>);
+    align util::threading::DynamicThreadTicket ticketing_;
     size_t const seg_capacity_;
     Recycler recycler_;
 };

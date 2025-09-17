@@ -4,10 +4,10 @@
 #include <SequencedCell.hpp>
 #include <HeapStorage.hpp>
 #include <StaticThreadTicket.hpp>
+#include <atomic>
 #include <cassert>
 #include <specs.hpp>
 #include <bit.hpp>
-#include <iostream>
 
 
 
@@ -66,7 +66,7 @@ public:
         while(1) {
             uint64_t tailTicket = tail_.fetch_add(1);
             if constexpr(base::is_linked_segment_v<Effective>) {
-                if(is_closed_(tailTicket)){
+                if(static_cast<Effective*>(this)->is_closed_(tailTicket)){
                     return false;
                 }
             }
@@ -95,7 +95,7 @@ public:
 
             if(tailTicket >= (head_.load() + size_)) {
                 if constexpr (base::is_linked_segment_v<Effective>) {
-                    (void) close();
+                    (void) static_cast<Effective*>(this)->close();
                 }
                 return false;
             }
@@ -188,73 +188,20 @@ public:
     /**
      * @brief Returns the number of items in the queue.
      *
-     * This value may not be exact in multithreaded use, but is safe to use
-     * for metrics or capacity checks.
+     * @note This value is not exact, since it performs the difference between
+     * the tail and head counters that get advanced optimistically
      *
      * @return Current number of elements in the queue.
      *
-     * @warning this value may be approximated
      */
-    size_t size() override {
+    size_t size() const override {
         uint64_t t = bit::get63LSB(tail_.load(std::memory_order_relaxed));
         uint64_t h = head_.load(std::memory_order_acquire);
-        return t > h? t - h : 0;
+        return t > h? (t - h) : 0;
     }
 
     /// @brief Defaulted destructor.
     ~PRQueue() override = default;
-
-protected:
-    // Only accessible to friends (e.g. Proxy classes) or derived types (LinkedSegments).
-
-    // ==================================
-    // Lifecycle Control (Linked Queues)
-    // ==================================
-
-    /**
-     * @brief Marks the queue as closed.
-     *
-     * Once closed, further enqueue attempts will fail.
-     *
-     * @return Always true.
-     */
-    bool close() override {
-        tail_.fetch_or(bit::MSB64);
-        return true;
-    }
-
-    /**
-     * @brief Reopens a previously closed queue.
-     *
-     * Allows enqueue operations again.
-     *
-     * @return Always true.
-     */
-    bool open() override {
-        tail_.fetch_and(bit::LSB63_MASK,std::memory_order_release);
-        return true;
-    }
-
-    /**
-     * @brief Checks if the queue is closed.
-     *
-     * @return true If the queue is closed.
-     * @return false If the queue is open.
-     */
-    bool isClosed() const override {
-        uint64_t tail = tail_.load(std::memory_order_acquire);
-        return is_closed_(tail);
-    }
-
-    /**
-     * @brief Checks if the queue is open.
-     *
-     * @return true If the queue is open.
-     * @return false If the queue is closed.
-     */
-    bool isOpened() const override {
-        return !isClosed();
-    }
 
 private:
 
@@ -288,11 +235,6 @@ private:
     bool isReserved(T ptr) const {
         return (reinterpret_cast<uintptr_t>(ptr) & 1) != 0;
     }
-protected:
-
-    bool is_closed_(uint64_t val) const {
-        return bit::getMSB64(val) != 0;
-    }
 
     void fixState() {
         while(1) {
@@ -310,9 +252,12 @@ protected:
             return;
         }
     }
-    alignas(CACHE_LINE) std::atomic<uint64_t> head_; ///< Head ticket index for dequeue.
+
+protected:  //Accessible to LinkedPRQ
+
+    align std::atomic<uint64_t> head_; ///< Head ticket index for dequeue.
     char pad_head_[CACHE_LINE - sizeof(std::atomic<uint64_t>)];
-    alignas(CACHE_LINE)std::atomic<uint64_t> tail_; ///< Tail ticket index for enqueue.
+    align std::atomic<uint64_t> tail_; ///< Tail ticket index for enqueue.
     char pad_tail_[CACHE_LINE - sizeof(std::atomic<uint64_t>)];
     const size_t size_;
     const size_t mask_;
@@ -356,6 +301,8 @@ class LinkedPRQ:
 
     using Base = PRQueue<T,Pow2,std::conditional_t<auto_close,LinkedPRQ<T,Proxy,Pow2>,void>>;
 
+    friend Base;
+
 public:
     /**
      * @brief Constructs a linked CAS loop queue segment.
@@ -386,9 +333,18 @@ private:
         return (tail > 0)? (tail-1) : 0;
     }
 
+    static bool is_closed_(uint64_t val) {
+        return bit::getMSB64(val) != 0;
+    }
+
+    bool close() final override {
+        Base::tail_.fetch_or(bit::MSB64,std::memory_order_acq_rel);
+        return true;
+    }
+
     bool open() final override {
         uint64_t tail = Base::tail_.load(std::memory_order_relaxed);
-        if(Base::is_closed_(tail)) {
+        if(is_closed_(tail)) {
             uint64_t head = Base::head_.load(std::memory_order_relaxed);
             next_.store(nullptr,std::memory_order_relaxed);
             Base::tail_.compare_exchange_strong(tail,head,std::memory_order_acq_rel);
@@ -396,5 +352,14 @@ private:
         return true;
     }
 
-    std::atomic<LinkedPRQ*> next_{nullptr}; ///< Pointer to the next segment in the chain.
+    bool isClosed() const override {
+        return is_closed_(Base::tail_);
+    }
+
+    bool isOpened() const override {
+        return !isClosed();
+    }
+
+    align std::atomic<LinkedPRQ*> next_{nullptr}; ///< Pointer to the next segment in the chain.
+    CACHE_PAD_TYPES(std::atomic<LinkedPRQ*>);
 };

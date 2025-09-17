@@ -72,8 +72,7 @@ public:
     void metadataIter(Func&& fn) const {
         if constexpr (!std::is_same_v<Meta,void>) {
             for (size_t tid = 0; tid < maxThreads_; ++tid) {
-            const auto& cell = storage_[tid];
-            fn(cell.get_metadata_ronly()); // passes const Meta&
+            fn(storage_[tid].get_metadata_ronly_()); // passes const Meta&
         }
         } else {
             static_assert(!sizeof(Meta),"metadataIter is noly available when Meta is non-void");
@@ -204,7 +203,7 @@ public:
         typename M = Meta,
         typename Enable = std::enable_if_t<!std::is_same_v<M, void>>
     >
-    M& getMetadata(size_t tid);
+    M& getMetadata(uint64_t tid);
 
 
     /**
@@ -271,8 +270,11 @@ private:
             for(size_t j = 0; j < HV_MAX_HPS; j++){
                 data[j].store(nullptr,std::memory_order_relaxed);
             }
-            if constexpr (!std::is_same_v<Meta,void>) {
-                cell.meta.init();  //default construct metadata
+            if constexpr (
+                !(std::is_same_v<Meta,void> ||
+                std::is_default_constructible_v<Meta>)
+            ) {
+                cell.meta.init();
             }
         }
     }
@@ -297,7 +299,7 @@ private:
     // Definition outside class
     template<typename T, typename Meta>
     template<typename M, typename>
-    inline M& HazardVector<T, Meta>::getMetadata(size_t tid) {
+    inline M& HazardVector<T, Meta>::getMetadata(uint64_t tid) {
         return storage_[tid].getMetadata();
     }
 

@@ -24,14 +24,14 @@
 /**
  * @brief Proxy wrapper for LinkedSegment tests.
  *
- * Exposes lifecycle methods (`open`, `close`, `isOpened`, `isClosed`) 
+ * Exposes lifecycle methods (`open`, `close`, `isOpened`, `isClosed`)
  * and capacity for testing purposes.
  *
  * @tparam Seg Linked segment type (e.g., CASLoopSegment<int*>)
  */
-template <typename T, template<typename, typename> typename Seg>
+template <typename T, template<typename, typename,bool,bool> typename Seg>
 struct TestProxy {
-    using Segment = Seg<T, TestProxy>;
+    using Segment = Seg<T, TestProxy,false,true>;
 
     explicit TestProxy(size_t cap) : seg(cap) {}
 
@@ -148,7 +148,7 @@ TYPED_TEST(LinkedSegmentTest, AutoCloseWhenFull) {
     for (size_t i = 0; i < this->q.capacity(); i++) {
         EXPECT_TRUE(this->q.enqueue(&dummy));
     }
-    EXPECT_FALSE(this->q.enqueue(&dummy));//queue is actually fall 
+    EXPECT_FALSE(this->q.enqueue(&dummy));//queue is actually fall
     EXPECT_TRUE(this->q.isClosed());
     EXPECT_FALSE(this->q.enqueue(&dummy));
 }

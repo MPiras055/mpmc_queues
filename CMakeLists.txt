@@ -53,16 +53,18 @@ foreach(test_src ${UNIT_TEST_SOURCES})
     # Compile with address sanitizer
     TARGET_COMPILE_OPTIONS(${test_name} PUBLIC
      -O3
+     -g
      -march=native
      -funroll-loops
      -fno-rtti
      -DNDEBUG
+     -fsanitize=address
     )
 
     # link gtest and fsanitize
-    target_link_libraries(${test_name} gtest_main)
+    #target_link_libraries(${test_name} gtest_main)
     # TARGET_COMPILE_OPTIONS(${test_name} PUBLIC -fsanitize=address -g -O3)
-    # TARGET_LINK_LIBRARIES(${test_name} PUBLIC gtest_main -fsanitize=address)
+    TARGET_LINK_LIBRARIES(${test_name} PUBLIC gtest_main -fsanitize=address)
 
     # Register with CTest
     add_test(NAME ${test_name} COMMAND ${test_name})

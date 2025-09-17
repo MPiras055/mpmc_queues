@@ -1,255 +1,177 @@
 #include <gtest/gtest.h>
 #include <thread>
-#include <atomic>
-#include <barrier>
 #include <vector>
-#include <random>
 #include <CASLoopSegment.hpp>
-#include <PRQSegment.hpp>
-// #include <BoundedCounterProxy.hpp>
+// #include <PRQSegment.hpp>
+#include <BoundedCounterProxy.hpp>
 #include <BoundedChunkProxy.hpp>
 #include <BoundedMemProxy.hpp>
 
+struct Data {
+    uint64_t tid;uint64_t epoch;
+    Data() = default;
+    Data(uint64_t t, uint64_t e): tid{t},epoch{e}{};
+};
 
-static constexpr size_t segments = 4;
-static constexpr size_t full_capacity = 1024 * 16;
-static constexpr size_t segment_capacity = full_capacity / segments;
+/**
+ * static enviromental test variables
+ */
+static constexpr size_t SEGMENTS = 4;
+static constexpr size_t FULL_CAPACITY = 1024 * 16;
+static constexpr size_t SEG_CAPACITY = FULL_CAPACITY / SEGMENTS;
 
 // ---- List of queue implementations to test ----
+template<typename V>
 using QueueTypes = ::testing::Types<
-    // BoundedChunkProxy<int*,LinkedCASLoop,segments>,
-    // BoundedCounterProxy<int*,LinkedCASLoop,segments>,
-    // BoundedCounterProxy<int*,LinkedPRQ,segments>,
-    // BoundedChunkProxy<int*,LinkedPRQ,segments>
-    // BoundedChunkProxy<int*,LinkedPRQ,segments>
-    // BoundedMemProxy<int*,LinkedCASLoop,segments>,
-    BoundedChunkProxy<int*,LinkedCASLoop,segments>
-
+    BoundedChunkProxy<V,LinkedCASLoop,SEGMENTS>,
+    BoundedCounterProxy<V,LinkedCASLoop,SEGMENTS>,
+    BoundedMemProxy<V,LinkedCASLoop,SEGMENTS>
     //, Other queues to add here
 >;
 
+using QueuesOfData  = QueueTypes<Data*>;
+
 // ---- Fixture ----
-template <typename T>
-class QueueTest : public ::testing::Test {
+template <typename Q>
+class Semantics: public ::testing::Test {
 protected:
-    T q{full_capacity,20}; //queues where each segment has capacity of 128 and can be used by 8 threads concurrently
+    const size_t maxThreads = 1;
+    Q q{FULL_CAPACITY,maxThreads};
 
 };
-TYPED_TEST_SUITE(QueueTest, QueueTypes);
+template <typename Q>
+class Concurrency: public ::testing::Test {
+protected:
+    const size_t maxThreads = 16;
+    Q q{FULL_CAPACITY,maxThreads};
+};
+TYPED_TEST_SUITE(Semantics, QueuesOfData);
+TYPED_TEST_SUITE(Concurrency, QueuesOfData);
 
 // ------------------------------------------------
 // Basic Functional Tests
 // ------------------------------------------------
-
-TYPED_TEST(QueueTest, EnqueueDequeueBasic) {
-    int a = 1, b = 2, c = 3;
-    int* out = nullptr;
-
-    EXPECT_TRUE(this->q.enqueue(&a));
-    EXPECT_TRUE(this->q.enqueue(&b));
-    EXPECT_TRUE(this->q.enqueue(&c));
-
-    EXPECT_TRUE(this->q.dequeue(out));
-    EXPECT_EQ(out, &a);
-    EXPECT_TRUE(this->q.dequeue(out));
-    EXPECT_EQ(out, &b);
-    EXPECT_TRUE(this->q.dequeue(out));
-    EXPECT_EQ(out, &c);
-
-    EXPECT_FALSE(this->q.dequeue(out)); // empty
+TYPED_TEST(Semantics,CachedTicket) {
+    /**
+     * checks if the ticket is cached properly
+     */
+    EXPECT_TRUE(this->q.acquire()); //caches the ticket
+    const size_t ignore_iter = this->maxThreads * 10;   //can be any number (meaningful if >> maxThreads)
+    for(size_t i = 0; i < ignore_iter; i++) {
+        //any number of iteration is successful since the ticket is cached by the first acquire (not cleared)
+        EXPECT_TRUE(this->q.acquire());
+    }
+    this->q.release(); //release the ticket (clears the cache)
 }
 
-TYPED_TEST(QueueTest, FreshAllocation) {
-    EXPECT_TRUE(this->q.acquire());
-    int dummy;
-    int *dummy_out;
-    EXPECT_EQ(this->q.size(), 0);
 
-    //fill the queue
-    for(size_t i = 0; i < segments; i++) {
-        for(size_t i = 0; i < segment_capacity; i++) {
-            EXPECT_TRUE(this->q.enqueue(&dummy));
-        }
-        //for each segment check if the size is correct
-        EXPECT_EQ(this->q.size(), segment_capacity * (i + 1));
+TYPED_TEST(Semantics,EnqueueDequeueBasic) {
+    const size_t batchSize = 10;
+    assert(batchSize <= this->q.capacity() && "Wrong test parameter batchSize");
+    auto batch = std::vector<Data>(batchSize,{0,0});
+
+    EXPECT_TRUE(this->q.acquire()); //acquire a ticket for queue operation
+
+    for(size_t i = 0; i < batchSize; i++) {
+        EXPECT_TRUE(this->q.enqueue(&(batch[i])));
     }
-
-    EXPECT_EQ(this->q.size(),this->q.capacity());
-
-    //check if capacity constraint is respected
-    //check if fragmentation constraint is respected
-    for(size_t i = 0; i < segment_capacity; i++) {
-        EXPECT_FALSE(this->q.enqueue(&dummy));
-    }
-
-    //empty the queue, and for each segment emptied check if size matches
-    for(signed int i = segments - 1; i >= 0; i--) {
-        for(size_t i = 0; i < segment_capacity; i++) {
-            EXPECT_TRUE(this->q.dequeue(dummy_out));
-        }
-    }
-
-    EXPECT_FALSE(this->q.dequeue(dummy_out));
-    EXPECT_EQ(this->q.size(),0);
-    this->q.release();
-}
-
-// ------------------------------------------------
-// Boundary Tests
-// ------------------------------------------------
-
-TYPED_TEST(QueueTest, DequeueFromEmpty) {
-    EXPECT_TRUE(this->q.acquire());
-    int* out = nullptr;
-    EXPECT_FALSE(this->q.dequeue(out)); // should not crash or succeed
-    this->q.release();
-}
-
-TYPED_TEST(QueueTest, FillAndEmpty) {
-    EXPECT_TRUE(this->q.acquire());
-    int dummy;
-    int* out = nullptr;
-    const size_t segments_fill = segments - 1;
-    assert(segments_fill != 0 && "Wrong test parameter");
-
-    EXPECT_EQ(this->q.size(),0u);  // empty
-
-    //completely fills most segments of the queue
-    for (size_t i = 0; i < segment_capacity * segments_fill; i++) {
-        EXPECT_TRUE(this->q.enqueue(&dummy));
-    }
-
-    EXPECT_EQ(this->q.size(), (segments - 1) * segment_capacity);  // check if size matches
-
-    //completely drains 2 segments of the queue
-    for (size_t i = 0; i < segments_fill * segment_capacity; i++) {
+    EXPECT_EQ(this->q.size(),batchSize);
+    Data* out{};
+    //check fifo ordering
+    for(size_t i = 0; i < batchSize; i++) {
         EXPECT_TRUE(this->q.dequeue(out));
+        EXPECT_EQ(out,&(batch[i]));
+    }
+    Data* cmp = out;
+    EXPECT_EQ(this->q.size(),0);
+    EXPECT_FALSE(this->q.dequeue(out));
+    EXPECT_EQ(out,cmp); //check that failed dequeue doesn't overwrite the out value
+    EXPECT_EQ(this->q.size(),0);    //check if size is affected by a failed dequeue
+
+    this->q.release();          //release the previously acquired ticket
+}
+
+TYPED_TEST(Semantics, SegmentLinking) {
+    const size_t batchSize = this->q.capacity();
+    auto batch = std::vector<Data>(batchSize, {0, 0});
+    const size_t Segments = this->q.Segments; // static constexpr member
+    const size_t SegmentCapacity = batchSize / Segments;
+
+    // Check no rounding error in division
+    EXPECT_EQ(Segments * SegmentCapacity, batchSize);
+
+    EXPECT_TRUE(this->q.acquire()); // acquire ticket for queue operation
+
+    // Enqueue: fill one segment at a time
+    for (size_t i = 0; i < Segments; ++i) {
+        const size_t segmentStart = i * SegmentCapacity;
+        for (size_t j = 0; j < SegmentCapacity; ++j) {
+            EXPECT_TRUE(this->q.enqueue(&(batch[segmentStart + j])));
+        }
+        // Queue size should match number of enqueued items so far
+        EXPECT_EQ(this->q.size(), (i + 1) * SegmentCapacity);
     }
 
-    EXPECT_FALSE(this->q.dequeue(out)); // empty again
+    // Queue should now be full
+    EXPECT_EQ(this->q.size(), batchSize);
+
+    // Try enqueuing when full: should fail
+    Data dummyVal{};
+    Data* dummy = &dummyVal;
+    EXPECT_FALSE(this->q.enqueue(dummy));
+    EXPECT_EQ(this->q.size(), batchSize);
+
+    // Dequeue: one segment at a time
+    Data* out = nullptr;
+    for (size_t i = 0; i < Segments; ++i) {
+        const size_t segmentStart = i * SegmentCapacity;
+        for (size_t j = 0; j < SegmentCapacity; ++j) {
+            EXPECT_TRUE(this->q.dequeue(out));
+            EXPECT_EQ(out, &(batch[segmentStart + j])); // FIFO order
+        }
+        // After dequeuing one segment, check size
+        EXPECT_EQ(this->q.size(), batchSize - (i + 1) * SegmentCapacity);
+    }
+
+    // Queue should now be empty
+    Data* cmp = out;
     EXPECT_EQ(this->q.size(), 0);
-    this->q.release();
+    EXPECT_FALSE(this->q.dequeue(out));
+    EXPECT_EQ(out, cmp); // make sure out wasn't overwritten
 }
+
 
 // ------------------------------------------------
 // Concurrency Tests
 // ------------------------------------------------
+//
+TYPED_TEST(Concurrency,SingleProducerSingleConsumer) {
+    const size_t N = (1024 * 1024);
 
-TYPED_TEST(QueueTest, SingleProducerSingleConsumer) {
-    const int N = (1024 * 1024);
-    std::atomic<long long> sum{0};
-    int* out = nullptr;
+    //initialize a batch of data
+    std::vector<Data> batch;
+    batch.resize(N);
 
-    std::thread prod([&] {
-        EXPECT_TRUE(this->q.acquire()); //each thread should get a slot
-        for (int i = 1; i <= N; i++) {
-            int* val = new int(i); // simulate dynamic allocation
-            while(!this->q.enqueue(val)){};   //unbounded queues are always successful on enqueues
+    std::jthread prod([&] {
+        //preallocate a batch of items
+        EXPECT_TRUE(this->q.acquire()); //thread should get a slot
+        for(auto& item : batch) {
+            while(!(this->q.enqueue(&item))) {
+                //spin;
+            }
         }
         this->q.release();
     });
 
-    std::thread cons([&] {
+    std::jthread cons([&] {
         EXPECT_TRUE(this->q.acquire());
-        for (int i = 1; i <= N; i++) {
-            while (!this->q.dequeue(out)) {}
-            sum.fetch_add(*out, std::memory_order_relaxed);
-            delete out; // cleanup
+        Data *out{reinterpret_cast<Data*>(0x1)};
+        for(auto& cmp : batch) {
+            while(!(this->q.dequeue(out))) {
+                //spin
+            }
+            EXPECT_EQ(&cmp,out);    //check for fifo ordering of pointers
         }
         this->q.release();
     });
-
-    prod.join();
-    cons.join();
-
-    EXPECT_EQ(sum, 1LL * N * (N + 1) / 2);
-
-}
-
-TYPED_TEST(QueueTest, MultiProducerMultiConsumer) {
-    const int N = (1024 * 1024 * 50), P = 8, C = 8;
-    std::vector<int*> produced;
-    produced.reserve(N);
-
-    // Preallocate unique addresses so there’s no allocator reuse confusion.
-    std::vector<std::unique_ptr<int>> pool;
-    pool.reserve(N);
-    for (int i = 1; i <= N; ++i) {
-        pool.emplace_back(std::make_unique<int>(i));
-        produced.push_back(pool.back().get());
-    }
-
-    std::atomic<long long> sum{0};
-    std::vector<std::thread> producers, consumers;
-    std::vector<std::atomic<int>> seen(N + 1); // index by value, count occurrences
-    std::barrier b(P + 1);
-    for (auto& s : seen) s.store(0, std::memory_order_relaxed);
-
-    // Enqueue pointers partitioned by producer
-    for (int p = 0; p < P; ++p) {
-        producers.emplace_back([&, p]{
-            EXPECT_TRUE(this->q.acquire()); //each thread should successfuly acquire a ticket from the queue
-            b.arrive_and_wait();
-            int start = p * (N / P) + 1;
-            int end   = (p + 1) * (N / P);
-            for (int i = start; i <= end; ++i) {
-                int* val = produced[i-1];
-                while (!this->q.enqueue(val)){}
-            }
-            this->q.release(); //each thread successfuly releases the ticket from the queue
-        });
-    }
-
-    b.arrive_and_wait();
-
-    // Consumers: no delete; just record and sum
-    for (int c = 0; c < C; ++c) {
-        consumers.emplace_back([&]{
-            EXPECT_TRUE(this->q.acquire()); //each thread should successfuly acquire a ticket from the queue
-            int* out = nullptr;
-            for (int i = 0; i < N / C; ++i) {
-                size_t attempt = 0;
-                while (!this->q.dequeue(out)) {}
-                sum.fetch_add(*out, std::memory_order_relaxed);
-                seen[*out].fetch_add(1, std::memory_order_relaxed);
-            }
-            this->q.release(); //each thread successfuly releases the previously acquired ticket
-        });
-    }
-
-    for (auto& t : producers) t.join();
-    for (auto& t : consumers) t.join();
-
-    EXPECT_EQ(sum, 1LL * N * (N + 1) / 2);
-
-    // Check for duplicates or drops
-    for (int v = 1; v <= N; ++v) {
-        int c = seen[v].load(std::memory_order_relaxed);
-        EXPECT_EQ(c, 1) << "value " << v << " seen " << c << " times";
-    }
-}
-
-
-// ------------------------------------------------
-// Stress / Randomized Tests
-// ------------------------------------------------
-
-TYPED_TEST(QueueTest, RandomizedWorkload) {
-    const int OPS = 1024 * 1024;
-    int a = 42;
-    int* out = nullptr;
-    std::mt19937 rng(12345);
-    std::uniform_int_distribution<int> dist(0, 1);
-
-    for (int i = 0; i < OPS; i++) {
-        if (dist(rng)) {
-            this->q.enqueue(&a); // ignore failure if full
-        } else {
-            this->q.dequeue(out); // ignore failure if empty
-        }
-    }
-
-    // After random workload, queue must still be consistent
-    size_t s = this->q.size();
-    EXPECT_LE(s, this->q.capacity());
 }

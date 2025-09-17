@@ -2,8 +2,6 @@
 #include <thread>
 #include <vector>
 #include <atomic>
-#include <chrono>
-#include <random>
 
 // Include your SegmentRecycler header
 #include "Recycler.hpp"
@@ -88,7 +86,7 @@ TEST_F(SegmentRecyclerTest, CacheIsConsistent) {
     for(auto& seg : segments) {
         ASSERT_TRUE(seg->isOpen());
     }
-    
+
 }
 
 TEST_F(SegmentRecyclerTest, ReclaimSingle) {
