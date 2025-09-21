@@ -14,6 +14,7 @@ class BoundedChunkProxy: public base::IProxy<T,Seg> {
     using Segment = Seg<T, BoundedChunkProxy,Pow2,true>;
     using ThreadRecord = std::atomic<int64_t>;  //for accurate length computation
     using Ticket = util::threading::DynamicThreadTicket::Ticket;    //ticket for thread access
+    static_assert(Seg_count != 0, "Chunk factor cannot be 0");
 
 public:
     static constexpr size_t Segments = Seg_count;
@@ -107,19 +108,16 @@ public:
                     //try to update the current head
                     if(head_.compare_exchange_strong(head,next)) {
                         head_idx_.fetch_add(1,std::memory_order_release);
-                        //record the current segment
-                        Segment *old = head;
+                        //retire the current segment (delayed - since the caller holds protection)
+                        hazard_.retire(head,ticket);
                         //update protection on the current segment
                         head = hazard_.protect(next,ticket);
-                        //retire the old segment
-                        hazard_.retire(old,ticket);
                     } else {
                         head = hazard_.protect(head,ticket);
                     }
                     continue;
                 }
             }
-
             hazard_.clear(ticket);
             recordDequeue(ticket);
             return true;

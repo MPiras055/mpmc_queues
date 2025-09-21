@@ -112,12 +112,9 @@ public:
                     //try to update the current head
                     if(head_.compare_exchange_strong(head,next)) {
                         //record the old segment
-                        Segment *old = head;
-                        //update hte current segment
+                        hazard_.retire(head,ticket);
+                        //update the current segment
                         head = hazard_.protect(next,ticket);
-                        //retire the old segment
-                        hazard_.retire(old,ticket);
-
                     } else {
                         head = hazard_.protect(head,ticket);
                     }
@@ -216,7 +213,6 @@ private:
         return  (itemsPushed_.load(std::memory_order_relaxed) -
                 itemsPopped_.load(std::memory_order_acquire)) <
                 full_capacity_;
-
     }
 
     /**

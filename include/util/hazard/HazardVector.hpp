@@ -231,12 +231,12 @@ public:
      */
     size_t collect(size_t tid) {
         size_t deleted = 0;
-        for (size_t i = 0; i < retired_[tid].v.size(); ) {
+        for (size_t i = 0; i < retired_[tid].v.size(); /* conditional increment*/) {
             T obj = retired_[tid].v[i];
             bool canDelete = true;
 
             // Scan all hazard pointers
-            for (size_t t = 0; t < maxThreads_ && canDelete; ++t) {
+            for (size_t t = 0; (t < maxThreads_) && canDelete; ++t) {
                 for (size_t h = 0; h < HV_MAX_HPS; ++h) {
                     if (storage_[t].data[h].load(std::memory_order_acquire) == obj) {
                         canDelete = false;
@@ -246,13 +246,15 @@ public:
             }
 
             if (canDelete) {
+                //swap the last item with the current
                 std::swap(retired_[tid].v[i], retired_[tid].v.back());
                 retired_[tid].v.pop_back();
                 delete obj;
                 ++deleted;
-                continue; // do not increment i, new element at i
+                //do not increment i, the swapped pointer still needs to be checked
+            } else {
+                ++i;
             }
-            ++i;
         }
 
         return deleted;

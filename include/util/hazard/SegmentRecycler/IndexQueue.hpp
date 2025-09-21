@@ -24,7 +24,7 @@ class IndexQueue {
     using Cell = PackedSequencedCell;
 
 public:
-    IndexQueue(uint32_t size, uint32_t e_val = MAX) noexcept:
+    IndexQueue(size_t size, uint32_t e_val = MAX) noexcept:
         size_{pow_2? bit::next_pow2(size) : size},
         mask_{size_ - 1},
         shift_{pow_2? bit::log2(size_) : 0},

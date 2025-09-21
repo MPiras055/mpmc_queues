@@ -80,9 +80,6 @@ public:
                 cache_{tracked},
                 tracked_count_{static_cast<Tml>(tracked)} {
         static_assert(std::is_same_v<Tml,uint32_t>,"Tml must be uint32_t");
-
-        // std::cout << "CACHE_" << cache_.capacity() << " TRACKED " << tracked << "\n";
-
         assert(tracked < static_cast<size_t>(UINT32_MAX) && "Recycler: Cannot track more than (UINT32_MAX - 1) elements");
         assert(tracked > 0 && "Recycler: tracked count must be non-null");
         assert(buckets_.capacity() == 4 && "Recycler: buckets must be 4");

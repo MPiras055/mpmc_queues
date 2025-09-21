@@ -15,6 +15,11 @@ public:
         Segment* sentinel = new Segment(cap,0);
         head_.store(sentinel,std::memory_order_relaxed);
         tail_.store(sentinel,std::memory_order_relaxed);
+
+        //Initialize thread metadata for accurate length tracking
+        for(size_t i = 0; i < maxThreads; i++) {
+            hazard_.getMetadata(i).store(0,std::memory_order_relaxed);
+        }
     }
 
     ~UnboundedProxy() {
@@ -67,7 +72,9 @@ public:
             //acquire protection on the current new tail
             tail = hazard_.protect(null, ticket);
         }
+
         hazard_.clear(ticket);
+        recordEnqueue(ticket);
         return true;
     }
 
@@ -110,6 +117,7 @@ public:
             }
 
             hazard_.clear(ticket);
+            recordDequeue(ticket);
             return true;
         }
     }
@@ -126,15 +134,13 @@ public:
      *
      * @warning requires the thread to have acquired an operation slot
      */
-    size_t size() override {
-        uint64_t tail,head;
-        uint64_t ticket = get_ticket_();
-        Segment *tail_seg = hazard_.protect(tail_,ticket);
-        tail = bit::get63LSB(tail_seg->tail_.load(std::memory_order_relaxed));
-        Segment *head_seg = hazard_.protect(head_,ticket);
-        head = head_seg->head_.load(std::memory_order_acquire);
-        hazard_.clear(get_ticket_());
-        return head > tail ? 0 : tail - head;
+    size_t size() const override {
+        int64_t total = 0;
+        hazard_.metadataIter([&total](const std::atomic<int64_t>& m) {
+            total += m.load(std::memory_order_relaxed);
+        });
+        assert(total >= 0 && "Negative size detected");
+        return static_cast<size_t>(total);
     }
 
     /**
@@ -167,6 +173,14 @@ public:
 
 private:
 
+    inline void recordEnqueue(uint64_t t) {
+        hazard_.getMetadata(t).fetch_add(1,std::memory_order_relaxed);
+    }
+
+    inline void recordDequeue(uint64_t t) {
+        hazard_.getMetadata(t).fetch_sub(1,std::memory_order_relaxed);
+    }
+
     /**
      * @brief internal get_ticket function
      *
@@ -183,7 +197,7 @@ private:
     alignas(CACHE_LINE) std::atomic<Segment*> tail_{nullptr};
     char pad_tail_[CACHE_LINE - sizeof(std::atomic<Segment *>)];
     util::threading::DynamicThreadTicket ticketing_;
-    util::hazard::HazardVector<Segment*> hazard_;
+    util::hazard::HazardVector<Segment*,std::atomic<int64_t>> hazard_;
     const size_t seg_capacity_;
 
 };

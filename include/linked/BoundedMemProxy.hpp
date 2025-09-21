@@ -18,16 +18,14 @@ template <
     using Segment = SegmentType<T,BoundedMemProxy,Pow2,true>;
     //for this design we NECESSARILY need the recycler to use the cache
     using Recycler = util::hazard::Recycler<Segment,std::atomic<int64_t>,true,RecyclerPow2>;
-    using VersionedIndex = uint64_t;
     using Index = Recycler::Tml;
     using Version = uint32_t;
     using Ticket = util::threading::DynamicThreadTicket::Ticket;
     using TaggedPtr = uint64_t;
-    static constexpr uint32_t INC_VERSION = 2;
 
     static_assert(
-                ((sizeof(Version) + sizeof(Index)) <= sizeof(VersionedIndex)) &&
-                (sizeof(VersionedIndex) <= sizeof(Segment*)),
+                ((sizeof(Version) + sizeof(Index)) <= sizeof(TaggedPtr)) &&
+                (sizeof(TaggedPtr) <= sizeof(Segment*)),
                     "Version and index cannot fit in a single memory word"
     );
 
@@ -38,22 +36,34 @@ public:
             seg_capacity_((Pow2? bit::next_pow2(capacity) : capacity) / ChunkFactor),
             recycler_(ChunkFactor,maxThreads,seg_capacity_) {
 
-        assert(seg_capacity_ != 0 && "Segment Capacity is null (if Pow2 abilitated check division underflow)");
-        assert(maxThreads != 0 && "The managed number of threads must be non null");
-
-        if(!useCache) {
-            std::abort();
-        }
+        assert(
+            ((Pow2? bit::next_pow2(capacity) : capacity) % ChunkFactor) == 0 &&
+            "Queue capacity has to be a multiple of chunk factor (Chunkfactor Default = 4)"
+        );
+        assert(seg_capacity_ != 0 &&
+            "Segment Capacity underflow detected"
+        );
+        assert(maxThreads != 0 &&
+            "The managed number of threads must be non null"
+        );
 
         Index SentinelIndex;
-        if(!recycler_.get_cache(SentinelIndex)) {
-            assert(false && "Cannot get segment from cache");
+        bool ok;
+        if constexpr (useCache) {
+            ok = recycler_.get_cache(SentinelIndex);
+        } else {
+            ok = recycler_.reclaim(SentinelIndex,0); //we can use any ticket up to maxThreads since all others are inactive
         }
-        Version v = versionPool_.fetch_add(INC_VERSION);
-        TaggedPtr Sentinel = getTagged(v, SentinelIndex);
+
+        assert(ok &&
+            "No Sentinel segment could have been get"
+        );
+
+        TaggedPtr Sentinel = getTagged(getNewVersion(), SentinelIndex);
         head_.store(Sentinel);
         tail_.store(Sentinel);
 
+        //Initialize thread metadata for accurate length tracking
         for(size_t i = 0; i < maxThreads; i++) {
             recycler_.getMetadata(i).store(0,std::memory_order_relaxed);
         }
@@ -77,70 +87,159 @@ public:
      * @debug: have to rework the protection scheme in order to minimize
      * protection windows. Make the link logic easier
      */
+    // bool enqueue(T item) override {
+    //     Ticket t = get_ticket_();
+    //     bool failedReclaim{false};
+    //     while(1) {
+    //         TaggedPtr taggedTail = recycler_.protect_epoch_and_load(t,tail_);
+
+    //         if(updateNextTail(taggedTail)){
+    //             continue;
+    //         }
+
+    //         if(safeEnqueue(taggedTail,item)) {
+    //             recycler_.clear_epoch(t);
+    //             recordEnqueue(t);
+    //             return true;
+    //         }
+
+    //         //failed we have to check and reclaim
+    //         Index newQueueIndex = 0;
+    //         if(recycler_.get_cache(newQueueIndex)) {
+    //             //reset the reclaim flag
+    //             failedReclaim = false;
+    //             //enqueue your item
+    //             Segment *newQueue = recycler_.decode(newQueueIndex);
+    //             assert(newQueue->isOpened() && "Private queue from cache wasn't opened");
+    //             T ignore;
+    //             assert(newQueue->dequeue(ignore) == false && "Not expected dequeue from private segment");
+    //             (void)newQueue->enqueue(item);
+    //             Version v = getNewVersion();
+    //             newQueue = ptrCast(getTagged(v,newQueueIndex));
+    //             Segment *nullNode = nullptr;
+    //             Segment *currentTail = recycler_.decode(getIndex(taggedTail));
+    //             //try to link
+    //             if(currentTail->next_.compare_exchange_strong(nullNode,newQueue)) {
+    //                 //link successful
+    //                 (void) tail_.compare_exchange_strong(taggedTail,taggedCast(newQueue));
+    //                 recycler_.clear_epoch(t);
+    //                 recordEnqueue(t);
+    //                 return true;
+    //             }  else {
+    //                 //dequeue your item and place
+    //                 size_t success = 0;
+    //                 while(recycler_.decode(newQueueIndex)->dequeue(ignore)) {
+    //                     success++;
+    //                 }
+    //                 assert(success == 1 && "More enqueues from private segment than expected");
+    //                 recycler_.put_cache(newQueueIndex);
+    //             }
+    //         } else {
+    //             //try to reclaim
+    //             recycler_.clear_epoch(t);
+    //             if(recycler_.reclaim(newQueueIndex,t)) {
+    //                 //clear this queue and place it in cache
+    //                 Segment* reclaimedQueue = recycler_.decode(newQueueIndex);
+    //                 assert(reclaimedQueue->isClosed() && "Reclaimed queue wasn't closed");
+    //                 //open the previously cloead queue
+    //                 (void) reclaimedQueue->open();
+    //                 recycler_.put_cache(newQueueIndex);
+    //             } else if(failedReclaim) {
+    //                 return false;
+    //             } else {
+    //                 failedReclaim = true;
+    //             }
+    //         }
+    //     }
+    // }
+
     bool enqueue(T item) override {
         Ticket t = get_ticket_();
-        bool failedReclaim{false};
-        while(1) {
-            TaggedPtr taggedTail = recycler_.protect_epoch_and_load(t,tail_);
+        bool failedReclamation{false};
+        Version lastSeen{0};
 
-            if(updateNextTail(taggedTail)){
+        while(1) {
+            TaggedPtr taggedTail = recycler_.protect_epoch_and_load(t, tail_);
+
+            // ==================
+            // Preliminary checks
+            // ==================
+
+            if(updateNextTail(taggedTail)) {
+                failedReclamation = false;
                 continue;
             }
 
-            if(safeEnqueue(taggedTail,item)) {
-                recycler_.clear_epoch(t);
-                recordEnqueue(t);
-                return true;
+            if(failedReclamation) {
+                //no segment has been got in previous iteration and tail hasn't changed
+                //queue is most likely full
+                if(lastSeen == getVersion(taggedTail)) {
+                     recycler_.clear_epoch(t);
+                     return false;
+                }
+                failedReclamation = false;
             }
 
-            //failed we have to check and reclaim
-            Index newQueueIndex = 0;
-            if(recycler_.get_cache(newQueueIndex)) {
-                //reset the reclaim flag
-                failedReclaim = false;
-                //enqueue your item
-                Segment *newQueue = recycler_.decode(newQueueIndex);
-                assert(newQueue->isOpened() && "Private queue from cache wasn't opened");
-                T ignore;
-                assert(newQueue->dequeue(ignore) == false && "Not expected dequeue from private segment");
-                (void)newQueue->enqueue(item);
-                Version v = versionPool_.fetch_add(INC_VERSION);
-                newQueue = ptrCast(getTagged(v,newQueueIndex));
-                Segment *nullNode = nullptr;
-                Segment *currentTail = recycler_.decode(getIndex(taggedTail));
-                //try to link
-                if(currentTail->next_.compare_exchange_strong(nullNode,newQueue)) {
-                    //link successful
-                    (void) tail_.compare_exchange_strong(taggedTail,taggedCast(newQueue));
-                    recycler_.clear_epoch(t);
-                    recordEnqueue(t);
-                    return true;
-                }  else {
-                    //dequeue your item and place
-                    size_t success = 0;
-                    while(recycler_.decode(newQueueIndex)->dequeue(ignore)) {
-                        success++;
-                    }
-                    assert(success == 1 && "More enqueues from private segment than expected");
-                    recycler_.put_cache(newQueueIndex);
-                }
-            } else {
-                //try to reclaim
-                recycler_.clear_epoch(t);
-                if(recycler_.reclaim(newQueueIndex,t)) {
-                    //clear this queue and place it in cache
-                    Segment* reclaimedQueue = recycler_.decode(newQueueIndex);
-                    assert(reclaimedQueue->isClosed() && "Reclaimed queue wasn't closed");
-                    //open the previously cloead queue
-                    (void) reclaimedQueue->open();
-                    recycler_.put_cache(newQueueIndex);
-                } else if(failedReclaim) {
-                    return false;
-                } else {
-                    failedReclaim = true;
-                }
+            // =====================
+            //  Enqueue on segment
+            // =====================
+
+            if(safeEnqueue(taggedTail,item)) {
+                break;
             }
+
+            //get the current snapshot of the the tail
+            TaggedPtr taggedTail2 = tail_.load(std::memory_order_acquire);
+            if(taggedTail != taggedTail2) {
+                continue;   //don't even try to link (tail has changed)
+            }
+
+            // =====================
+            // New segment link
+            // =====================
+
+            Index newTailIndex;
+            // TRY TO GET A NEW SEGMENT
+            if(!recycler_.get_cache(newTailIndex)) {
+                recycler_.clear_epoch(t);
+                if(!recycler_.reclaim(newTailIndex,t)) {
+                    // NO SEGMENT GOT (SET FLAG FOR NEXT ITERATION)
+                    failedReclamation = true;
+                    lastSeen = getVersion(taggedTail);
+                    continue;
+                }
+
+                // IF TAIL HAS CHANGED, DON'T BOTHER LINKING
+                TaggedPtr tagged2 = recycler_.protect_epoch_and_load(t,tail_);
+                if(tagged2 != taggedTail){
+                    privateQueuePutBack<false>(newTailIndex,t,false);
+                    continue;
+                }
+                //open the queue
+                (void) recycler_.decode(newTailIndex)->open();
+            }
+
+            //push the current item
+            (void) recycler_.decode(newTailIndex)->enqueue(item);
+            //pack the new queue in a Segment*
+            Segment* newTail = ptrCast(getTagged(getNewVersion(),newTailIndex));
+            Segment* nullNode = nullptr;
+            Segment* currentTail = recycler_.decode(getIndex(taggedTail));
+
+            //try to perform the link
+            if(currentTail->next_.compare_exchange_strong(nullNode,newTail)) {
+                (void) tail_.compare_exchange_strong(taggedTail,taggedCast(newTail));
+                break;
+            }
+
+            //link was performed by someone else
+            privateQueuePutBack<true>(newTailIndex,t,false);
         }
+
+        //successful
+        recycler_.clear_epoch(t);
+        recordEnqueue(t);
+        return true;
     }
 
     bool dequeue(T& item) override {
@@ -161,7 +260,7 @@ public:
                     //try to cas the new next
                     if(head_.compare_exchange_strong(taggedHead,taggedCast(next))) {
                         //drop protection
-                        recycler_.retire(getIndex(taggedHead),t,true);
+                        recycler_.retire(getIndex(taggedHead),t);
                     }
                     continue;
                 }
@@ -262,6 +361,38 @@ private:
 
     }
 
+    /**
+     * @brief clears a private segment and gives it back to the Recycler
+     * @param Index q: Recycler::Index of the Segment
+     * @param Ticket t: ticket of the thread calling the method
+     * @param bool dropProtection: if true automatically drops the epoch protection
+     *
+     * @warning: if the segment was made public then undefined behaviour
+     * @warning: thread must be protecting an epoch before calling this method
+     */
+    template<bool do_empty>
+    inline void privateQueuePutBack(Index q,Ticket t,bool dropProtection = true) {
+        Segment* queue = recycler_.decode(q);
+        if constexpr (do_empty) {
+            size_t success = 0;
+            T ignore;
+            while(queue->dequeue(ignore)) {
+                success++;
+            }
+            assert(success == 1 && "Exactely one enqueue constraint failed");
+        }
+        if constexpr (useCache) {
+            /**
+             * if segment is being put in cache open it (Open is constant time)
+             */
+            (void) queue->open();
+            assert(queue->isOpened() && "Putting in cache queue that wasn't opened");
+            recycler_.put_cache(q);
+        } else {
+            recycler_.retire(q,t,dropProtection); //put it back in the free space
+        }
+    }
+
     inline Ticket get_ticket_() {
         Ticket t;
         bool ok = ticketing_.acquire(t);
@@ -293,11 +424,19 @@ private:
         return bit::keep_high(p);
     }
 
+    inline Version getNewVersion() {
+        Version ret;
+        do {
+            ret = versionPool_.fetch_add(1, std::memory_order_acq_rel);
+        } while(ret == 0);
+        return ret;
+    }
+
     align std::atomic<TaggedPtr> tail_{0};   //matches the nullptr value
     CACHE_PAD_TYPES(std::atomic<TaggedPtr>);
     align std::atomic<TaggedPtr> head_{0};   //matches the nullptr value
     CACHE_PAD_TYPES(std::atomic<TaggedPtr>);
-    align std::atomic<Version> versionPool_{1};   //all versions must be odd (version 0 is reserved for nullptr)
+    align std::atomic<Version> versionPool_{1};   //version reserved for nullptr
     CACHE_PAD_TYPES(std::atomic<Version>);
     align util::threading::DynamicThreadTicket ticketing_;
     size_t const seg_capacity_;

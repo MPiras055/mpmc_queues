@@ -1,8 +1,10 @@
+#include <atomic>
 #include <gtest/gtest.h>
 #include <thread>
 #include <vector>
+#include <barrier>
 #include <CASLoopSegment.hpp>
-// #include <PRQSegment.hpp>
+#include <PRQSegment.hpp>
 #include <BoundedCounterProxy.hpp>
 #include <BoundedChunkProxy.hpp>
 #include <BoundedMemProxy.hpp>
@@ -23,9 +25,9 @@ static constexpr size_t SEG_CAPACITY = FULL_CAPACITY / SEGMENTS;
 // ---- List of queue implementations to test ----
 template<typename V>
 using QueueTypes = ::testing::Types<
-    BoundedChunkProxy<V,LinkedCASLoop,SEGMENTS>,
-    BoundedCounterProxy<V,LinkedCASLoop,SEGMENTS>,
-    BoundedMemProxy<V,LinkedCASLoop,SEGMENTS>
+    BoundedChunkProxy<V,LinkedPRQ,SEGMENTS>,
+    BoundedCounterProxy<V,LinkedPRQ,SEGMENTS>,
+    BoundedMemProxy<V,LinkedPRQ,SEGMENTS>
     //, Other queues to add here
 >;
 
@@ -42,7 +44,7 @@ protected:
 template <typename Q>
 class Concurrency: public ::testing::Test {
 protected:
-    const size_t maxThreads = 16;
+    const size_t maxThreads = 8;
     Q q{FULL_CAPACITY,maxThreads};
 };
 TYPED_TEST_SUITE(Semantics, QueuesOfData);
@@ -66,8 +68,7 @@ TYPED_TEST(Semantics,CachedTicket) {
 
 
 TYPED_TEST(Semantics,EnqueueDequeueBasic) {
-    const size_t batchSize = 10;
-    assert(batchSize <= this->q.capacity() && "Wrong test parameter batchSize");
+    const size_t batchSize = this->q.capacity();
     auto batch = std::vector<Data>(batchSize,{0,0});
 
     EXPECT_TRUE(this->q.acquire()); //acquire a ticket for queue operation
@@ -77,6 +78,7 @@ TYPED_TEST(Semantics,EnqueueDequeueBasic) {
     }
     EXPECT_EQ(this->q.size(),batchSize);
     Data* out{};
+
     //check fifo ordering
     for(size_t i = 0; i < batchSize; i++) {
         EXPECT_TRUE(this->q.dequeue(out));
@@ -146,13 +148,16 @@ TYPED_TEST(Semantics, SegmentLinking) {
 // ------------------------------------------------
 //
 TYPED_TEST(Concurrency,SingleProducerSingleConsumer) {
-    const size_t N = (1024 * 1024);
+    const size_t N = (1024 * 1024 * 10);
 
     //initialize a batch of data
     std::vector<Data> batch;
-    batch.resize(N);
+    batch.reserve(N);
+    for(size_t i = 1; i <= N; i++) {
+        batch.emplace_back(Data(0,i));
+    }
 
-    std::jthread prod([&] {
+    std::thread prod([&] {
         //preallocate a batch of items
         EXPECT_TRUE(this->q.acquire()); //thread should get a slot
         for(auto& item : batch) {
@@ -163,7 +168,7 @@ TYPED_TEST(Concurrency,SingleProducerSingleConsumer) {
         this->q.release();
     });
 
-    std::jthread cons([&] {
+    std::thread cons([&] {
         EXPECT_TRUE(this->q.acquire());
         Data *out{reinterpret_cast<Data*>(0x1)};
         for(auto& cmp : batch) {
@@ -174,4 +179,90 @@ TYPED_TEST(Concurrency,SingleProducerSingleConsumer) {
         }
         this->q.release();
     });
+
+    prod.join();
+    cons.join();
+}
+
+TYPED_TEST(Concurrency,MultiProducerMultiConsumer) {
+    const size_t N = 1024 * 1024 * 10;
+
+    const auto test = [&](size_t prod, size_t cons) {
+        EXPECT_LE(prod + cons, this->maxThreads);
+
+        //split the items evenly among producers
+        size_t per_producer = N / prod;
+        size_t remainder = N % prod;    //the first REMAINDER producers will get +1 item
+
+        //make sure producers exit after consumer
+        std::barrier<> producerBarrier(prod + 1);
+        std::atomic_bool consumerStop;
+        std::atomic_uint64_t consumerItems{0};
+        std::vector<std::jthread> producerList;
+
+        for(size_t tid = 0; tid < prod; tid++) {
+            producerList.emplace_back([&,tid] {
+                // each thread allocates a bucket of items
+                size_t batch_size = per_producer + (tid < remainder? 1 : 0);
+                std::vector<Data> batch;
+                batch.reserve(batch_size);
+                for(uint64_t i = 0; i < batch_size; i++) {
+                    batch.emplace_back(static_cast<uint64_t>(tid),i);
+                }
+                EXPECT_TRUE(this->q.acquire());
+                for(auto& item : batch) {
+                    while(!this->q.enqueue(&item)) {
+                        //spin
+                    }
+                }
+                this->q.release();
+                producerBarrier.arrive_and_wait();
+                //main sets the consumers flag (will join the barrier after all consumers are done)
+                producerBarrier.arrive_and_wait();
+                //at this point vector can get out of scope (consumers are out)
+            });
+        }
+        std::vector<std::thread> consumerList;
+        for(size_t tid = 0; tid < cons; tid++) {
+            consumerList.emplace_back([&]{
+                std::vector<uint64_t> producerLookup(prod);
+                for(auto& p : producerLookup){p = 0;}   //init each producer value
+                Data* out = nullptr;
+                uint64_t items = 0;
+                EXPECT_TRUE(this->q.acquire());
+                while(!consumerStop.load(std::memory_order_acquire)) {
+                    if(!(this->q.dequeue(out))) continue;
+                    items++;
+                    EXPECT_LE(producerLookup[out->tid],out->epoch);
+                    producerLookup[out->tid] = out->epoch;
+                }
+                //drain the queue
+                while(this->q.dequeue(out)) {
+                    EXPECT_LE(producerLookup[out->tid],out->epoch);
+                    producerLookup[out->tid] = out->epoch;
+                    items++;
+                }
+                this->q.release();
+                //add your count to
+                consumerItems.fetch_add(items);
+            });
+        }
+        producerBarrier.arrive_and_wait();
+        consumerStop.store(true,std::memory_order_release);
+        for(auto& t : consumerList) {
+            t.join();
+        }
+        producerBarrier.arrive_and_wait();  //now producers are joinable (automatic)
+        //expect items count to match
+        EXPECT_EQ(N,consumerItems.load());
+    };
+
+    size_t tRatio = this->maxThreads / 4;
+
+    // 25% producers - 75% consumers
+    test(tRatio, 3 * tRatio);
+    // 50% producers - 50% consumers
+    test(2 * tRatio, 2 * tRatio);
+    // 75% producers - 25% consumers
+    test(3 * tRatio, tRatio);
 }

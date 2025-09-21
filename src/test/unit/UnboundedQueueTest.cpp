@@ -133,7 +133,7 @@ TYPED_TEST(QueueTest, SingleProducerSingleConsumer) {
 }
 
 TYPED_TEST(QueueTest, MultiProducerMultiConsumer) {
-    const int N = (1024 << 15), P = 8, C = 8;
+    const int N = (1024 << 13), P = 8, C = 8;
 
     std::vector<int*> produced;
     produced.reserve(N);

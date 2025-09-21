@@ -44,6 +44,7 @@ public:
         assert(size_ != 0 && "Null capacity");
         assert(!(Pow2 && size_ == 1) &&  "Size 1 and Pow2 optimization enabled");
         assert(size == array_.capacity());
+        assert(bit::getMSB64(start + size_) == 0 && "start overflow 63 bit constraint");
         for(uint64_t i = start; i < start + size_; i++) {
             array_[i % size_].val = T{nullptr};
             array_[i % size_].seq.store(i, std::memory_order_relaxed);
@@ -61,15 +62,16 @@ public:
      * @return false If the queue is full or closed.
      */
     bool enqueue(T item) final override {
-        T tagged = threadReserved();
 
         while(1) {
-            uint64_t tailTicket = tail_.fetch_add(1);
+            uint64_t tailTicket = tail_.fetch_add(1,std::memory_order_relaxed);
             if constexpr(base::is_linked_segment_v<Effective>) {
                 if(static_cast<Effective*>(this)->is_closed_(tailTicket)){
                     return false;
                 }
             }
+
+            T tagged = threadReserved();
 
             size_t tailIndex;
             if constexpr (Pow2) {
@@ -79,21 +81,23 @@ public:
             }
 
             Cell& cell = array_[tailIndex];
-            uint64_t seq = cell.seq.load();
-            T val = cell.val.load();
+            uint64_t seq = cell.seq.load(std::memory_order_relaxed);
+            T val = cell.val.load(std::memory_order_acquire);
 
             if( (val == nullptr) &&
                 (bit::get63LSB(seq) <= tailTicket) &&
-                (!bit::getMSB64(seq) || head_.load() <= tailTicket)
+                (!bit::getMSB64(seq) || head_.load(std::memory_order_acquire) <= tailTicket)
             ) {
                 if(cell.val.compare_exchange_strong(val,tagged)) {
                     if (cell.seq.compare_exchange_strong(seq,tailTicket + size_) &&
                         cell.val.compare_exchange_strong(tagged,item)
                     ) return true;
-                } else cell.val.compare_exchange_strong(tagged,T{nullptr});
+                } else
+                    cell.val.compare_exchange_strong(tagged,T{nullptr});
             }
 
-            if(tailTicket >= (head_.load() + size_)) {
+            //queue is most likely full or livelocked
+            if(tailTicket >= (head_.load(std::memory_order_acquire) + size_)) {
                 if constexpr (base::is_linked_segment_v<Effective>) {
                     (void) static_cast<Effective*>(this)->close();
                 }
@@ -114,8 +118,8 @@ public:
      */
     bool dequeue(T& container) override {
         while(1) {
-            uint64_t headTicket = head_.fetch_add(1,std::memory_order_acq_rel);
-            uint64_t headIndex;
+            uint64_t headTicket = head_.fetch_add(1,std::memory_order_relaxed);
+            uint64_t headIndex{};
             if constexpr(Pow2) {
                 headIndex = headTicket & mask_;
             } else {
@@ -127,26 +131,27 @@ public:
             uint64_t tailTicket,tailIndex,tailClosed;
 
             while(1) {
-                uint64_t packed_seq = cell.seq.load();
+                uint64_t packed_seq = cell.seq.load(std::memory_order_acquire);
                 uint64_t unsafe = bit::getMSB64(packed_seq);
                 uint64_t seq = bit::get63LSB(packed_seq);
-                T val = cell.val.load();
+                T val = cell.val.load(std::memory_order_relaxed);
 
                 //inconsistent view of the cell
-                if(packed_seq != cell.seq.load())
+                if(packed_seq != cell.seq.load(std::memory_order_acquire))
                     continue;
 
+                //arrived early
                 if(seq > (headTicket + size_))
                     break;
 
                 if((val != nullptr) && !isReserved(val)) {
                     if(seq == (headTicket + size_)) {
-                        cell.val.store(nullptr);
+                        cell.val.store(nullptr,std::memory_order_release);
                         container = val;
                         return true;
                     } else {
                         if(unsafe) {
-                            if(cell.seq.load() == packed_seq)
+                            if(cell.seq.load(std::memory_order_acquire) == packed_seq)
                                 break;
                         } else {
                             if(cell.seq.compare_exchange_strong(packed_seq,bit::setMSB64(seq)))
@@ -154,14 +159,25 @@ public:
                         }
                     }
                 } else {
+                    //reload the tail pointer every MAX_RELOAD iterations
                     if((retry & MAX_RELOAD) == 0) {
-                        tailTicket = tail_.load();
+                        tailTicket = tail_.load(std::memory_order_acquire);
                         tailIndex = bit::get63LSB(tailTicket);
                         tailClosed = tailTicket - tailIndex;
                     }
-                    if(unsafe || tailIndex < (headTicket + 1) || tailClosed || retry > MAX_RETRY) {
-                        if(isReserved(val) && !(cell.val.compare_exchange_strong(val,nullptr)))
+                    /**
+                     * Conditions
+                     * - cell is unsage (dequeues are not dequeueing | could contain reserved pointer)
+                     * - tail is behid head (high contention)
+                     * - queue is closed
+                     * - too many retries on the same cell
+                     */
+                    if(unsafe || tailIndex < (headTicket + 1) || tailClosed != 0 || retry > MAX_RETRY) {
+                        //check if the cell contains a stale bottom pointer
+                        if(isReserved(val) && !(cell.val.compare_exchange_strong(val,nullptr,std::memory_order_acq_rel)))
                             continue;
+
+                        //advance the cells epoch
                         if(cell.seq.compare_exchange_strong(packed_seq,unsafe | (headTicket + size_)))
                             break;
                     }
@@ -169,7 +185,7 @@ public:
                 ++retry;
             }
 
-            if(bit::get63LSB(tail_.load(std::memory_order_acquire)) <= (headTicket + 1)) {
+            if(bit::get63LSB(tail_.load(std::memory_order_acquire)) < (headTicket + 1)) {
                 fixState();
                 return false;
             }
@@ -210,7 +226,7 @@ private:
     // ==================================
 
     static constexpr unsigned int MAX_RELOAD    = (1ul << 8) - 1; //has to be 2^n - 1
-    static constexpr unsigned int MAX_RETRY     = 4*1024;
+    static constexpr unsigned int MAX_RETRY     = 4 * 1024;
 
     /**
      * @brief get a per-thread reserved dirty pointer of type T
@@ -244,7 +260,7 @@ private:
             if(t != tail_.load(std::memory_order_acquire)) // inconsistent tail
                 continue;
 
-            if(h > t) {
+            if(h > t) { //doesn't do anything if tail is closed
                 if(!tail_.compare_exchange_strong(t,h,std::memory_order_acq_rel))
                     continue;
             }
@@ -256,9 +272,9 @@ private:
 protected:  //Accessible to LinkedPRQ
 
     align std::atomic<uint64_t> head_; ///< Head ticket index for dequeue.
-    char pad_head_[CACHE_LINE - sizeof(std::atomic<uint64_t>)];
+    CACHE_PAD_TYPES(std::atomic_uint64_t);
     align std::atomic<uint64_t> tail_; ///< Tail ticket index for enqueue.
-    char pad_tail_[CACHE_LINE - sizeof(std::atomic<uint64_t>)];
+    CACHE_PAD_TYPES(std::atomic_uint64_t);
     const size_t size_;
     const size_t mask_;
     util::memory::HeapStorage<Cell> array_; ///< Underlying circular buffer storage.
@@ -328,9 +344,14 @@ private:
     }
 
 
+    /*
+     * DEPRECATED
+     *
+     */
     uint64_t getNextStartIndex() const override {
-        uint64_t tail = bit::get63LSB(Base::tail_.load(std::memory_order_relaxed));
-        return (tail > 0)? (tail-1) : 0;
+        // uint64_t tail = bit::get63LSB(Base::tail_.load(std::memory_order_relaxed));
+        // return (tail > 0)? (tail - 1) : 0;
+        return 0;
     }
 
     static bool is_closed_(uint64_t val) {
