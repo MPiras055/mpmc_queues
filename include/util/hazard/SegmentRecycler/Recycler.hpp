@@ -1,6 +1,6 @@
 #pragma once
 #include <IndexQueue.hpp>
-#include "CASLoopSegment.hpp"
+#include <CASLoopSegment.hpp>
 #include <HazardCell.hpp>
 #include <SingleWriterCell.hpp>
 #include <PtrLookup.hpp>

@@ -50,5 +50,14 @@ compile_commands.json
 build
 cmake/*
 
+# scripts
+*.sh
+
+# zip files
+*.zip
+
 # documentation directories
 .obsidian
+
+# python
+__pycache__

@@ -124,6 +124,10 @@ public:
         }
     }
 
+    static std::string toString() {
+        return std::string("BoundedChunk") + Segment::toString();
+    }
+
 
     /**
      * @brief get the underlying segment capacity
@@ -246,13 +250,13 @@ private:
         return retval;
     }
 
-    align std::atomic<Segment*> head_{nullptr};
+    ALIGNED_CACHE std::atomic<Segment*> head_{nullptr};
     CACHE_PAD_TYPES(std::atomic<Segment*>);
-    align std::atomic<Segment*> tail_{nullptr};
+    ALIGNED_CACHE std::atomic<Segment*> tail_{nullptr};
     CACHE_PAD_TYPES(std::atomic<Segment*>);
-    align std::atomic<uint64_t> tail_idx_{1};
+    ALIGNED_CACHE std::atomic<uint64_t> tail_idx_{1};
     CACHE_PAD_TYPES(std::atomic<uint64_t>);
-    align std::atomic<uint64_t> head_idx_{1};
+    ALIGNED_CACHE std::atomic<uint64_t> head_idx_{1};
     CACHE_PAD_TYPES(std::atomic<uint64_t>);
     util::threading::DynamicThreadTicket ticketing_;
     util::hazard::HazardVector<Segment*,ThreadRecord> hazard_;

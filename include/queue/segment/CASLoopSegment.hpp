@@ -176,12 +176,16 @@ public:
     /// @brief Defaulted destructor.
     ~CASLoopQueue() override = default;
 
+    std::string toString() {
+        return "CASLoopQueue";
+    }
+
 protected:
     // Only accessible to LinkedSegment version
 
-    align std::atomic_uint64_t head_; ///< Head ticket index for dequeue.
+    ALIGNED_CACHE std::atomic_uint64_t head_; ///< Head ticket index for dequeue.
     CACHE_PAD_TYPES(std::atomic_uint64_t);
-    align std::atomic_uint64_t tail_; ///< Tail ticket index for enqueue.
+    ALIGNED_CACHE std::atomic_uint64_t tail_; ///< Tail ticket index for enqueue.
     CACHE_PAD_TYPES(std::atomic_uint64_t);
     const size_t size_;
     const size_t mask_;
@@ -303,6 +307,6 @@ protected:
         return bit::get63LSB(tail);
     }
 
-    align std::atomic<LinkedCASLoop*> next_{nullptr}; ///< Pointer to the next segment in the chain.
+    ALIGNED_CACHE std::atomic<LinkedCASLoop*> next_{nullptr}; ///< Pointer to the next segment in the chain.
     CACHE_PAD_TYPES(std::atomic<LinkedCASLoop*>);
 };

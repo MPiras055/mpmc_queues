@@ -8,6 +8,7 @@
 #include <BoundedCounterProxy.hpp>
 #include <BoundedChunkProxy.hpp>
 #include <BoundedMemProxy.hpp>
+#include <IProxy.hpp>
 
 struct Data {
     uint64_t tid;uint64_t epoch;

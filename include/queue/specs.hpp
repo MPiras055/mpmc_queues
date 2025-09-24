@@ -64,4 +64,4 @@ namespace cache_align {
     char UNIQUE_NAME(_pad)[::cache_align::padding_for_types<__VA_ARGS__>()]
 
 // Optional: shorthand for aligning a struct
-#define align alignas(CACHE_LINE)
+#define ALIGNED_CACHE alignas(CACHE_LINE)

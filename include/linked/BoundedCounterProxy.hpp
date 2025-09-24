@@ -128,6 +128,9 @@ public:
         }
     }
 
+    static std::string toString() {
+        return std::string("BoundedCounter") + Segment::toString();
+    }
 
     /**
      * @brief get the underlying segment capacity
@@ -235,13 +238,13 @@ private:
         itemsPopped_.fetch_add(1,std::memory_order_release);
     }
 
-    align std::atomic<Segment*> head_{nullptr};
+    ALIGNED_CACHE std::atomic<Segment*> head_{nullptr};
     CACHE_PAD_TYPES(std::atomic<Segment*>);
-    align std::atomic<Segment*> tail_{nullptr};
+    ALIGNED_CACHE std::atomic<Segment*> tail_{nullptr};
     CACHE_PAD_TYPES(std::atomic<Segment*>);
-    align std::atomic<uint64_t> itemsPushed_{0};
+    ALIGNED_CACHE std::atomic<uint64_t> itemsPushed_{0};
     CACHE_PAD_TYPES(std::atomic<uint64_t>);
-    align std::atomic<uint64_t> itemsPopped_{0};
+    ALIGNED_CACHE std::atomic<uint64_t> itemsPopped_{0};
     CACHE_PAD_TYPES(std::atomic<uint64_t>);
     const size_t seg_capacity_;
     const size_t full_capacity_;

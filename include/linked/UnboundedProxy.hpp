@@ -192,9 +192,9 @@ private:
         return retval;
     }
 
-    alignas(CACHE_LINE) std::atomic<Segment*> head_{nullptr};
+    ALIGNED_CACHE std::atomic<Segment*> head_{nullptr};
     char pad_head_[CACHE_LINE - sizeof(std::atomic<Segment *>)];
-    alignas(CACHE_LINE) std::atomic<Segment*> tail_{nullptr};
+    ALIGNED_CACHE std::atomic<Segment*> tail_{nullptr};
     char pad_tail_[CACHE_LINE - sizeof(std::atomic<Segment *>)];
     util::threading::DynamicThreadTicket ticketing_;
     util::hazard::HazardVector<Segment*,std::atomic<int64_t>> hazard_;

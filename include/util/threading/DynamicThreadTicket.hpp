@@ -221,7 +221,7 @@ private:
     std::uint64_t maxThreads_;    ///< Runtime cap on tickets for this instance.
 
     // Ticket bitset: storage_[i] has 1-bits for free tickets, 0-bits for held tickets.
-    align std::array<std::atomic<std::uint64_t>, NumCells> storage_{};
+    ALIGNED_CACHE std::array<std::atomic<std::uint64_t>, NumCells> storage_{};
 
     // Global bitset of free instance IDs: 1=free, 0=used (low MaxInstances bits used).
     static inline std::atomic<std::uint64_t> instance_bitmap_{

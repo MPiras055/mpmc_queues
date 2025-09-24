@@ -300,6 +300,10 @@ public:
         return seg_capacity_ * ChunkFactor;
     }
 
+    static std::string toString() {
+        return std::string("BoundedMem") + Segment::toString();
+    }
+
 
 private:
 
@@ -432,13 +436,13 @@ private:
         return ret;
     }
 
-    align std::atomic<TaggedPtr> tail_{0};   //matches the nullptr value
+    ALIGNED_CACHE std::atomic<TaggedPtr> tail_{0};   //matches the nullptr value
     CACHE_PAD_TYPES(std::atomic<TaggedPtr>);
-    align std::atomic<TaggedPtr> head_{0};   //matches the nullptr value
+    ALIGNED_CACHE std::atomic<TaggedPtr> head_{0};   //matches the nullptr value
     CACHE_PAD_TYPES(std::atomic<TaggedPtr>);
-    align std::atomic<Version> versionPool_{1};   //version reserved for nullptr
+    ALIGNED_CACHE std::atomic<Version> versionPool_{1};   //version reserved for nullptr
     CACHE_PAD_TYPES(std::atomic<Version>);
-    align util::threading::DynamicThreadTicket ticketing_;
+    ALIGNED_CACHE util::threading::DynamicThreadTicket ticketing_;
     size_t const seg_capacity_;
     Recycler recycler_;
 };

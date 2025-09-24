@@ -219,6 +219,10 @@ public:
     /// @brief Defaulted destructor.
     ~PRQueue() override = default;
 
+    static std::string toString() {
+        return "PRQueue";
+    }
+
 private:
 
     // ==================================
@@ -271,9 +275,9 @@ private:
 
 protected:  //Accessible to LinkedPRQ
 
-    align std::atomic<uint64_t> head_; ///< Head ticket index for dequeue.
+    ALIGNED_CACHE std::atomic<uint64_t> head_; ///< Head ticket index for dequeue.
     CACHE_PAD_TYPES(std::atomic_uint64_t);
-    align std::atomic<uint64_t> tail_; ///< Tail ticket index for enqueue.
+    ALIGNED_CACHE std::atomic<uint64_t> tail_; ///< Tail ticket index for enqueue.
     CACHE_PAD_TYPES(std::atomic_uint64_t);
     const size_t size_;
     const size_t mask_;
@@ -381,6 +385,6 @@ private:
         return !isClosed();
     }
 
-    align std::atomic<LinkedPRQ*> next_{nullptr}; ///< Pointer to the next segment in the chain.
+    ALIGNED_CACHE std::atomic<LinkedPRQ*> next_{nullptr}; ///< Pointer to the next segment in the chain.
     CACHE_PAD_TYPES(std::atomic<LinkedPRQ*>);
 };

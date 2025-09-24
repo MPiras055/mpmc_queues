@@ -4,6 +4,7 @@
 
 #pragma once
 #include <cstddef>
+#include <string>
 
 namespace base {
 
@@ -58,6 +59,11 @@ public:
     /// @return The number of elements currently stored.
     virtual size_t size() const = 0;
 
+    /// @brief Returns the canonical name of the segment
+    ///
+    static std::string toString() {
+        return "IQueue";
+    };
 
 };
 

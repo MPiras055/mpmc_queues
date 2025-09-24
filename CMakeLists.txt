@@ -11,7 +11,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 enable_testing()
 
 # === Include all subdirectories in include/ ===
-file(GLOB_RECURSE ALL_INCLUDE_DIRS LIST_DIRECTORIES true "${PROJECT_SOURCE_DIR}/include/*")
+file(GLOB_RECURSE
+    ALL_INCLUDE_DIRS
+    LIST_DIRECTORIES true
+    "${PROJECT_SOURCE_DIR}/include/*"
+)
 
 set(INCLUDE_DIRS "")
 foreach(dir ${ALL_INCLUDE_DIRS})
@@ -20,6 +24,15 @@ foreach(dir ${ALL_INCLUDE_DIRS})
     endif()
 endforeach()
 include_directories(${INCLUDE_DIRS})
+
+# === Additional Work utilities
+add_executable(timeTicks "src/util/time/timeTicks.cpp")
+target_compile_options(timeTicks PUBLIC -O3)
+
+# === Test Stub
+add_executable(testStub "src/sim/test_stub.cpp")
+target_compile_options(testStub PUBLIC -O3)
+
 
 # === GoogleTest ===
 set(GTEST_DIR ${PROJECT_SOURCE_DIR}/cmake/extern/googletest)
