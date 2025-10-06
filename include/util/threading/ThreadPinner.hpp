@@ -6,6 +6,7 @@
 #include <string>
 #include <fstream>
 #include <cassert>
+#include <iostream>
 
 #ifndef CORE_TOPOLOGY
 #define CORE_TOPOLOGY ".sys_topo"
@@ -15,22 +16,23 @@ class ThreadPinner {
 public:
     ThreadPinner() {
         bool ok = load_topology(logical_core_list);
-        assert(ok && "Failed to load topology");
-
+        if(!ok) {
+            std::cerr << "CORE TOPOLOGY file not found\n";
+            std::abort();
+        }
     }
 
     /**
      * @brief pins a group of threads
      */
     bool pin_threads(std::vector<std::thread>& threads) const {
-        size_t core_len = logical_core_list.size();
+        const size_t core_len = logical_core_list.size();
         for(size_t i = 0; i < threads.size(); i++) {
             bool ok = bind_thread_to_core(
                 threads[i],
                 logical_core_list[i % core_len]
             );
-            if(!ok)
-                return false;
+            if(!ok) return false;
         }
         return true;
     }
@@ -96,11 +98,12 @@ private:
         std::string line;
         int core;
         while(std::getline(input,line)) {
-            if(std::scanf(line.c_str(),"%d",&core) != 1) {
+            if(std::sscanf(line.c_str(),"%d",&core) != 1) {
                 return false;
             }
             core_list.push_back(core);
         }
+
         res = core_list;
         return true;
     }
@@ -112,7 +115,7 @@ private:
         cpu_set_t cpu_set;
         CPU_ZERO(&cpu_set);
         CPU_SET(core_id,&cpu_set);
-        return pthread_setaffinity_np(t.native_handle(), sizeof(cpu_set_t), &cpu_set);
+        return pthread_setaffinity_np(t.native_handle(), sizeof(cpu_set_t), &cpu_set) == 0;
     }
 
     std::vector<int> logical_core_list;

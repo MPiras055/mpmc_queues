@@ -9,15 +9,15 @@
 template <
     typename T, //type of the queue item
     template<typename T1,typename Proxy, bool p = true, bool auto_close = true> typename SegmentType, //deferred segment type
-    size_t ChunkFactor = 4,     //recycler's pool size
-    bool Pow2 = true,           //segment pow2
-    bool RecyclerPow2 = true,   //enable pow2 optimization for recycler queues
-    bool useCache = true        //enable recycler's cache
+    size_t ChunkFactor = 4,         //recycler's pool size
+    bool Pow2 = false,              //segment pow2
+    bool RecyclerPow2 = false,      //enable pow2 optimization for recycler queues
+    bool useCache = true            //enable recycler's cache
 > class BoundedMemProxy: public base::IProxy<T, SegmentType> {
 
     using Segment = SegmentType<T,BoundedMemProxy,Pow2,true>;
     //for this design we NECESSARILY need the recycler to use the cache
-    using Recycler = util::hazard::Recycler<Segment,std::atomic<int64_t>,true,RecyclerPow2>;
+    using Recycler = util::hazard::Recycler<Segment,std::atomic<int64_t>,useCache,RecyclerPow2>;
     using Index = Recycler::Tml;
     using Version = uint32_t;
     using Ticket = util::threading::DynamicThreadTicket::Ticket;

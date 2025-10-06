@@ -4,9 +4,13 @@
 #include <specs.hpp>                //padding definition
 #include <bit.hpp>                  //bit manipulation
 
-template <typename T, template<typename,typename,bool,bool> typename Seg>
+template <
+    typename T,
+    template<typename,typename,bool,bool>
+    typename Seg, bool pow2 = false
+>
 class UnboundedProxy: public base::IProxy<T,Seg> {
-    using Segment = Seg<T, UnboundedProxy,true,true>;
+    using Segment = Seg<T, UnboundedProxy,pow2,true>;
 
 public:
     explicit UnboundedProxy(size_t cap, size_t maxThreads) :

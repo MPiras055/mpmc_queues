@@ -52,8 +52,8 @@ public:
     using Tml = uint32_t;
 private:
     using ThreadHazard = HazardCell<SingleWriterCell,Meta>;   //padded HazardCells
-    using Bucket = IndexQueue<usePow2>;
-    using Cache = CASLoopQueue<Tml,usePow2>;
+    using Bucket =  IndexQueue<usePow2>;
+    using Cache  =  IndexQueue<usePow2>;
 public:
     /**
    * @brief Construct a Recycler.
@@ -105,7 +105,7 @@ public:
 
         if constexpr(!use_cache) {
             // if Tmls start in the free_bucket set the available counter
-            reclaim_avail_.store(tracked_count_, std::memory_order_release);
+            reclaim_avail_.store(tracked_count_, std::memory_order_relaxed);
         }
     }
 
@@ -399,7 +399,8 @@ private:
      * @brief helper to check for reclaimable Tmls
      */
     inline bool available() const noexcept {
-        return reclaim_avail_.load(std::memory_order_acquire) > 0;
+        uint32_t rec = reclaim_avail_.load(std::memory_order_acquire);
+        return rec > 0;
     }
 
 

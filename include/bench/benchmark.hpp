@@ -1,3 +1,5 @@
+#pragma once
+
 #include <chrono>
 #include <barrier>
 #include <thread>
@@ -9,17 +11,28 @@
 #include <ThreadPinner.hpp>
 #include <AdditionalWork.hpp>
 
+// Include all proxies
+#include <BoundedChunkProxy.hpp>
+#include <BoundedCounterProxy.hpp>
+#include <BoundedMemProxy.hpp>
+#include <UnboundedProxy.hpp>
+
+// Include all queue segments
+#include <PRQSegment.hpp>
+#include <CASLoopSegment.hpp>
+
 //Assumes that CORE_TOPOLOGY is defined if pinning is active
 
 namespace bench {
 
 static constexpr size_t NSEC_IN_SEC = 1'000'000'000ull;
 
+
 enum class delay {
-    NO_DELAY,
-    PROD_DELAY,
-    CONS_DELAY,
-    BOTH_DELAY
+    NO_DELAY = 0ul,
+    PROD_DELAY = 1ul,
+    CONS_DELAY = 2ul,
+    BOTH_DELAY = 3ul
 };
 
 struct QueueItem {  //dummy pointer
@@ -40,19 +53,31 @@ Q create_queue(size_t size_queue, size_t threads) {
 /**
  * @brief runs a performance benchmark sending
  */
-template<typename Q, delay do_delay, bool pin_threads>
+template<typename Q>
 bool benchmark(
     size_t prod,
     size_t cons,
     size_t size_queue,
     size_t iterations,
+    bool pinning,
+    size_t delay_int,
     size_t delay_center,
-    size_t delay_amplitude) {
+    size_t delay_amplitude
+) {
+
+    delay delay = static_cast<enum delay>(delay_int);
 
     using namespace std::chrono;
 
-    if(prod == 0 || cons == 0 || iterations == 0 || size_queue <= 1)
-        return false;
+    if(prod == 0 || cons == 0 || iterations == 0 || size_queue <= 1) {
+        std::cerr << "Test parameters [prod cons iterations size_queue] invalid";
+        std::abort();
+    }
+
+    else if(delay_int > 3) {
+        std::cerr << "Invalid delay" << delay_int << "\n";
+        std::abort();
+    }
 
     Q queue = create_queue<Q>(size_queue,prod + cons);
 
@@ -75,17 +100,25 @@ bool benchmark(
             //acquire a ticket for the queue if proxy
             if constexpr (base::is_proxy_v<Q>) {
                 bool ok = queue.acquire();
-                assert(ok && "[Producers] Ticket for proxy coudn't be acquired");
+                if(!ok) {
+                    std::cerr << "Producer coudn't acquire ticket";
+                    std::abort();
+                }
             }
             threadBarrier.arrive_and_wait();    //threads wait for main thread to signal
 
-            for(size_t j = 0; j < iterations && (!producerStop.load(std::memory_order_relaxed)); j++) {
-                (void) j;
-                //perform random work only before each enqueue
-                if constexpr ((do_delay == delay::PROD_DELAY) || (do_delay == delay::BOTH_DELAY)) {
+            if ((delay == delay::PROD_DELAY) || (delay == delay::BOTH_DELAY)) {
+                for(size_t j = 0; j < iterations && (!producerStop.load(std::memory_order_relaxed)); j++) {
+                    (void) j;
+                    //perform random work only before each enqueue
                     random_work(delay_center,delay_amplitude);
+                    while(!queue.enqueue(dummy));
                 }
-                while(!queue.enqueue(dummy));
+            } else {
+                for(size_t j = 0; j < iterations && (!producerStop.load(std::memory_order_relaxed)); j++) {
+                    (void) j;
+                    while(!queue.enqueue(dummy));
+                }
             }
 
             //release the queue ticket if not proxy
@@ -102,26 +135,29 @@ bool benchmark(
     for(size_t i = 0; i < cons; i++) {
         consumers.emplace_back([&]{
             QueueItem* dummy;
-
             //acquire a ticket for the queue if proxy
             if constexpr (base::is_proxy_v<Q>) {
                 bool ok = queue.acquire();
-                assert(ok && "[Consumers] Ticket for proxy coudn't be acquired");
+                if(!ok) {
+                    std::cerr << "Consumer ticket coudn't be acquired";
+                    std::abort();
+                }
             }
             threadBarrier.arrive_and_wait(); //waits for pinning setting
 
-            while(!consumerStop.load(std::memory_order_relaxed)) {
-                while(!queue.dequeue(dummy) && !consumerStop.load(std::memory_order_relaxed));
-                //perform random work only after successful dequeue
-                if constexpr ((do_delay == delay::CONS_DELAY) || (do_delay == delay::BOTH_DELAY)) {
+            if((delay == delay::CONS_DELAY) || (delay == delay::BOTH_DELAY)) {
+                while(!consumerStop.load(std::memory_order_relaxed)) {
+                    if(queue.dequeue(dummy))
+                        random_work(delay_center,delay_amplitude);
+                }
+                while(queue.dequeue(dummy)) {
                     random_work(delay_center,delay_amplitude);
                 }
-            }
-            //right now drain the queue
-            while(queue.dequeue(dummy)) {
-                if constexpr ((do_delay == delay::CONS_DELAY) || (do_delay == delay::BOTH_DELAY)) {
-                    random_work(delay_center,delay_amplitude);
+            } else {
+                while(!consumerStop.load(std::memory_order_relaxed)) {
+                    (void)(queue.dequeue(dummy));
                 }
+                while(queue.dequeue(dummy));
             }
 
             if constexpr (base::is_proxy_v<Q>) {
@@ -132,9 +168,10 @@ bool benchmark(
         });
     }
 
-    if constexpr(pin_threads) {
+    if (pinning) {
         ThreadPinner T;
         bool ok = T.pin_threads(producers,consumers);
+
         if(!ok) {
             //threads coudn't be pinned
             producerStop.store(true,std::memory_order_release);
@@ -162,16 +199,13 @@ bool benchmark(
     //return the ops per sec
     std::chrono::nanoseconds deltaTime = end - start;
 
-    for(auto& p : producers) {
-        p.join();
-    }
-    for(auto& c : consumers ) {
-        c.join();
-    }
+    for(auto& p : producers) p.join();
+
+    for(auto& c : consumers ) c.join();
 
 
     std::cout << static_cast<long double>(iterations * NSEC_IN_SEC) / deltaTime.count() << "\n";
-    return 0;
+    return true;
 }
 
 }   //bench namespace

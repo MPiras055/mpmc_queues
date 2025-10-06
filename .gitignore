@@ -45,6 +45,7 @@
 .vscode
 .cache
 compile_commands.json
+.zed
 
 # cmake
 build
@@ -58,6 +59,12 @@ cmake/*
 
 # documentation directories
 .obsidian
+.md
 
-# python
+# pyright
+pyrightconfig.json
+
+# benchmarking
 __pycache__
+scripts
+src/sim

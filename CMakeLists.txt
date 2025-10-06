@@ -27,11 +27,13 @@ include_directories(${INCLUDE_DIRS})
 
 # === Additional Work utilities
 add_executable(timeTicks "src/util/time/timeTicks.cpp")
-target_compile_options(timeTicks PUBLIC -O3)
+target_compile_options(timeTicks PUBLIC -O3 -DNDEBUG -funroll-loops -fno-rtti)
 
 # === Test Stub
-add_executable(testStub "src/sim/test_stub.cpp")
-target_compile_options(testStub PUBLIC -O3)
+add_executable(testStub "src/sim/test_stub_autogen.cpp")
+target_compile_options(
+    testStub PUBLIC -O3 -DNDEBUG -funroll-loops -fno-rtti -march=native)
+target_precompile_headers(testStub PUBLIC "include/bench/benchmark.hpp")
 
 
 # === GoogleTest ===

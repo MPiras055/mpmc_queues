@@ -112,7 +112,7 @@ public:
     /**
      * @brief Constructs a PtrLookup by moving a HeapStorage of pointers.
      * @param h Rvalue reference to HeapStorage<P> to consume.
-     * 
+     *
      * @note Ownership of the storage is trasferred
      */
     explicit PtrLookup(util::memory::HeapStorage<P>&& h)
@@ -146,6 +146,7 @@ public:
      * @return Stored pointer at the given index.
      */
     inline P getPtr(size_t idx) const {
+        assert(idx < storage_.capacity() && "Accessing out of bounds");
         return storage_[idx];
     }
 

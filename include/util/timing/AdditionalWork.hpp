@@ -35,13 +35,17 @@ static inline void random_work(const double mean) {
     return;
 }
 
-inline size_t randint(size_t center, size_t amplitude){
-#ifndef NDEBUG
-    assert(amplitude <= center);
-#endif
-    double random_amplitude = random_01_distribution(random_engine) * static_cast<double>(amplitude << 1);
-    return static_cast<size_t>(static_cast<double>(center-amplitude) + random_amplitude);
+inline size_t randint(size_t center, size_t amplitude) {
+    assert(amplitude <= center); // avoid underflow
+
+    // Generate random double in [0.0, 1.0)
+    double rand01 = random_01_distribution(random_engine);
+
+    // Calculate result in [center - amplitude, center + amplitude)
+    return static_cast<size_t>(static_cast<double>(center - amplitude) + rand01 * (2 * amplitude));
+
 }
+
 
 /**
  * @brief Random work function
