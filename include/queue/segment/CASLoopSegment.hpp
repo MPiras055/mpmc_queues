@@ -38,7 +38,7 @@ class LinkedCASLoop;
  */
 template<typename T, typename Opt = meta::EmptyOptions, typename Derived = void>
 class CASLoopQueue: public base::IQueue<T> {
-    static_assert(std::is_pointer_v<T>, "CASLoopQueue: non pointer item type");
+    static_assert(std::is_pointer_v<T>, "CASLoopQueue: non-pointer item type");
 
 
     using Effective = std::conditional_t<std::is_void_v<Derived>, CASLoopQueue, Derived>;
@@ -52,7 +52,7 @@ class CASLoopQueue: public base::IQueue<T> {
 
     inline size_t mod(uint64_t i) const noexcept{
         if constexpr (POW2) {
-            return i & (size_ - 1);
+            return i & (mask_);
         } else {
             return i % size_;
         }
@@ -70,10 +70,11 @@ public:
      */
     CASLoopQueue(size_t size, uint64_t start = 0):
         size_(POW2 && !bit::is_pow2(size)? bit::next_pow2(size) : size),
+        mask_(POW2 && size_ != 1? (size_ - 1) : 0),
         array_{new Cell[size_]}
     {
         assert(size_ != 0 && "CASLoopQueue: null capacity");
-        assert(!POW2 || size_ != 1 && "CASLoopQueue: null bitmask");
+        assert(!POW2 || mask_ != 0 && "CASLoopQueue: null bitmask");
 
 
         for(uint64_t i = start; i < start + size_; i++) {
@@ -205,6 +206,7 @@ protected:
     ALIGNED_CACHE std::atomic_uint64_t tail_; ///< Tail ticket index for enqueue.
     CACHE_PAD_TYPES(std::atomic_uint64_t);
     const size_t size_;
+    const size_t mask_;
     Cell* array_; ///< Underlying circular buffer storage.
 
 };
@@ -266,8 +268,8 @@ protected:
     /**
      * @brief internal method to check if the queue is closed
      */
-    static bool is_closed_(uint64_t tail) {
-        return bit::get_msb(tail) != 0;
+    static bool is_closed_(uint64_t tail) noexcept {
+        return bit::get_msb(tail) != uint64_t{0};
     }
 
     /**
@@ -294,22 +296,32 @@ protected:
      * @brief closes the queue to further insertions (until open() is called)
      */
     bool close() final override {
-        Base::tail_.fetch_or(bit::set_msb(1ull),std::memory_order_acq_rel);
+        Base::tail_.fetch_or(bit::set_msb(uint64_t{0}),std::memory_order_acq_rel);
         return true;
     }
 
+    /**
+     * @brief checks if the segment is closed to further insertions
+     */
     bool isClosed() const final override {
         return is_closed_(Base::tail_);
     }
 
+    /**
+     * @brief checks if the segment is closed to further insertions
+     */
     bool isOpened() const final override {
         return !isClosed();
     }
 
+    /// @brief enqueue with additional info
+    /// @note same as base segment for this implementation
     bool enqueue(T item, [[maybe_unused]] bool info = true) final override {
         return Base::enqueue(item);
     }
 
+    /// @brief dequeue with additional info
+    /// @note same as base segment for this implementation
     bool dequeue(T item, [[maybe_unused]] bool info = true) final override {
         return Base::dequeue(item);
     }
@@ -317,7 +329,7 @@ protected:
     static_assert(detail::atomic_compatible_v<Next>,"LinkedCASLoop Next field: not lock free");
     static_assert(std::is_default_constructible_v<Next>,"LinkedCASLoop Next field: not default constructible");
     ALIGNED_CACHE std::atomic<Next> next_{}; ///< Pointer to the next segment in the chain.
-    CACHE_PAD_TYPES(std::atomic<LinkedCASLoop*>);
+    CACHE_PAD_TYPES(std::atomic<Next>);
 };
 
 }   //namespace queue

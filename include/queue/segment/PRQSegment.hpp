@@ -1,18 +1,28 @@
 #pragma once
-#include <IQueue.hpp>
-#include <ILinkedSegment.hpp>
-#include <SequencedCell.hpp>
-#include <HeapStorage.hpp>
-#include <StaticThreadTicket.hpp>
 #include <atomic>
 #include <cassert>
-#include <specs.hpp>
-#include <bit.hpp>
+#include <atomic>
+#include <cassert>
+#include <specs.hpp>            //  padding and compatibility def
+#include <IQueue.hpp>           //  base queue interface
+#include <ILinkedSegment.hpp>   //  base linked segment interface
+#include <SequencedCell.hpp>    //  cell definition
+#include <bit.hpp>              //  bit manipulation utilities
+#include <OptionsPack.hpp>      //  options
 
 
+
+namespace queue {
+
+/// Options for the queue
+struct PRQOption {
+    struct Pow2Size{};
+    struct DisableCellPadding{};
+    struct DisableAutoClose{};
+};
 
 // Forward declaration
-template<typename T, typename Proxy, bool Pow2, bool auto_close>
+template<typename T, typename Proxy, typename Opt, typename NextT>
 class LinkedPRQ;
 
 /**
@@ -20,11 +30,26 @@ class LinkedPRQ;
  *
  * @tparam T Type of elements stored in the queue
  */
-template<typename T, bool Pow2 = false, typename Derived = void>
+template<typename T, typename Opt = meta::EmptyOptions, typename Derived = void>
 class PRQueue: public base::IQueue<T> {
+    static_assert(std::is_pointer_v<T>,"PRQueue: non-pointer item type");
 
     using Effective = std::conditional_t<std::is_void_v<Derived>,PRQueue,Derived>;
-    using Cell = SequencedCell<T>;
+    static constexpr bool AUTO_CLOSE = !Opt::template has<PRQOption::DisableAutoClose> &&
+        base::is_linked_segment_v<Effective>;
+
+    static constexpr bool POW2 =        Opt::template has<PRQOption::Pow2Size>;
+    static constexpr bool PAD_CELL =    !Opt::template has<PRQOption::DisableCellPadding>;
+
+    using Cell = cell::SequencedCell<T,PAD_CELL>;
+
+    inline size_t mod(uint64_t i) const noexcept {
+        if constexpr (POW2) {
+            return i & (mask_);
+        } else {
+            return i % size_;
+        }
+    }
 
 public:
     /**
@@ -37,24 +62,22 @@ public:
      * @param start Initial sequence number (defaults to 0).
      */
     explicit PRQueue(size_t size, uint64_t start = 0):
-        size_{Pow2? bit::next_pow2(size) : size},
-        mask_{size_ - 1},
-        array_(size_)
+        size_(POW2 && !bit::is_pow2(size)? bit::next_pow2(size) : size),
+        mask_(POW2 && size_ != 1? (size_ - 1) : 0),
+        array_{new Cell[size_]}
     {
-        assert(size_ != 0 && "Null capacity");
-        assert(!(Pow2 && size_ == 1) &&  "Size 1 and Pow2 optimization enabled");
-        assert(size == array_.capacity());
-        assert(bit::getMSB64(start + size_) == 0 && "start overflow 63 bit constraint");
-        for(uint64_t i = start; i < start + size_; i++) {
-            array_[i % size_].val = T{nullptr};
-            array_[i % size_].seq.store(i, std::memory_order_relaxed);
-        }
+        assert(size_ != 0 && "PRQueue: null capacity");
+        assert(!POW2 || mask_ != 0 && "PRQueue: null bitmask");
+        assert(bit::get_msb(start + size_) == 0ull && "PRQueue: sequence overflow");
 
+        for(uint64_t i = start; i < start + size_; i++) {
+            array_[mod(i)].seq.store(i, std::memory_order_relaxed);
+        }
         head_.store(start, std::memory_order_relaxed);
         tail_.store(start, std::memory_order_relaxed);
     }
 
-        /**
+    /**
      * @brief Enqueues an item into the queue.
      *
      * @param item Value to insert into the queue.
@@ -65,28 +88,22 @@ public:
 
         while(1) {
             uint64_t tailTicket = tail_.fetch_add(1,std::memory_order_relaxed);
-            if constexpr(base::is_linked_segment_v<Effective>) {
+            if constexpr(AUTO_CLOSE) {
                 if(static_cast<Effective*>(this)->is_closed_(tailTicket)){
                     return false;
                 }
             }
 
             T tagged = threadReserved();
-
-            size_t tailIndex;
-            if constexpr (Pow2) {
-                tailIndex = tailTicket & mask_;
-            } else {
-                tailIndex = tailTicket % size_;
-            }
+            size_t tailIndex = mod(tailTicket);
 
             Cell& cell = array_[tailIndex];
             uint64_t seq = cell.seq.load(std::memory_order_relaxed);
             T val = cell.val.load(std::memory_order_acquire);
 
             if( (val == nullptr) &&
-                (bit::get63LSB(seq) <= tailTicket) &&
-                (!bit::getMSB64(seq) || head_.load(std::memory_order_acquire) <= tailTicket)
+                (bit::clear_msb(seq) <= tailTicket) &&
+                (!bit::get_msb(seq) || head_.load(std::memory_order_acquire) <= tailTicket)
             ) {
                 if(cell.val.compare_exchange_strong(val,tagged)) {
                     if (cell.seq.compare_exchange_strong(seq,tailTicket + size_) &&
@@ -98,10 +115,10 @@ public:
 
             //queue is most likely full or livelocked
             if(tailTicket >= (head_.load(std::memory_order_acquire) + size_)) {
-                if constexpr (base::is_linked_segment_v<Effective>) {
-                    (void) static_cast<Effective*>(this)->close();
+                if constexpr (AUTO_CLOSE) {
+                    if(static_cast<Effective*>(this)->close())
+                        return false;
                 }
-                return false;
             }
         }
     }
@@ -119,12 +136,7 @@ public:
     bool dequeue(T& container) override {
         while(1) {
             uint64_t headTicket = head_.fetch_add(1,std::memory_order_relaxed);
-            uint64_t headIndex{};
-            if constexpr(Pow2) {
-                headIndex = headTicket & mask_;
-            } else {
-                headIndex = headTicket % size_;
-            }
+            uint64_t headIndex  = mod(headTicket);
             Cell& cell = array_[headIndex];
 
             unsigned int retry = 0;
@@ -132,8 +144,8 @@ public:
 
             while(1) {
                 uint64_t packed_seq = cell.seq.load(std::memory_order_acquire);
-                uint64_t unsafe = bit::getMSB64(packed_seq);
-                uint64_t seq = bit::get63LSB(packed_seq);
+                uint64_t unsafe = bit::get_msb(packed_seq);
+                uint64_t seq = bit::clear_msb(packed_seq);
                 T val = cell.val.load(std::memory_order_relaxed);
 
                 //inconsistent view of the cell
@@ -154,7 +166,7 @@ public:
                             if(cell.seq.load(std::memory_order_acquire) == packed_seq)
                                 break;
                         } else {
-                            if(cell.seq.compare_exchange_strong(packed_seq,bit::setMSB64(seq)))
+                            if(cell.seq.compare_exchange_strong(packed_seq,bit::set_msb(seq)))
                                 break;
                         }
                     }
@@ -162,7 +174,7 @@ public:
                     //reload the tail pointer every MAX_RELOAD iterations
                     if((retry & MAX_RELOAD) == 0) {
                         tailTicket = tail_.load(std::memory_order_acquire);
-                        tailIndex = bit::get63LSB(tailTicket);
+                        tailIndex = bit::clear_msb(tailTicket);
                         tailClosed = tailTicket - tailIndex;
                     }
                     /**
@@ -185,7 +197,7 @@ public:
                 ++retry;
             }
 
-            if(bit::get63LSB(tail_.load(std::memory_order_acquire)) < (headTicket + 1)) {
+            if(bit::clear_msb(tail_.load(std::memory_order_acquire)) < (headTicket + 1)) {
                 fixState();
                 return false;
             }
@@ -198,7 +210,7 @@ public:
      * @return Maximum number of elements that can be stored.
      */
     size_t capacity() const override {
-        return array_.capacity();
+        return size_;
     }
 
     /**
@@ -211,17 +223,15 @@ public:
      *
      */
     size_t size() const override {
-        uint64_t t = bit::get63LSB(tail_.load(std::memory_order_relaxed));
+        uint64_t t = bit::clear_msb(tail_.load(std::memory_order_relaxed));
         uint64_t h = head_.load(std::memory_order_acquire);
         return t > h? (t - h) : 0;
     }
 
     /// @brief Defaulted destructor.
-    ~PRQueue() override = default;
-
-    static std::string toString() {
-        return "PRQueue";
-    }
+    ~PRQueue() override {
+        delete[] array_;
+    };
 
 private:
 
@@ -238,10 +248,10 @@ private:
      * @note uses thread-local storage to cache the result
      *
      */
-    T threadReserved() const {
-        thread_local static T tid = [] {
-            static std::atomic<int> counter{1};
-            return reinterpret_cast<T>((counter.fetch_add(1) << 1) | 1);
+    T threadReserved() const noexcept {
+        static thread_local T tid = [](){
+            static std::atomic<uint64_t> counter{1ull};
+            return reinterpret_cast<T>((counter.fetch_add(1ull) << 1) | 1);
         }();
         return tid;
     }
@@ -256,21 +266,14 @@ private:
         return (reinterpret_cast<uintptr_t>(ptr) & 1) != 0;
     }
 
-    void fixState() {
-        while(1) {
-            uint64_t t = tail_.load(std::memory_order_relaxed);
-            uint64_t h = head_.load(std::memory_order_relaxed);
-
-            if(t != tail_.load(std::memory_order_acquire)) // inconsistent tail
-                continue;
-
-            if(h > t) { //doesn't do anything if tail is closed
-                if(!tail_.compare_exchange_strong(t,h,std::memory_order_acq_rel))
-                    continue;
-            }
-
-            return;
-        }
+    void fixState() noexcept {
+        uint64_t t = tail_.load(std::memory_order_relaxed);
+        uint64_t h = head_.load(std::memory_order_relaxed);
+        while(
+            (h > t) &&
+            !tail_.compare_exchange_strong(t,h,std::memory_order_acq_rel,std::memory_order_acquire)
+        );
+        return;
     }
 
 protected:  //Accessible to LinkedPRQ
@@ -281,7 +284,7 @@ protected:  //Accessible to LinkedPRQ
     CACHE_PAD_TYPES(std::atomic_uint64_t);
     const size_t size_;
     const size_t mask_;
-    util::memory::HeapStorage<Cell> array_; ///< Underlying circular buffer storage.
+    Cell* array_; ///< Underlying circular buffer storage.
 };
 
 /**
@@ -293,35 +296,24 @@ protected:  //Accessible to LinkedPRQ
  * @tparam T Type of elements stored in the queue.
  * @tparam Proxy Friend class allowed to access private members (e.g., higher-level queue).
  */
-template<typename T, typename Proxy, bool Pow2, bool auto_close = true>
+template<typename T, typename Proxy, typename Opt = meta::EmptyOptions, typename NextT = void>
 class LinkedPRQ:
     public PRQueue<
-        T,
-        Pow2,
-        std::conditional_t<
-            auto_close,
-            LinkedPRQ<
-                T,
-                Proxy,
-                Pow2
-            >,
-            void
-        >
+        T,Opt,LinkedPRQ<T,Proxy,Opt,NextT>
     >,
     public base::ILinkedSegment<
-        T,
-        LinkedPRQ<
-            T,
-            Proxy,
-            Pow2
+        T, std::conditional_t<
+            std::is_void_v<NextT>,
+            LinkedPRQ<T,Proxy,Opt,NextT>*,
+            NextT
         >
     >
 {
-    friend Proxy;   ///< Proxy class can access private methods.
 
-    using Base = PRQueue<T,Pow2,std::conditional_t<auto_close,LinkedPRQ<T,Proxy,Pow2>,void>>;
-
+    using Base = PRQueue<T,Opt,LinkedPRQ<T,Proxy,Opt,NextT>>;
+    using Next = std::conditional_t<std::is_void_v<NextT>,LinkedPRQ<T,Proxy,Opt,NextT>*,NextT>;
     friend Base;
+    friend Proxy;   ///< Proxy class can access private methods.
 
 public:
     /**
@@ -330,8 +322,7 @@ public:
      * @param size Capacity of this segment.
      * @param start Initial sequence number (defaults to 0).
      */
-    LinkedPRQ(size_t size, uint64_t start = 0):
-        Base(size,start) {}
+    LinkedPRQ(size_t size, uint64_t start = 0): Base(size,start) {}
 
     /// @brief Defaulted destructor.
     ~LinkedPRQ() override = default;
@@ -343,48 +334,78 @@ private:
      *
      * @return Pointer to the next segment, or nullptr if none.
      */
-    LinkedPRQ* getNext() const override {
+    Next getNext() const override {
         return next_.load(std::memory_order_acquire);
     }
 
-
-    /*
-     * DEPRECATED
-     *
+    /**
+     * @brief internal method to check if the queue is closed
      */
-    uint64_t getNextStartIndex() const override {
-        // uint64_t tail = bit::get63LSB(Base::tail_.load(std::memory_order_relaxed));
-        // return (tail > 0)? (tail - 1) : 0;
-        return 0;
+    static bool is_closed_(uint64_t val) noexcept {
+        return bit::get_msb(val) != uint64_t{0};
     }
 
-    static bool is_closed_(uint64_t val) {
-        return bit::getMSB64(val) != 0;
-    }
-
+    /**
+     * @brief closes the queue to further insertions (until open() is called)
+     */
     bool close() final override {
-        Base::tail_.fetch_or(bit::MSB64,std::memory_order_acq_rel);
+        Base::tail_.fetch_or(bit::set_msb(uint64_t{0}),std::memory_order_acq_rel);
         return true;
     }
 
+    /**
+     * @brief reopens a previously closed segment
+     *
+     * Checks if the closure bit is setted, if so it alignes the head and tail index
+     * via CAS and clears the next pointer.
+     *
+     * @warning it is supposed that this method gets called on a fully drained queue,
+     * undefined behaviour can occur if it's not the case.
+     */
     bool open() final override {
         uint64_t tail = Base::tail_.load(std::memory_order_relaxed);
-        if(is_closed_(tail)) {
+        if(bit::get_msb(tail) != 0) {
             uint64_t head = Base::head_.load(std::memory_order_relaxed);
-            next_.store(nullptr,std::memory_order_relaxed);
-            Base::tail_.compare_exchange_strong(tail,head,std::memory_order_acq_rel);
+            next_.store(nullptr,std::memory_order_relaxed); //this is guarded by the CAS
+            bool ok = Base::tail_.compare_exchange_strong(tail,head,std::memory_order_acq_rel);
+            assert(ok && "LinkedPRQ: failed open - not exclusive ownership");
         }
         return true;
     }
 
-    bool isClosed() const override {
+    /**
+     * @brief checks if the segment is closed to further insertions
+     */
+    bool isClosed() const final override {
         return is_closed_(Base::tail_);
     }
 
-    bool isOpened() const override {
+    /**
+     * @brief checks if the segment is open to further insertions
+     */
+    bool isOpened() const final override {
         return !isClosed();
     }
 
-    ALIGNED_CACHE std::atomic<LinkedPRQ*> next_{nullptr}; ///< Pointer to the next segment in the chain.
-    CACHE_PAD_TYPES(std::atomic<LinkedPRQ*>);
+    /// @brief enqueue with additional info
+    /// @param T item: item to be enqueued
+    /// @param bool info: if true check if the segment is closed before attempting the operation
+    ///
+    /// @note: this is necessary to prevent thrashing indexes that can lead to livelock of the segment
+    bool enqueue(T item, [[maybe_unused]] bool info = false) final override {
+        return info && isClosed()? false : Base::enqueue(item);
+    }
+
+    /// @brief dequeue with additional info
+    bool dequeue(T item, [[maybe_unused]] bool info = true) final override {
+        return Base::dequeue(item);
+    }
+
+
+    static_assert(detail::atomic_compatible_v<Next>,"LinkedPRQ Next field: not lock free");
+    static_assert(std::is_default_constructible_v<Next>,"LinkedPRQ Next field: not default constructible");
+    ALIGNED_CACHE std::atomic<Next> next_{}; ///< Pointer to the next segment in the chain.
+    CACHE_PAD_TYPES(std::atomic<Next>);
 };
+
+}   //namespace queue
