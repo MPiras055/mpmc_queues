@@ -212,6 +212,7 @@ protected:
 };
 
 
+namespace segment {
 /**
  * @brief Linked segment extension of CASLoopQueue.
  *
@@ -242,6 +243,9 @@ class LinkedCASLoop:
     using Next = std::conditional_t<std::is_void_v<NextT>,LinkedCASLoop<T,Proxy,Opt,NextT>*,NextT>;
     friend Base;    ///< Base class can access lifecycle methods
     friend Proxy;   ///< Proxy class can access private methods.
+
+    //proxies require segments to be on auto_close mode;
+    static_assert(!Opt::template has<CASLoopOption::DisableAutoClose>,"LinkedCASLoop: AutoClose disabled");
 
 public:
     /**
@@ -331,5 +335,7 @@ protected:
     ALIGNED_CACHE std::atomic<Next> next_{}; ///< Pointer to the next segment in the chain.
     CACHE_PAD_TYPES(std::atomic<Next>);
 };
+
+}   //namespace segment
 
 }   //namespace queue

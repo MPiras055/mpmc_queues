@@ -287,6 +287,9 @@ protected:  //Accessible to LinkedPRQ
     Cell* array_; ///< Underlying circular buffer storage.
 };
 
+
+
+namespace segment {
 /**
  * @brief Linked segment extension of PRQueue.
  *
@@ -314,6 +317,9 @@ class LinkedPRQ:
     using Next = std::conditional_t<std::is_void_v<NextT>,LinkedPRQ<T,Proxy,Opt,NextT>*,NextT>;
     friend Base;
     friend Proxy;   ///< Proxy class can access private methods.
+
+    //proxies require segments to be on auto_close mode;
+    static_assert(!Opt::template has<PRQOption::DisableAutoClose>,"LinkedPRQ: AutoClose disabled");
 
 public:
     /**
@@ -407,5 +413,7 @@ private:
     ALIGNED_CACHE std::atomic<Next> next_{}; ///< Pointer to the next segment in the chain.
     CACHE_PAD_TYPES(std::atomic<Next>);
 };
+
+}   //namespace segment
 
 }   //namespace queue

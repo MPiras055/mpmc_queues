@@ -62,7 +62,9 @@ private:
  * @tparam T Type of the stored value.
  */
 template <typename T>
-struct alignas(16) SequencedCell<T, false> {
+struct alignas(
+    sizeof(std::atomic<T>) + sizeof(std::atomic_uint64_t)
+) SequencedCell<T, false> {
     std::atomic<T>        val;  ///< Stored value.
     std::atomic<uint64_t> seq;  ///< Sequence index.
 };
