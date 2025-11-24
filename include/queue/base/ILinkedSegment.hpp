@@ -1,5 +1,4 @@
 #pragma once
-#include <cstdint>
 #include <type_traits>
 namespace base {
 
@@ -26,7 +25,13 @@ public:
     /// @return Pointer to the next segment, or `nullptr` if this is the last segment.
     virtual Derived* getNext() const = 0;
 
-    virtual uint64_t getNextStartIndex() const = 0;
+    // =============================
+    // Enqueue/Dequeue with checks
+    // =============================
+    virtual bool enqueue(T item, [[maybe_unused]] bool info) = 0;
+
+    virtual bool dequeue(T& out, [[maybe_unused]] bool info) = 0;
+
 
     // ==========================
     // Lifecycle Control

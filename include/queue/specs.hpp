@@ -3,17 +3,18 @@
 #include <type_traits>
 #include <utility>
 #include <cstddef>
+#include <atomic>
 
 #ifndef CACHE_LINE
-#define CACHE_LINE 64ul
+#define CACHE_LINE 128ul
 #endif
 
 // Use a namespace to avoid global pollution
-namespace cache_align {
+namespace align {
 
     // Get size from object or integral value
-    constexpr std::size_t get_size(auto&& arg) {
-        using T = std::remove_cvref_t<decltype(arg)>;
+    template<typename T>
+    constexpr std::size_t get_size(T&& arg) {
         if constexpr (std::is_integral_v<T>) {
             return static_cast<std::size_t>(arg);
         } else {
@@ -57,11 +58,30 @@ namespace cache_align {
 
 // Macro: Add padding using objects or sizes
 #define CACHE_PAD(...) \
-    char UNIQUE_NAME(_pad)[::cache_align::padding(__VA_ARGS__)]
+    char UNIQUE_NAME(_pad)[align::padding(__VA_ARGS__)]
 
 // Macro: Add padding using types
 #define CACHE_PAD_TYPES(...) \
-    char UNIQUE_NAME(_pad)[::cache_align::padding_for_types<__VA_ARGS__>()]
+    char UNIQUE_NAME(_pad)[align::padding_for_types<__VA_ARGS__>()]
 
 // Optional: shorthand for aligning a struct
 #define ALIGNED_CACHE alignas(CACHE_LINE)
+
+namespace detail {
+
+template <typename T, bool IsTC>
+struct is_lock_free_impl {
+    static constexpr bool value = false;
+};
+
+template <typename T>
+struct is_lock_free_impl<T, true> {
+    static constexpr bool value = std::atomic<T>::is_always_lock_free;
+};
+
+template <typename T>
+static constexpr bool atomic_compatible_v =
+    std::is_trivially_copyable_v<T> &&
+    is_lock_free_impl<T, std::is_trivially_copyable_v<T>>::value;
+
+} // namespace detail

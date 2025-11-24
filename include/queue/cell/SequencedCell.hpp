@@ -1,43 +1,70 @@
 #pragma once
-#include <atomic>
-#include <specs.hpp>
 
+#include <atomic>
+#include <cstddef>
+#include <specs.hpp>  // defines CACHE_LINE
+
+
+namespace cell {
 /**
  * @brief A sequenced cell storing a value and its sequence index.
  *
- * Used in lock-free ring buffers and similar data structures to
- * associate a stored value with a monotonically increasing sequence index.
+ * This struct is used in lock-free ring buffers and concurrent queues.
+ * Each cell stores:
+ *  - a value of type `T` (atomically accessed)
+ *  - a sequence counter used for turn-based synchronization
+ *
+ * Padding behavior is controlled by the template parameter `PadToCacheLine`.
+ *
+ * @tparam T                 Type of the stored value.
+ * @tparam PadToCacheLine    If true, the cell is cache-line-sized to avoid false sharing.
+ */
+template <typename T, bool PadToCacheLine>
+struct SequencedCell;
+
+// -----------------------------------------------------------------------------
+// Specialization: cache-line padded
+// -----------------------------------------------------------------------------
+
+/**
+ * @brief A cache-line padded sequenced cell.
+ *
+ * This specialization pads the structure to exactly one cache line, preventing
+ * false sharing when many producers or consumers update adjacent cells.
  *
  * @tparam T Type of the stored value.
  */
-template<typename T>
-struct SequencedCell;
-
-#ifndef NCELL_PAD
-
-/**
- * @brief Cache-line padded sequenced cell to avoid false sharing.
- *
- * Each instance is padded to exactly one cache line.
- */
-template<typename T>
-struct alignas(CACHE_LINE) SequencedCell {
+template <typename T>
+struct alignas(CACHE_LINE) SequencedCell<T, true> {
     std::atomic<T>        val;  ///< Stored value.
     std::atomic<uint64_t> seq;  ///< Sequence index.
-    char __pad[CACHE_LINE - (sizeof(std::atomic<T>) + sizeof(std::atomic<uint64_t>))];
+
+private:
+    // Compute required padding to fill one cache line.
+    static constexpr std::size_t kUsed =
+        sizeof(std::atomic<T>) + sizeof(std::atomic<uint64_t>);
+    static constexpr std::size_t kPad =
+        (kUsed < CACHE_LINE) ? (CACHE_LINE - kUsed) : 0;
+
+    char pad_[kPad];  ///< Padding to avoid false sharing.
 };
 
-#else
+// -----------------------------------------------------------------------------
+// Specialization: compact (no padding)
+// -----------------------------------------------------------------------------
 
 /**
- * @brief Compact sequenced cell with minimal alignment.
+ * @brief A compact sequenced cell with minimal alignment.
  *
- * Aligned to 16 bytes, without cache-line padding.
+ * This specialization avoids padding and minimizes memory usage. It should be
+ * used when false sharing is not a concern (e.g., single-producer/single-consumer).
+ *
+ * @tparam T Type of the stored value.
  */
-template<class T>
-struct alignas(16) SequencedCell {
+template <typename T>
+struct alignas(16) SequencedCell<T, false> {
     std::atomic<T>        val;  ///< Stored value.
     std::atomic<uint64_t> seq;  ///< Sequence index.
 };
 
-#endif
+}   //namespace cell

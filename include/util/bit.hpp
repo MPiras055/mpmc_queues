@@ -1,176 +1,173 @@
 #pragma once
-#include <cstdint>
+#include <cstddef>
 #include <type_traits>
+#include <limits>
 
 namespace bit {
 
-    // === Constants ===
+    // === Type Traits / Helpers ===
 
-    /// Most Significant Bit mask for 64-bit unsigned integer
-    static constexpr uint64_t MSB64 = 1ull << 63;
+    /** * Helper to ensure T is an unsigned integer.
+     * We use this in static_asserts for better error messages.
+     */
+    template <typename T>
+    static constexpr bool is_unsigned_int_v = std::is_integral_v<T> && std::is_unsigned_v<T>;
 
-    /// Mask to keep only the least significant 63 bits in a 64-bit unsigned integer
-    static constexpr uint64_t LSB63_MASK = ~MSB64;
-
-    /// Most Significant Bit mask for 32-bit unsigned integer
-    static constexpr uint32_t MSB32 = 1ul << 31;
-
-    /// Mask to keep only the least significant 31 bits in a 32-bit unsigned integer
-    static constexpr uint32_t LSB31_MASK = ~MSB32;
-
-    // === 64-bit Utilities ===
+    // === Constants (Templated) ===
 
     /**
-     * @brief Extracts the most significant bit from a 64-bit unsigned integer.
-     * @param value The 64-bit unsigned integer.
-     * @return The MSB only (0x8000000000000000 if set, 0 otherwise).
+     * @brief Returns the Most Significant Bit mask for type T.
+     * E.g., for uint8_t: 0x80, for uint64_t: 0x8000000000000000
      */
-    static inline uint64_t getMSB64(uint64_t value) noexcept {
-        return value & MSB64;
+    template <typename T>
+    static constexpr T msb_mask = T(1) << (std::numeric_limits<T>::digits - 1);
+
+    /**
+     * @brief Returns the mask for all bits except the Most Significant Bit.
+     */
+    template <typename T>
+    static constexpr T non_msb_mask = ~msb_mask<T>;
+
+    // === General Bit Utilities ===
+
+    /**
+     * @brief Extracts the most significant bit from an integer.
+     * @return The MSB only (e.g., 1000...000 if set, 0 otherwise).
+     */
+    template <typename T>
+    [[nodiscard]] static constexpr T get_msb(T value) noexcept {
+        static_assert(is_unsigned_int_v<T>, "T must be an unsigned integer");
+        return value & msb_mask<T>;
     }
 
     /**
-     * @brief Sets the most significant bit in a 64-bit unsigned integer.
-     * @param value The 64-bit unsigned integer.
-     * @return The value with the MSB set.
+     * @brief Sets the most significant bit in an integer.
      */
-    static inline uint64_t setMSB64(uint64_t value) noexcept {
-        return value | MSB64;
+    template <typename T>
+    [[nodiscard]] static constexpr T set_msb(T value) noexcept {
+        static_assert(is_unsigned_int_v<T>, "T must be an unsigned integer");
+        return value | msb_mask<T>;
     }
 
     /**
-     * @brief Clears the most significant bit in a 64-bit unsigned integer.
-     * @param value The 64-bit unsigned integer.
-     * @return The value with the MSB cleared.
+     * @brief Clears the most significant bit in an integer.
+     * Replaces clearMSB64/clearMSB32/get63LSB.
      */
-    static inline uint64_t clearMSB64(uint64_t value) noexcept {
-        return value & LSB63_MASK;
+    template <typename T>
+    [[nodiscard]] static constexpr T clear_msb(T value) noexcept {
+        static_assert(is_unsigned_int_v<T>, "T must be an unsigned integer");
+        return value & non_msb_mask<T>;
+    }
+
+    // === Conversion / Truncation Utilities ===
+
+    /**
+     * @brief Casts a larger integer down to a smaller integer (keeping lower bits).
+     * Usage: keep_low<uint32_t>(my_uint64);
+     */
+    template <typename OutT, typename InT>
+    [[nodiscard]] static constexpr OutT keep_low(InT value) noexcept {
+        static_assert(is_unsigned_int_v<InT> && is_unsigned_int_v<OutT>, "Types must be unsigned");
+        static_assert(sizeof(OutT) <= sizeof(InT), "Output type should be smaller or equal to Input type");
+        return static_cast<OutT>(value);
     }
 
     /**
-     * @brief Extracts the least significant 63 bits of a 64-bit unsigned integer.
-     * @param value The 64-bit unsigned integer.
-     * @return The value with the MSB cleared.
+     * @brief Keeps the upper bits of an integer by shifting and casting.
+     * Usage: keep_high<uint32_t>(my_uint64);
      */
-    static inline uint64_t get63LSB(uint64_t value) noexcept {
-        return value & LSB63_MASK;
-    }
+    template <typename OutT, typename InT>
+    [[nodiscard]] static constexpr OutT keep_high(InT value) noexcept {
+        static_assert(is_unsigned_int_v<InT> && is_unsigned_int_v<OutT>, "Types must be unsigned");
+        static_assert(sizeof(OutT) < sizeof(InT), "Output type must be smaller than Input type to be useful");
 
-    // === 32-bit Utilities ===
-
-    /**
-     * @brief Extracts the most significant bit from a 32-bit unsigned integer.
-     * @param value The 32-bit unsigned integer.
-     * @return The MSB only (0x80000000 if set, 0 otherwise).
-     */
-    static inline uint32_t getMSB32(uint32_t value) noexcept {
-        return value & MSB32;
-    }
-
-    /**
-     * @brief Sets the most significant bit in a 32-bit unsigned integer.
-     * @param value The 32-bit unsigned integer.
-     * @return The value with the MSB set.
-     */
-    static inline uint32_t setMSB32(uint32_t value) noexcept {
-        return value | MSB32;
-    }
-
-    /**
-     * @brief Clears the most significant bit in a 32-bit unsigned integer.
-     * @param value The 32-bit unsigned integer.
-     * @return The value with the MSB cleared.
-     */
-    static inline uint32_t clearMSB32(uint32_t value) noexcept {
-        return value & LSB31_MASK;
-    }
-
-    /**
-     * @brief Extracts the least significant 31 bits of a 32-bit unsigned integer.
-     * @param value The 32-bit unsigned integer.
-     * @return The value with the MSB cleared.
-     */
-    static inline uint32_t get31LSB(uint32_t value) noexcept {
-        return value & LSB31_MASK;
-    }
-
-    // === Conversion Utilities ===
-
-    /**
-     * @brief Keeps the lower 32 bits of a 64-bit unsigned integer.
-     * @param value The 64-bit unsigned integer.
-     * @return The least significant 32 bits as a 32-bit unsigned integer.
-     */
-    static inline uint32_t keep_low(uint64_t value) noexcept {
-        return static_cast<uint32_t>(value);
-    }
-
-    /**
-     * @brief Keeps the upper 32 bits of a 64-bit unsigned integer.
-     * @param value The 64-bit unsigned integer.
-     * @return The most significant 32 bits as a 32-bit unsigned integer.
-     */
-    static inline uint32_t keep_high(uint64_t value) noexcept {
-        return static_cast<uint32_t>(value >> 32);
+        // Calculate how many bits we need to shift based on the size difference
+        // or simply shift by the bit-width of the Output type if we assume strictly 2x split.
+        constexpr size_t shift_amount = sizeof(OutT) * 8;
+        return static_cast<OutT>(value >> shift_amount);
     }
 
     // === Merge & Split ===
 
     /**
-     * @brief Merges two 32-bit unsigned integers into a single 64-bit value.
-     * @param high The value to place in the upper 32 bits.
-     * @param low The value to place in the lower 32 bits.
-     * @return A 64-bit unsigned integer with 'high' in bits 32-63 and 'low' in bits 0-31.
+     * @brief Merges two smaller integers into a generic larger integer.
+     * @tparam OutT The resulting large type (e.g. uint64_t)
+     * @param high The value for the upper bits.
+     * @param low The value for the lower bits.
      */
-    static inline uint64_t merge(uint32_t high, uint32_t low) noexcept {
-        return (static_cast<uint64_t>(high) << 32) | static_cast<uint64_t>(low);
+    template <typename OutT, typename InT>
+    [[nodiscard]] static constexpr OutT merge(InT high, InT low) noexcept {
+        static_assert(is_unsigned_int_v<OutT> && is_unsigned_int_v<InT>, "Types must be unsigned");
+        static_assert(sizeof(OutT) >= sizeof(InT) * 2, "Output type must be at least 2x larger than Input type");
+
+        constexpr size_t shift = sizeof(InT) * 8;
+        return (static_cast<OutT>(high) << shift) | static_cast<OutT>(low);
     }
 
     /**
-     * @brief Splits a 64-bit unsigned integer in 2 32_bit signed integers
+     * @brief Splits a generic large integer into two smaller integers.
+     * @param value The large input value.
+     * @param high [out] The upper bits.
+     * @param low [out] The lower bits.
      */
-    static inline void split(uint64_t value, uint32_t& high, uint32_t& low) noexcept {
-        low     = static_cast<uint32_t>(value);
-        high    = value >> 32;
+    template <typename InT, typename OutT>
+    static constexpr void split(InT value, OutT& high, OutT& low) noexcept {
+        static_assert(is_unsigned_int_v<OutT> && is_unsigned_int_v<InT>, "Types must be unsigned");
+
+        low = static_cast<OutT>(value);
+
+        constexpr size_t shift = sizeof(OutT) * 8;
+        // Check to prevent shifting by width of type (UB) if InT == OutT
+        if constexpr (shift < std::numeric_limits<InT>::digits) {
+            high = static_cast<OutT>(value >> shift);
+        } else {
+            high = 0;
+        }
     }
 
-    template <typename T>
-    constexpr bool is_pow2(T n) {
-        static_assert(std::is_unsigned_v<T>, "T must be unsigned integral type");
-        return n != 0 && ( (n & (n - 1)) == 0 );
-    }
+    // === Power of 2 Utilities ===
 
     template <typename T>
-    constexpr T next_pow2(T n) {
-        static_assert(std::is_unsigned_v<T>, "T must be unsigned integral type");
+    [[nodiscard]] static constexpr bool is_pow2(T n) noexcept {
+        static_assert(is_unsigned_int_v<T>, "T must be unsigned integral type");
+        return n != 0 && ((n & (n - 1)) == 0);
+    }
+
+    /**
+     * @brief Computes the next power of 2 (e.g., 3 -> 4, 5 -> 8).
+     * Note: In C++20, consider using std::bit_ceil().
+     */
+    template <typename T>
+    [[nodiscard]] static constexpr T next_pow2(T n) noexcept {
+        static_assert(is_unsigned_int_v<T>, "T must be unsigned integral type");
 
         if (n == 0) return 1;
-
         if (is_pow2(n)) return n;
 
-        // Compute next power of 2
-        n--;
+        n--; // Decrement to handle exact powers of 2 correctly
 
-        // Number of bits in T
-        constexpr unsigned bits = sizeof(T) * 8;
+        // Unrolled loop logic generically for any type width
+        constexpr size_t digits = std::numeric_limits<T>::digits;
 
-        // The bit-shifts below should cover all bits of T,
-        // so we do a loop or unroll for powers of two <= bits
-        for (unsigned shift = 1; shift < bits; shift <<= 1) {
+        for (size_t shift = 1; shift < digits; shift <<= 1) {
             n |= n >> shift;
         }
 
-        n++;
-        return n;
+        return n + 1;
     }
 
+    /**
+     * @brief Integer base-2 logarithm (floor).
+     * Note: In C++20, consider using std::bit_width() - 1.
+     */
     template<typename T>
-    constexpr T log2(T n) {
-        static_assert(std::is_unsigned_v<T>,"T must be unsigned integral type");
+    [[nodiscard]] static constexpr T log2(T n) noexcept {
+        static_assert(is_unsigned_int_v<T>, "T must be unsigned integral type");
         T r = 0;
-        while (n >>= 1) ++r;
+        while (n >>= 1) {
+            ++r;
+        }
         return r;
     }
-
 
 } // namespace bit
