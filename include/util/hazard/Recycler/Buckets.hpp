@@ -7,6 +7,7 @@
 #include <cassert>
 #include <OptionsPack.hpp>
 #include <SequencedCell.hpp>
+#include <iostream>
 
 namespace util::hazard::recycler::details {
 
@@ -28,7 +29,7 @@ struct LimboBufferOpt {
 template<size_t Capacity, typename Opt = meta::EmptyOptions>
 class LimboBuffer {
 public:
-    static constexpr Value EMPTY_VAL = 0;
+    static constexpr Value EMPTY_VAL = Capacity;
     static constexpr bool AUTO_FIXSTATE = Opt::template has<LimboBufferOpt::Auto_FixState>;
 
     explicit LimboBuffer() {
@@ -122,9 +123,7 @@ public:
 
 private:
     inline void internal_reset_() {
-        if(tail_.load(std::memory_order_relaxed) != 0) {
-            tail_.store(0,std::memory_order_release);
-        }
+        tail_.store(0,std::memory_order_release);
         head_.store(0,std::memory_order_release);
     }
 

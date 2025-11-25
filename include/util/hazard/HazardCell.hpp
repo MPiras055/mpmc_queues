@@ -37,10 +37,10 @@ namespace util::hazard {
      */
     template<typename Data>
     struct ALIGNED_CACHE HazardCell<Data,void> {
-        inline Data& getData() {
+        inline Data& data() {
             return data_;
         }
-        inline const Data& getData() const {
+        inline const Data& data() const {
             return data_;
         }
 

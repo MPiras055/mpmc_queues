@@ -75,7 +75,7 @@ private:
     using Bucket         = details::LimboBuffer<Capacity,
         std::conditional_t<
             AUTOFIX_LIMBO,
-            details::LimboBufferOpt::Auto_FixState,
+            meta::OptionsPack<details::LimboBufferOpt::Auto_FixState>,
             meta::EmptyOptions
         >>;
 
@@ -86,7 +86,7 @@ private:
                            ::template add_if<POW2, details::CacheOpt::Pow2Size>;
     using RealCache      = details::Cache<Capacity, CacheOpt>;
 
-    struct DisabledCache { explicit DisabledCache(size_t) {} };
+    struct DisabledCache {};
     using CacheMember    = std::conditional_t<NO_CACHE, DisabledCache, RealCache>;
 
 public:
@@ -206,7 +206,40 @@ public:
             assert(false && "Recycler: metadataInit called on void Metadata");
             std::abort();
         }
+    }
 
+    /**
+     * @brief registers the caller
+     *
+     * @returns: true if the thread was registered for recycler operations
+     * false otherwise (the recycler is full at this time)
+     *
+     * @note: this explicit call may not be necessary only in the case where the
+     * number of threads accessing the recycler **WILL NEVER REACH** the Recycler
+     * init maxThread cap
+     *
+     * @warning: this method must be called in order to correctly use the recycler,
+     * if any other method detects that no slots are free then the program will be
+     * aborted
+     */
+    [[nodiscard]] bool register_thread() noexcept {
+        uint64_t t;
+        return ticketing_.acquire(t);
+    }
+
+    /**
+     * @brief unregisters the caller freeing a slot for any other thread
+     *
+     * @note: this method is idempotent, if the caller didn't previously acquired
+     * any ticket then there are not side effects
+     * @note: if the caller possessed a slot then its EpochCell gets cleared out
+     */
+    void unregister_thread() {
+        uint64_t t;
+        if(ticketing_.acquire(t)) {
+            threadRecord_[t].data().clear();
+        }
+        ticketing_.release();
     }
 
     // =========================================================================
@@ -326,36 +359,42 @@ public:
     /**
      * @brief Retires an index, scheduling it for reclamation.
      *
-     * The index is added to the bucket corresponding to the epoch the *thread*
-     * is currently protecting. This ensures that even if the global epoch advances,
-     * the item is placed in a bucket consistent with the thread's view.
+     * If the caller is protecting an epoch, the index is added to the Current Bucket for
+     * the protected epoch. In the other case the index is added to the Current Bucket for
+     * the
      *
-     * @note: since the thread is protecting an epoch, either this is stale (at most by one)
+     * @note: if the caller is protecting an epoch, either this is stale (at most by one)
      * by definition of epoch advancement or it's synchronized with the global epoch.
      * Using the thread local epoch to determine where to put the item permits only one
      * epoch advancement for reclaim (in the best case)
      *
-     * @warning The calling thread **MUST** be protecting an epoch (via `protect_epoch`)
-     * before calling this method.
-     *
      * @param idx The index to retire.
      */
-    void retire(Index idx) {
-        uint64_t ticket = get_ticket();
-        bool active;
-        uint64_t protected_epoch;
+     void retire(Index idx) {
+         uint64_t ticket = get_ticket();
+         bool was_active;
+         uint64_t current_epoch;
+         EpochCell& c = threadRecord_[ticket].data();
 
-        // Snapshot the thread's current state
-        threadRecord_[ticket].data().snapshot(active, protected_epoch);
+         // 1. Check if we are already protecting an epoch
+         c.snapshot(was_active, current_epoch);
 
-        // Assert contract: Thread MUST be protecting an epoch to retire safely
-        assert(active && "Recycler: retire called without epoch protection");
+         if (!was_active) {
+             // 2. If not, we must temporarily protect the global epoch
+             // to ensure the bucket we pick doesn't vanish under us.
+             current_epoch = epoch_.load(std::memory_order_acquire);
+             c.protect(current_epoch);
+         }
 
-        // Enqueue into the bucket associated with the epoch the thread is actually seeing
-        // (This handles cases where the thread is lagging behind the global epoch)
-        Bucket& target = get_bucket(protected_epoch, BucketState::Current);
-        target.enqueue(idx);
-    }
+         // 3. Queue to the bucket of the epoch we are holding
+         Bucket& target = get_bucket(current_epoch, BucketState::Current);
+         target.enqueue(idx);
+
+         // 4. CLEANUP: Only clear if WE started the protection
+         if (!was_active) {
+             c.clear();
+         }
+     }
 
     /**
      * @brief Attempts to reclaim a free index for reuse.
@@ -373,10 +412,9 @@ public:
      */
     bool reclaim(Index& out_idx) {
         uint64_t ticket = get_ticket();
-        int attempts = 0;
         constexpr int MAX_ATTEMPTS = 2;
 
-        while (attempts < MAX_ATTEMPTS) {
+        for(size_t i = 0; i < MAX_ATTEMPTS; i++) {
             uint64_t e = epoch_.load(std::memory_order_acquire);
             Bucket& free_b = get_bucket(e, BucketState::Free);
 
@@ -393,16 +431,14 @@ public:
 
             // 2. Free bucket empty? Try to advance epoch.
             if (try_advance_epoch(e, ticket)) {
-                // Success: Buckets rotated. Reset attempts to check the NEW free bucket.
-                attempts = 0;
+                continue;
+            } else if(epoch_.load(std::memory_order_acquire) == e) {
+                return false; //epoch cannot be advanced;
             } else {
-                // Failure: Check if someone else advanced it
-                if (epoch_.load(std::memory_order_relaxed) != e) {
-                    attempts = 0; // Epoch changed, retry immediately
-                } else {
-                    attempts++;
-                }
+                //someone else advanced the epoch
+                i = 0; //reset attempts
             }
+
         }
         return false;
     }
@@ -415,11 +451,17 @@ private:
     /**
      * @brief Gets the thread ticket, acquiring one via DynamicThreadTicket if necessary.
      * @return The thread's unique ticket ID.
+     *
+     * @warning: aborts the caller if no ticket was cached and no ticket could have
+     * been acquired
      */
     uint64_t get_ticket() {
         uint64_t t;
         bool ok = ticketing_.acquire(t);
         assert(ok && "Recycler: Thread limit reached");
+        if(!ok) {
+            std::abort();
+        }
         return t;
     }
 

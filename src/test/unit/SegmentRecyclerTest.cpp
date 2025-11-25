@@ -2,23 +2,29 @@
 #include <thread>
 #include <vector>
 #include <atomic>
+#include <algorithm>
+#include <barrier>
+#include <atomic>
+#include <OptionsPack.hpp>
 
 // Include your SegmentRecycler header
 #include "Recycler.hpp"
 
-using namespace util::hazard;
-
 // ---------------- MockSegment ----------------
+// Minimal segment to test open/close/reset behavior via the Recycler
 template <typename T, typename Recycler>
 struct MockSegment {
     friend Recycler;
     std::atomic<bool> opened{true};
 
+    // Recycler often calls open() when retrieving from cache
     bool open() {
         opened.store(true);
         return true;
     }
 
+    // Recycler doesn't strictly call close(), but the proxy does.
+    // We track state for assertions.
     bool close() {
         opened.store(false);
         return true;
@@ -27,7 +33,7 @@ struct MockSegment {
     bool isOpen() const { return opened.load(); }
     bool isClosed() const { return !isOpen(); }
 
-    size_t size() const { return 0; } // always empty for testing
+    size_t size() const { return 0; }
 };
 
 // ---------------- Test Fixture ----------------
@@ -35,124 +41,316 @@ class SegmentRecyclerTest : public ::testing::Test {
 protected:
     static constexpr size_t SEGMENTS = 4;
     static constexpr size_t CAPACITY = 8;
-    static constexpr size_t THREADS  = 8;
-    using Segment = MockSegment<int*,void>;
-    using TestRecycler = Recycler<Segment>;
-    TestRecycler recycler{SEGMENTS, THREADS, CAPACITY};
+    static constexpr size_t THREADS  = 4;
+
+    using Segment = MockSegment<int*, void>;
 };
 
 // ---------------- Tests ----------------
 
-// API Correctness
+// 1. Test Basic Cache Interaction
 TEST_F(SegmentRecyclerTest, BasicCachePutGet) {
-    TestRecycler::Tml index;
+    static constexpr size_t CAPACITY    = 100;
+    static constexpr size_t threads     = 1;
+    using Rec = util::hazard::recycler::Recycler<Segment,CAPACITY>;
+    using Index = Rec::Index;
+    std::vector<Index> indexes;
+    indexes.reserve(CAPACITY);
 
-    // Get from cache
-    ASSERT_TRUE(recycler.get_cache(index));
-    Segment* seg = recycler.decode(index);
-    ASSERT_NE(seg, nullptr);
-    EXPECT_TRUE(seg->isOpen());
+    Rec r(threads); //initialize the recycler
 
-    // Close & recycle into cache
-    ASSERT_TRUE(seg->close());
-    seg->open();
-    ASSERT_TRUE(recycler.put_cache(index));
+    Index idx;
 
-    // Get again from cache
-    ASSERT_TRUE(recycler.get_cache(index));
+    //drain the recyclers cache
+    for(size_t i = 0; i < CAPACITY; i++) {
+        EXPECT_TRUE(r.get_cache(idx));
+        indexes.emplace_back(idx);
+    }
+
+    EXPECT_FALSE(r.get_cache(idx));
+
+    //sort indexes and see if they map to an interval
+    std::sort(indexes.begin(),indexes.end());
+    for(size_t i = 1; i < CAPACITY; i++) {
+        EXPECT_EQ(indexes[i-1] + 1, indexes[i]);
+    }
+
+    //check if indexes map to valid segment pointers
+    for(size_t i = 0; i < CAPACITY; i++) {
+        Segment* seg = r.decode(indexes[i]);
+        EXPECT_TRUE(seg->isOpen());
+    }
+
+    //put back indexes to cache
+    while(!indexes.empty()) {
+        r.put_cache(indexes.back());
+        indexes.pop_back();
+    }
+
+    //drain the recycler cache again
+    for(size_t i = 0; i < CAPACITY; i++) {
+        EXPECT_TRUE(r.get_cache(idx));
+        indexes.emplace_back(idx);
+    }
+
+    EXPECT_FALSE(r.get_cache(idx));
 }
 
-//Test if the cache contains all indexes
-TEST_F(SegmentRecyclerTest, CacheIsConsistent) {
-    std::vector<TestRecycler::Tml> tracked;
-    std::vector<Segment*> segments;
-    TestRecycler::Tml current;
-    for(size_t i = 0; i < SEGMENTS; i++) {
-        ASSERT_TRUE(recycler.get_cache(current));
-        tracked.push_back(current);
-        segments.push_back(recycler.decode(current));
+// 2. Test Basic Reclaim and Retire Interaction
+TEST_F(SegmentRecyclerTest, BasicRetireReclaim) {
+    static constexpr size_t CAPACITY    = 100;
+    static constexpr size_t threads     = 1;
+    using Opt = util::hazard::recycler::RecyclerOpt;
+    using Rec = util::hazard::recycler::Recycler<Segment,CAPACITY,meta::OptionsPack<Opt::Disable_Cache>>;
+    using Index = Rec::Index;
+    std::vector<Index> indexes;
+
+    indexes.reserve(CAPACITY);
+    Rec r(threads);
+    Index idx;
+
+    /// No need to register_thread() since
+    /// the number of threads used in the
+    /// recycler never exceeds the max
+    /// initialization cap
+    ///
+    /// @note: remember using register_thread() if
+    /// unsure if the threads using the recycler could
+    /// exceed the init bound
+    // r.register_thread();
+
+    //drain the recyclers free bucket
+    for(size_t i = 0; i < CAPACITY; i++) {
+        EXPECT_TRUE(r.reclaim(idx));
+        indexes.emplace_back(idx);
     }
 
-    //Cache should be empty
-    ASSERT_FALSE(recycler.get_cache(current));
+    EXPECT_FALSE(r.reclaim(idx));
 
-    //sort and check if no missing spots
-    std::sort(tracked.begin(),tracked.end());
-    for(size_t i = 1; i < tracked.size(); i++) {
-        ASSERT_EQ(tracked[i-1] + 1, tracked[i]);    //no missing spots
+    //sort indexes and see if they map to an interval
+    std::sort(indexes.begin(),indexes.end());
+    for(size_t i = 1; i < CAPACITY; i++) {
+        EXPECT_EQ(indexes[i-1] + 1, indexes[i]);
     }
 
-    //check if all indexes map to consistent segments
-    for(auto& seg : segments) {
-        ASSERT_TRUE(seg->isOpen());
+    //check if indexes map to valid segment pointers
+    for(size_t i = 0; i < CAPACITY; i++) {
+        Segment* seg = r.decode(indexes[i]);
+        EXPECT_TRUE(seg->isOpen());
     }
 
+    //protect epoch in order to retire all segments
+    r.protect_epoch();
+
+    //put back indexes to cache
+    while(!indexes.empty()) {
+        r.retire(indexes.back());
+        indexes.pop_back();
+    }
+
+    //while epoch is protected we cannot reclaim
+    EXPECT_FALSE(r.reclaim(idx));
+
+    r.clear_epoch();
+
+    //drain the recycler cache again
+    for(size_t i = 0; i < CAPACITY; i++) {
+        EXPECT_TRUE(r.reclaim(idx));
+        indexes.emplace_back(idx);
+    }
+
+    //Free pool is empty again
+    EXPECT_FALSE(r.reclaim(idx));
 }
 
-TEST_F(SegmentRecyclerTest, ReclaimSingle) {
-    TestRecycler::Tml idx;
-    TestRecycler::Tml idx_cmp;
-    ASSERT_TRUE(recycler.get_cache(idx));
-    recycler.protect_epoch(0);
-    recycler.retire(idx,0,true);    //automatically drops protection
-    ASSERT_TRUE(recycler.reclaim(idx_cmp,0));
-    ASSERT_EQ(idx,idx_cmp);
-}
+TEST_F(SegmentRecyclerTest, ThreadRegistrationCap) {
+    static constexpr size_t CAPACITY    = 1;
+    static constexpr size_t threads     = 1;
+    using Opt = util::hazard::recycler::RecyclerOpt;
+    using Rec = util::hazard::recycler::Recycler<Segment,CAPACITY,meta::OptionsPack<Opt::Disable_Cache>>;
 
-TEST_F(SegmentRecyclerTest, ReclaimAll) {
-    std::vector<TestRecycler::Tml> tracked;
-    TestRecycler::Tml idx;
-    for(size_t i = 0; i < SEGMENTS; i++) {
-        ASSERT_TRUE(recycler.get_cache(idx));
-        tracked.push_back(idx);
-    }
-    ASSERT_FALSE(recycler.get_cache(idx));
-    ASSERT_FALSE(recycler.reclaim(idx,0));  //quarantine empty
-    recycler.protect_epoch(0);
-    for(auto& tml : tracked) {
-        recycler.retire(idx,0,false);   //don't drop protection
-    }
-    recycler.clear_epoch(0);    //drop protection here
-    for(size_t i = 0; i < tracked.size(); i++) {
-        ASSERT_TRUE(recycler.reclaim(idx,0));
-    }
-    ASSERT_FALSE(recycler.reclaim(idx,0));  //quarantine empty
+    size_t actual_threads = 2;
 
-}
+    Rec r(threads);
+    std::vector<std::thread> th;
 
-// ---------------- Concurrency ----------------
-TEST_F(SegmentRecyclerTest, ConcurrentGetRecycle) {
-    constexpr size_t OPS = 100000;
-    std::vector<std::thread> workers;
+    std::barrier threadsBarrier(actual_threads);
 
-    for (size_t t = 0; t < THREADS; ++t) {
-        workers.emplace_back([&, t]() {
-            TestRecycler::Tml index;
-            Segment* seg;
-            for (size_t i = 0; i < OPS; i++) {
-                if(recycler.get_cache(index) || recycler.reclaim(index,t))
-                    seg = recycler.decode(index);
-                else {
-                    i--;
-                    continue;
-                }
-
-                // //don't use every few iteration
-                if((i % 37) == 0) {
-                    ASSERT_TRUE(recycler.put_cache(index));
-                    continue;
-                }
-                //simulate usage
-                recycler.protect_epoch(t);
-                if(!seg->isOpen())
-                    seg->open();
-                for(size_t i = 0; i < 4; i++) {
-                    std::this_thread::yield();
-                }
-                recycler.retire(index,t,true);  //drop protection
+    //spawn 2 threads and make them fight for the tickets
+    for(size_t i = 0; i < actual_threads; i++) {
+        th.emplace_back([&]() {
+            bool res = r.register_thread();
+            if(res) {
+                threadsBarrier.arrive_and_wait();
+                r.unregister_thread();
+                threadsBarrier.arrive_and_wait();
+                threadsBarrier.arrive_and_wait();
+            } else {
+                //try to register but ticket is occupied
+                EXPECT_FALSE(r.register_thread());
+                //unlock other thread
+                threadsBarrier.arrive_and_wait();
+                //wait for ticket to be released
+                threadsBarrier.arrive_and_wait();
+                EXPECT_TRUE(r.register_thread());
+                threadsBarrier.arrive_and_wait();
+                r.unregister_thread();
             }
         });
     }
 
-    for (auto& w : workers) w.join();
+    for(auto& t : th) t.join();
+    EXPECT_TRUE(r.register_thread());
+    r.unregister_thread();
+}
+
+TEST_F(SegmentRecyclerTest,MetadataUtils) {
+    static constexpr size_t CAPACITY    = 1;
+    static constexpr size_t threads     = 10;
+    using Opt   = meta::EmptyOptions;
+    using Meta  = std::atomic<unsigned int>;
+
+    using Rec = util::hazard::recycler::Recycler<Segment,CAPACITY,Opt,Meta>;
+
+    Rec r(threads);
+    std::vector<std::thread> th;
+    std::barrier b(threads + 1);  //barrier for threads and main
+
+    static constexpr unsigned int SET_VAL   = 1;
+    static constexpr unsigned int RESET_VAL = 2;
+    for(size_t i = 1; i <= threads; i++) {
+        th.emplace_back([&,i](){
+            EXPECT_TRUE(r.register_thread());
+            //wait for main to set the data
+            b.arrive_and_wait();
+            Meta& m = r.getMetadata();
+            EXPECT_EQ(m.load(std::memory_order_acquire),SET_VAL);
+            m.store(i); //store the thread id
+            b.arrive_and_wait();
+            //wait for main to validate and reset the data
+            b.arrive_and_wait();
+            Meta& m1 = r.getMetadata();
+            EXPECT_EQ(m.load(std::memory_order_acquire),RESET_VAL);
+        });
+    }
+
+    //set threads metadata
+    const auto init = [](Meta& meta) {
+        meta.store(SET_VAL,std::memory_order_release);
+    };
+    r.metadataInit(init);
+    b.arrive_and_wait();
+    //wait for thread to set their metadata
+    b.arrive_and_wait();
+    unsigned int sum = 0;
+    const auto validate = [&sum](const Meta& meta) {
+        sum += meta.load(std::memory_order_acquire);
+    };
+    r.metadataIter(validate);
+    //check the sum
+    EXPECT_EQ(sum,((threads + 1)*(threads))/2);
+    const auto reset = [](Meta& meta) {
+        meta.store(RESET_VAL,std::memory_order_release);
+    };
+    r.metadataInit(reset);
+    b.arrive_and_wait();
+    for(auto& t : th) t.join();
+}
+
+TEST_F(SegmentRecyclerTest, EpochProtectionBlocksReclaim) {
+    static constexpr size_t CAPACITY      = 13;
+    static constexpr size_t WORKERS       = 3;
+    static constexpr size_t PROTECTORS    = 1;
+    static constexpr size_t TOTAL_THREADS = WORKERS + PROTECTORS;
+    static constexpr size_t GAUSS_SUM     = (CAPACITY * (CAPACITY - 1)) / 2; // Sum of 0..N-1
+
+    using Opt = util::hazard::recycler::RecyclerOpt;
+    using Rec = util::hazard::recycler::Recycler<Segment, CAPACITY, meta::OptionsPack<Opt::Disable_Cache,Opt::AutoFixLimbo>>;
+    using Index = Rec::Index;
+    Rec r(TOTAL_THREADS);
+    // Increased barriers to strictly order the "Check Fail" and "Clear Epoch" phases
+    std::barrier sync_point(TOTAL_THREADS);
+
+    std::vector<std::thread> threads;
+    std::atomic<size_t> reclaimed_count_initial{0};
+    std::atomic<size_t> reclaimed_sum_initial{0};
+    std::atomic<size_t> reclaimed_count_final{0};
+    std::atomic<size_t> reclaimed_sum_final{0};
+
+    auto worker_task = [&](int id) {
+        EXPECT_TRUE(r.register_thread());
+        sync_point.arrive_and_wait(); // Sync 1: Start
+
+
+        // 1. Initial Drain
+        std::vector<Index> held_segments;
+        Index idx;
+        while(r.reclaim(idx)) {
+            held_segments.push_back(idx);
+            reclaimed_count_initial.fetch_add(1);
+            reclaimed_sum_initial.fetch_add(idx);
+        }
+
+        sync_point.arrive_and_wait(); // Sync 2: Drain Complete
+
+        // 2. Retire (Protector is protecting now)
+        for(auto i : held_segments) r.retire(i);
+        held_segments.clear();
+
+        sync_point.arrive_and_wait(); // Sync 3: Retire Complete
+
+        // 3. Failed Reclaim (Epoch IS protected)
+        // Race fix: We check BEFORE signaling we are done
+        puts("FALSE RECLAIMING");
+        EXPECT_FALSE(r.reclaim(idx));
+        puts("FALSE RECLAIM DONE");
+
+        sync_point.arrive_and_wait(); // Sync 4: Checks Complete (Signal to protector)
+
+        sync_point.arrive_and_wait(); // Sync 5: Epoch Cleared (Wait for protector)
+
+        // 4. Final Reclaim (Epoch released)
+        while(r.reclaim(idx)) {
+            held_segments.push_back(idx);
+            reclaimed_count_final.fetch_add(1);
+            reclaimed_sum_final.fetch_add(idx);
+        }
+
+        for(auto i : held_segments) r.retire(i);
+        r.unregister_thread();
+        puts("WORKERS OUT");
+    };
+
+    auto protector_task = [&]() {
+        EXPECT_TRUE(r.register_thread());
+        sync_point.arrive_and_wait(); // Sync 1: Start
+
+        sync_point.arrive_and_wait(); // Sync 2: Wait for workers to Drain
+
+        r.protect_epoch(); // Block reclamation NOW
+
+        sync_point.arrive_and_wait(); // Sync 3: Wait for workers to Retire
+
+        // Workers are checking EXPECT_FALSE now...
+        sync_point.arrive_and_wait(); // Sync 4: Wait for workers to finish checks
+
+        r.clear_epoch();   // Release SAFE: Workers are done checking
+
+        sync_point.arrive_and_wait(); // Sync 5: Signal release
+
+        r.unregister_thread();
+    };
+
+    for(size_t i = 0; i < WORKERS; ++i) threads.emplace_back(worker_task, i);
+    threads.emplace_back(protector_task);
+
+    for(auto& t : threads) if(t.joinable()) t.join();
+
+    // Validate Counts
+    EXPECT_EQ(reclaimed_count_initial.load(), CAPACITY);
+    EXPECT_EQ(reclaimed_count_final.load(), CAPACITY);
+
+    // Validate Sums (Check for data integrity using Gauss Sum)
+    EXPECT_EQ(reclaimed_sum_initial.load(), GAUSS_SUM);
+    EXPECT_EQ(reclaimed_sum_final.load(), GAUSS_SUM);
 }
