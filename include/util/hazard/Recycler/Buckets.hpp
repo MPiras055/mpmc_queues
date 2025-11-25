@@ -83,6 +83,7 @@ public:
             // This isn't strictly sequentially consistent but safe in Phased MPMC
             // because no one is validly using indices >= limit.
             // We use store (not CAS) because if we are >= limit, we just want to stop here.
+
             if constexpr (AUTO_FIXSTATE) {
                 internal_reset_();
             }
@@ -105,7 +106,7 @@ public:
     }
 
     inline void reset() {
-        if constexpr (AUTO_FIXSTATE) {
+        if constexpr (!AUTO_FIXSTATE) {
             internal_reset_();
         }
     }
@@ -121,7 +122,9 @@ public:
 
 private:
     inline void internal_reset_() {
-        tail_.store(0,std::memory_order_release);
+        if(tail_.load(std::memory_order_relaxed) != 0) {
+            tail_.store(0,std::memory_order_release);
+        }
         head_.store(0,std::memory_order_release);
     }
 
