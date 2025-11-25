@@ -3,7 +3,7 @@
 #include <type_traits>
 #include <cstdlib>
 
-namespace util::hazard::recycler {
+namespace util::hazard::recycler::details {
 
 /**
  * @brief A high-performance, immutable lookup table that owns a contiguous block of memory.

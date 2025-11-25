@@ -3,7 +3,7 @@
 #include <cassert>
 #include <bit.hpp>  //bit manipulation utils
 
-namespace util::hazard::recycler {
+namespace util::hazard::recycler::details {
 
 /**
  * @brief A cell that stores an "active" epoch number with a single-writer assumption.

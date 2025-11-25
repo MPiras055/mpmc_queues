@@ -170,4 +170,15 @@ namespace bit {
         return r;
     }
 
+    // C++17 compatible bit_width calculation (replaces std::bit_width from C++20)
+    constexpr size_t bit_width(size_t n) {
+        if (n == 0) return 0;
+        size_t bits = 0;
+        while (n > 0) {
+            n >>= 1;
+            bits++;
+        }
+        return bits;
+    }
+
 } // namespace bit
