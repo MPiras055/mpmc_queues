@@ -105,7 +105,8 @@ public:
      * @brief Constructs the Recycler.
      *
      * Initializes the lookup table, cache, and buckets.
-     * Pre-fills the initial 'Free' bucket (Index 2 at Epoch 0) so allocation can start immediately.
+     * If cache is disable, pre-fills the initial 'Free' bucket so reclaim can happen immediately
+     * else pre-fills the cache
      *
      * @param maxThreads The maximum number of concurrent threads supported.
      * @param args       Arguments forwarded to the constructor of the objects in the lookup table.
@@ -116,13 +117,20 @@ public:
         threadRecord_{new ThreadCell[maxThreads]},
         ticketing_{maxThreads},
         lookup_{Capacity, std::forward<Args>(args)...},
-        cache_{Capacity},
+        cache_(),
         buckets_{new Bucket[4]}
     {
         // Initialize: Fill the 'initial' Free bucket (index 2 for epoch 0)
-        Bucket& initialFree = buckets_[2];
-        for(size_t i = 0; i < Capacity; ++i) {
-            initialFree.enqueue(Index{i});
+        if constexpr (NO_CACHE) {
+            Bucket& initialFree = buckets_[2];
+            for(size_t i = 0; i < Capacity; ++i) {
+                initialFree.enqueue(Index{i});
+            }
+        } else {
+            RealCache& initialFree = static_cast<RealCache&>(cache_);
+            for(size_t i = 0; i < Capacity; ++i) {
+                initialFree.enqueue(Index{i});
+            }
         }
     }
 
@@ -161,6 +169,9 @@ public:
      *
      * @tparam Func Type of the callback function.
      * @param f A callable accepting `const Meta&`.
+     *
+     * @warning: if Metadata is not set (Metatada = void) then this method will abort the
+     * program
      */
     template<typename Func>
     void metadataIter(Func&& f) const {
@@ -170,6 +181,7 @@ public:
             }
         } else {
             assert(false && "Recycler: metadataIter called on void Metadata");
+            std::abort();
         }
     }
 
@@ -180,6 +192,9 @@ public:
      *
      * @tparam Func Type of the callback function.
      * @param f A callable accepting `Meta&`.
+     *
+     * @warning: if Metadata is not set (Metatada = void) then this method will abort the
+     * program
      */
     template<typename Func>
     void metadataInit(Func&& f) {
@@ -189,7 +204,9 @@ public:
             }
         } else {
             assert(false && "Recycler: metadataInit called on void Metadata");
+            std::abort();
         }
+
     }
 
     // =========================================================================
@@ -313,6 +330,11 @@ public:
      * is currently protecting. This ensures that even if the global epoch advances,
      * the item is placed in a bucket consistent with the thread's view.
      *
+     * @note: since the thread is protecting an epoch, either this is stale (at most by one)
+     * by definition of epoch advancement or it's synchronized with the global epoch.
+     * Using the thread local epoch to determine where to put the item permits only one
+     * epoch advancement for reclaim (in the best case)
+     *
      * @warning The calling thread **MUST** be protecting an epoch (via `protect_epoch`)
      * before calling this method.
      *
@@ -342,6 +364,9 @@ public:
      * 1. Dequeue from the current `Free` bucket (Epoch E-2).
      * 2. If empty, attempt to advance the global epoch.
      * 3. If advanced (by self or others), retry dequeue from the new `Free` bucket.
+     *
+     * @note: this is a best-effort attempt, each thread will try to reclaim in the range
+     * [e,e+2], where e is the global epoch at the time of the call.
      *
      * @param[out] out_idx The reclaimed index.
      * @return true if an index was successfully reclaimed, false if the system is exhausted.
@@ -412,8 +437,8 @@ private:
     /**
      * @brief Tries to advance the global epoch from `expected_epoch` to `expected_epoch + 1`.
      *
-     * Checks if any thread is "stuck" on `expected_epoch - 1` (the Grace epoch).
-     * If any active thread holds the Grace epoch, advancement is unsafe.
+     * Checks if any active thread is "stuck" on `expected_epoch - 1` (the Grace epoch).
+     * Epoch advancement is safe only if each active thread is synched with the global epoch
      *
      * @param expected_epoch The current global epoch value we expect.
      * @param my_ticket      The caller's ticket (used for optimizations internally).
