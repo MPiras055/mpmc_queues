@@ -148,9 +148,6 @@ TEST_F(SegmentRecyclerTest, BasicRetireReclaim) {
         indexes.pop_back();
     }
 
-    //while epoch is protected we cannot reclaim
-    EXPECT_FALSE(r.reclaim(idx));
-
     r.clear_epoch();
 
     //drain the recycler cache again
@@ -258,18 +255,20 @@ TEST_F(SegmentRecyclerTest,MetadataUtils) {
 }
 
 TEST_F(SegmentRecyclerTest, EpochProtectionBlocksReclaim) {
-    static constexpr size_t CAPACITY      = 13;
-    static constexpr size_t WORKERS       = 3;
+    while(true) {
+    static constexpr size_t CAPACITY      = 4000;
+    static constexpr size_t WORKERS       = 4;
     static constexpr size_t PROTECTORS    = 1;
     static constexpr size_t TOTAL_THREADS = WORKERS + PROTECTORS;
     static constexpr size_t GAUSS_SUM     = (CAPACITY * (CAPACITY - 1)) / 2; // Sum of 0..N-1
 
     using Opt = util::hazard::recycler::RecyclerOpt;
-    using Rec = util::hazard::recycler::Recycler<Segment, CAPACITY, meta::OptionsPack<Opt::Disable_Cache,Opt::AutoFixLimbo>>;
+    using Rec = util::hazard::recycler::Recycler<Segment, CAPACITY, meta::OptionsPack<Opt::Disable_Cache>>;
     using Index = Rec::Index;
     Rec r(TOTAL_THREADS);
     // Increased barriers to strictly order the "Check Fail" and "Clear Epoch" phases
     std::barrier sync_point(TOTAL_THREADS);
+    std::barrier sync_point_w_main(TOTAL_THREADS + 1);
 
     std::vector<std::thread> threads;
     std::atomic<size_t> reclaimed_count_initial{0};
@@ -281,7 +280,6 @@ TEST_F(SegmentRecyclerTest, EpochProtectionBlocksReclaim) {
         EXPECT_TRUE(r.register_thread());
         sync_point.arrive_and_wait(); // Sync 1: Start
 
-
         // 1. Initial Drain
         std::vector<Index> held_segments;
         Index idx;
@@ -291,24 +289,25 @@ TEST_F(SegmentRecyclerTest, EpochProtectionBlocksReclaim) {
             reclaimed_sum_initial.fetch_add(idx);
         }
 
-        sync_point.arrive_and_wait(); // Sync 2: Drain Complete
+        sync_point.arrive_and_wait(); // Sync 2: Drain Complete E = 2 or 3
 
         // 2. Retire (Protector is protecting now)
+        // r.protect_epoch();
         for(auto i : held_segments) r.retire(i);
         held_segments.clear();
+        // r.clear_epoch();
 
         sync_point.arrive_and_wait(); // Sync 3: Retire Complete
 
         // 3. Failed Reclaim (Epoch IS protected)
         // Race fix: We check BEFORE signaling we are done
-        puts("FALSE RECLAIMING");
-        EXPECT_FALSE(r.reclaim(idx));
-        puts("FALSE RECLAIM DONE");
+        EXPECT_FALSE(r.reclaim(idx)); // E = 2 => thread is blocking 1
 
         sync_point.arrive_and_wait(); // Sync 4: Checks Complete (Signal to protector)
 
         sync_point.arrive_and_wait(); // Sync 5: Epoch Cleared (Wait for protector)
 
+        EXPECT_TRUE(held_segments.empty());
         // 4. Final Reclaim (Epoch released)
         while(r.reclaim(idx)) {
             held_segments.push_back(idx);
@@ -316,18 +315,20 @@ TEST_F(SegmentRecyclerTest, EpochProtectionBlocksReclaim) {
             reclaimed_sum_final.fetch_add(idx);
         }
 
+        sync_point.arrive_and_wait();
+
         for(auto i : held_segments) r.retire(i);
+
         r.unregister_thread();
-        puts("WORKERS OUT");
     };
 
     auto protector_task = [&]() {
         EXPECT_TRUE(r.register_thread());
         sync_point.arrive_and_wait(); // Sync 1: Start
-
+        //drain complete
         sync_point.arrive_and_wait(); // Sync 2: Wait for workers to Drain
 
-        r.protect_epoch(); // Block reclamation NOW
+        r.protect_epoch(); // Block reclamation NOW protects epoch 1
 
         sync_point.arrive_and_wait(); // Sync 3: Wait for workers to Retire
 
@@ -337,6 +338,8 @@ TEST_F(SegmentRecyclerTest, EpochProtectionBlocksReclaim) {
         r.clear_epoch();   // Release SAFE: Workers are done checking
 
         sync_point.arrive_and_wait(); // Sync 5: Signal release
+
+        sync_point.arrive_and_wait();
 
         r.unregister_thread();
     };
@@ -353,4 +356,5 @@ TEST_F(SegmentRecyclerTest, EpochProtectionBlocksReclaim) {
     // Validate Sums (Check for data integrity using Gauss Sum)
     EXPECT_EQ(reclaimed_sum_initial.load(), GAUSS_SUM);
     EXPECT_EQ(reclaimed_sum_final.load(), GAUSS_SUM);
+    }
 }

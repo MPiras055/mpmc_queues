@@ -145,7 +145,7 @@ public:
      * @return true If the dequeue succeeds.
      * @return false If the queue is empty.
      */
-    bool dequeue(T& container) override {
+    bool dequeue(T& container) final override {
         uint64_t headTicket, seq;
         size_t index;
         do {

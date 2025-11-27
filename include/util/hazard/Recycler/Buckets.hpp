@@ -7,30 +7,109 @@
 #include <cassert>
 #include <OptionsPack.hpp>
 #include <SequencedCell.hpp>
-#include <iostream>
 
 namespace util::hazard::recycler::details {
 
 using Value = uint64_t;
 
-struct LimboBufferOpt {
-    struct Auto_FixState{};
+/// ===========================================
+/// Plain-old CASLoop (enqueue/dequeue) bucket
+/// ===========================================
+///
+template<size_t Capacity, typename Opt = meta::EmptyOptions>
+class DebugBucket {
+    using Cell = cell::SequencedCell<Value, true>;
+    static constexpr Value EMPTY = Capacity;
+    inline size_t mod(uint64_t i) const noexcept {
+        return i % Capacity;
+    }
+
+    public:
+
+    explicit DebugBucket() {
+        for(size_t i = 0; i < Capacity; i++) {
+            buffer[mod(i)].seq.store(i,std::memory_order_relaxed);
+            buffer[mod(i)].val.store(EMPTY,std::memory_order_relaxed);
+        }
+    }
+    void enqueue(Value item) {
+        uint64_t tailTicket,seq;
+        size_t index;
+
+        while(true){
+            tailTicket = tail.load(std::memory_order_relaxed);
+            index = mod(tailTicket);
+            Cell& node = buffer[index];
+            seq = node.seq.load(std::memory_order_acquire);
+
+            if(tailTicket == seq) {
+                bool success = tail.compare_exchange_weak(
+                    tailTicket,
+                    (tailTicket + 1),
+                    std::memory_order_relaxed
+                );
+                if(success) {
+                    node.val.store(item,std::memory_order_relaxed);
+                    node.seq.store(seq + 1,std::memory_order_release);
+                    return;
+                }
+            } else if (tailTicket > seq) {
+                assert(false && "Full debugBucket");
+            }
+        }
+    }
+
+    bool dequeue(Value& out) {
+        uint64_t headTicket, seq;
+        size_t index;
+        while(true) {
+            headTicket = head.load(std::memory_order_relaxed);
+            index = mod(headTicket);
+            Cell& node = buffer[index];
+            seq = node.seq.load(std::memory_order_acquire);
+            int64_t diff = static_cast<int64_t>(seq) - static_cast<int64_t>(headTicket + 1);
+            if(diff == 0) {
+                if(head.compare_exchange_weak(
+                    headTicket,headTicket + 1,
+                    std::memory_order_relaxed
+                )) {
+                    out = node.val.exchange(EMPTY,std::memory_order_acq_rel);
+                    assert(out != EMPTY && "DebugBuffer: extracted empty val");
+                    node.seq.store(headTicket + Capacity, std::memory_order_release);
+                    return true;
+                }
+            } else if(diff < 0 ) {
+                return false;
+            }
+        }
+    }
+
+
+    private:
+    std::atomic_uint64_t tail{0};
+    std::atomic_uint64_t head{0};
+    Cell buffer[Capacity];
+
+
 };
 
 /**
- * @brief A high-performance, phased, linear MPMC buffer for EBR.
+ * @brief A high-performance, phased, wait-free, linear MPMC buffer for EBR.
  * * @details
  * Designed for Phased Invariants:
  * 1. Accumulation: Multiple Producers, No Consumers.
  * 2. Reclamation: Multiple Consumers, No Producers.
  * * Uses monotonic indices with a linear layout to maximize cache locality
  * and minimize instruction overhead.
+ *
+ * Assumption:
+ * 1. Bucket never overfills
+ * 2. It's used in phases: either MP-NC or NP-MC (reset() to flip the phase)
  */
-template<size_t Capacity, typename Opt = meta::EmptyOptions>
+template<size_t Capacity>
 class LimboBuffer {
 public:
     static constexpr Value EMPTY_VAL = Capacity;
-    static constexpr bool AUTO_FIXSTATE = Opt::template has<LimboBufferOpt::Auto_FixState>;
 
     explicit LimboBuffer() {
         for(size_t i = 0; i < Capacity; i++) {
@@ -81,13 +160,6 @@ public:
         if (idx >= limit) {
             // Empty / Overshot
             // Fix State: Clamp head to limit to prevent runaway index.
-            // This isn't strictly sequentially consistent but safe in Phased MPMC
-            // because no one is validly using indices >= limit.
-            // We use store (not CAS) because if we are >= limit, we just want to stop here.
-
-            if constexpr (AUTO_FIXSTATE) {
-                internal_reset_();
-            }
 
             return false;
         }
@@ -107,9 +179,8 @@ public:
     }
 
     inline void reset() {
-        if constexpr (!AUTO_FIXSTATE) {
-            internal_reset_();
-        }
+        tail_.store(0,std::memory_order_release);
+        head_.store(0,std::memory_order_release);
     }
 
 
@@ -123,8 +194,8 @@ public:
 
 private:
     inline void internal_reset_() {
-        tail_.store(0,std::memory_order_release);
-        head_.store(0,std::memory_order_release);
+        tail_.store(0,std::memory_order_relaxed);
+        head_.store(0,std::memory_order_relaxed);
     }
 
     // Align to cache lines to prevent false sharing
@@ -141,14 +212,17 @@ struct CacheOpt {
 
 template<size_t Capacity, typename Opt = meta::EmptyOptions>
 class Cache {
+    static constexpr Value EMPTY = Capacity;
     static constexpr bool POW2  =
         Opt::template has<CacheOpt::Pow2Size> ||
         (bit::is_pow2(Capacity) && Capacity != 1);
 
-    struct Cell {
-        std::atomic<uint64_t> sequence;
-        Value data;
-    };
+    // struct Cell {
+    //     std::atomic<uint64_t> sequence;
+    //     Value data;
+    // };
+    //
+    using Cell = std::atomic<Value>;
 
     size_t mod(uint64_t i) const {
         if constexpr (POW2) {
@@ -163,7 +237,8 @@ public:
         buffer = new Cell[size_];
         for(size_t i = 0; i < size_; i++) {
             // Initial sequence must match the initial ticket indices (0, 1, 2...)
-            buffer[i].sequence.store(i, std::memory_order_relaxed);
+            // buffer[i].sequence.store(i, std::memory_order_relaxed);
+            buffer[i].store(EMPTY,std::memory_order_release);
         }
     }
 
@@ -184,56 +259,42 @@ public:
         size_t index = mod(tailTicket);
         Cell& cell = buffer[index];
 
-        // 2. Safety Check (Debug Only)
-        // If your assumption that "enqueue cannot fail" is wrong, this asserts.
-        // In Release builds, this compiles away completely.
-        assert(cell.sequence.load(std::memory_order_relaxed) == tailTicket
-               && "Enqueue called on full queue!");
-
         // 3. Write Data
         // Safe non-atomic write because we 'own' this slot via the ticket
-        cell.data = item;
+        cell.store(item,std::memory_order_release);
 
         // 4. Publish Sequence (CRITICAL)
         // We MUST set this to (ticket + 1).
         // The dequeue looks for (ticket + 1) to know the data is ready.
         // memory_order_release ensures the 'cell.data' write is visible
         // before the sequence updates.
-        cell.sequence.store(tailTicket + 1, std::memory_order_release);
+        // cell.sequence.store(tailTicket + 1, std::memory_order_release);
     }
 
     // -----------------------------------------------------------
     // DEQUEUE (unchanged logic, handles ABA/Stale reads)
     // -----------------------------------------------------------
     bool dequeue(Value& out) {
+        uint64_t headTicket = head_.load(std::memory_order_acquire);
         while(true) {
-            uint64_t headTicket = head_.load(std::memory_order_relaxed);
             size_t index = mod(headTicket);
             Cell& cell = buffer[index];
-
-            // Load sequence with Acquire to synchronize with the Producer's Release
-            uint64_t seq = cell.sequence.load(std::memory_order_acquire);
-
-            // We expect the sequence to be exactly (ticket + 1)
-            int64_t diff = (int64_t)seq - (int64_t)(headTicket + 1);
-
-            if (diff == 0) {
-                // Success case: Data is ready and sequence matches
-                if (head_.compare_exchange_weak(
-                        headTicket, headTicket + 1,
-                        std::memory_order_relaxed)) {
-
-                    out = cell.data;
-
-                    // Reset sequence for the NEXT generation of producers.
-                    // This slot will be used again when tail reaches (ticket + size).
-                    cell.sequence.store(headTicket + size_, std::memory_order_release);
-                    return true;
-                }
-            } else if (diff < 0) {
-                // Sequence is behind. The producer hasn't finished writing yet.
-                // Since this is a dequeue, we return false (empty).
+            Value item = cell.load(std::memory_order_acquire);
+            if(item == EMPTY)
                 return false;
+            //if fails then resets the headTicket
+            else if(head_.compare_exchange_weak(
+                headTicket,headTicket + 1,
+                std::memory_order_relaxed
+            )) {
+#ifdef NDEBUG
+                cell.store(EMPTY,std::memory_order_release);
+#else
+                Value cmp = cell.exchange(EMPTY,std::memory_order_acq_rel);
+                assert(item == cmp && "CacheBucket: store invariant violated");
+#endif
+                out = item;
+                return true;
             }
         }
     }
