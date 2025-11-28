@@ -49,7 +49,7 @@ private:
 
     // FIX: Use LimboBuffer to ensure slots are physically cleared (exchange EMPTY_VAL) upon dequeue.
     // This prevents the "double reclaim" bug where old data is read after bucket rotation.
-    using Bucket         = details::LimboBuffer<Capacity>;
+    using Bucket         = details::DebugBucket<Capacity>;
     // using Bucket = details::DebugBucket<Capacity,meta::EmptyOptions>;
 
     static_assert(std::is_same_v<Index, details::Value>, "Recycler: Index type mismatch with Bucket Value");
@@ -57,7 +57,7 @@ private:
     // Cache Types
     using CacheOpt       = typename meta::EmptyOptions
                            ::template add_if<POW2, details::CacheOpt::Pow2Size>;
-    using RealCache      = details::Cache<Capacity, CacheOpt>;
+    using RealCache      = details::DebugBucket<Capacity>;
 
     struct DisabledCache {};
     using CacheMember    = std::conditional_t<NO_CACHE, DisabledCache, RealCache>;
@@ -273,8 +273,7 @@ public:
             // 3. Try to Advance Epoch
             if(can_advance_epoch(e)) {
                 //if epoch can be advanced then fix the state of the bucket
-                get_bucket(e,BucketState::Next).reset();
-
+                // get_bucket(e,BucketState::Next).reset();
                 Epoch dummy_e = e;
                 bool ok = epoch_.compare_exchange_strong(
                     dummy_e,dummy_e + 1,

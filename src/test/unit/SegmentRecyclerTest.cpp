@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <barrier>
 #include <atomic>
+#include <chrono>
 #include <OptionsPack.hpp>
 
 // Include your SegmentRecycler header
@@ -255,9 +256,8 @@ TEST_F(SegmentRecyclerTest,MetadataUtils) {
 }
 
 TEST_F(SegmentRecyclerTest, EpochProtectionBlocksReclaim) {
-    while(true) {
-    static constexpr size_t CAPACITY      = 4000;
-    static constexpr size_t WORKERS       = 4;
+    static constexpr size_t CAPACITY      = 4;
+    static constexpr size_t WORKERS       = 5;
     static constexpr size_t PROTECTORS    = 1;
     static constexpr size_t TOTAL_THREADS = WORKERS + PROTECTORS;
     static constexpr size_t GAUSS_SUM     = (CAPACITY * (CAPACITY - 1)) / 2; // Sum of 0..N-1
@@ -356,5 +356,122 @@ TEST_F(SegmentRecyclerTest, EpochProtectionBlocksReclaim) {
     // Validate Sums (Check for data integrity using Gauss Sum)
     EXPECT_EQ(reclaimed_sum_initial.load(), GAUSS_SUM);
     EXPECT_EQ(reclaimed_sum_final.load(), GAUSS_SUM);
+
+}
+
+
+TEST_F(SegmentRecyclerTest, StressCacheAndReclaim) {
+    // 1. Setup Constants and Types
+    static constexpr size_t TEST_THREADS     = 8;
+    static constexpr size_t CAPACITY         = 4;
+    static constexpr size_t TOTAL_ITERATIONS = 1000000;
+    const std::chrono::microseconds WAIT_PROTECTED{10};
+
+    using Opt = util::hazard::recycler::RecyclerOpt;
+    // Cache is enabled by default. We add Pow2_Buckets.
+    using Rec = util::hazard::recycler::Recycler<
+        Segment,
+        CAPACITY
+        >;
+    using Index = Rec::Index;
+
+    Rec r(TEST_THREADS);
+    std::barrier sync_point(TEST_THREADS);
+    std::vector<std::thread> threads;
+
+    // Precondition: all segments start in cache and they're open
+    // If a segment is got from cache it should be open
+    // else it should be closed (and therefore opened)
+
+    // 3. Worker Lambda
+    auto worker_task = [&](size_t t_id) {
+        EXPECT_TRUE(r.register_thread());
+
+        // Load Balancing
+        size_t my_iters = TOTAL_ITERATIONS / TEST_THREADS;
+        if (t_id < (TOTAL_ITERATIONS % TEST_THREADS)) {
+            my_iters++;
+        }
+
+        // Lightweight Pseudo-Random Generator (Xorshift32)
+        uint32_t seed = 123456789 + static_cast<uint32_t>(t_id * 54321);
+        auto next_rand = [&seed]() {
+            uint32_t x = seed;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            return seed = x;
+        };
+
+        sync_point.arrive_and_wait(); // Start together
+
+        Index idx;
+        for(size_t i = 0; i < my_iters; ++i) {
+            // A. Get Segment (Spin until success)
+            bool got = false;
+            do {
+                // Priority to cache, then reclaim
+                if(r.get_cache(idx)) {
+                    got = true;
+                    EXPECT_TRUE(r.decode(idx)->isOpen());
+                } else if(r.reclaim(idx)) {
+                    got = true;
+                    Segment* s = r.decode(idx);
+                    EXPECT_TRUE(s->isClosed());
+                    EXPECT_TRUE(s->open());
+                } else {
+                    std::this_thread::yield();
+                }
+            } while(!got);
+
+            // C. Random Decision
+            if ((next_rand() % 2) == 0) {
+                // Path 1: Put back to Cache
+                // We must close it first to maintain the invariant for the next getter
+                r.put_cache(idx);
+            } else {
+                Segment* seg = r.decode(idx);
+                // Path 2: Retire (Simulate work and reclamation)
+                r.protect_epoch();
+
+                // "Use" implies we are holding it, now we are done.
+                seg->close();
+
+                // Spin for a few microseconds (Simulate cleanup overhead)
+                // Using volatile loop to prevent optimization
+                // std::this_thread::sleep_for(WAIT_PROTECTED);
+                std::this_thread::yield();
+                r.retire(idx);
+                r.clear_epoch();
+            }
+        }
+
+        r.unregister_thread();
+    };
+
+    // 4. Launch and Join
+    for(size_t i = 0; i < TEST_THREADS; ++i) {
+        threads.emplace_back(worker_task, i);
+    }
+
+    for(auto& t : threads) {
+        if(t.joinable()) t.join();
+    }
+
+    //check recycler consistency
+    EXPECT_TRUE(r.register_thread());
+    std::vector<Index> rec_state;
+    rec_state.reserve(CAPACITY);
+    Index idx;
+    while(r.get_cache(idx)) {
+        rec_state.push_back(idx);
+    }
+    while(r.reclaim(idx)) {
+        rec_state.push_back(idx);
+    }
+
+    std::sort(rec_state.begin(),rec_state.end());
+    for(size_t i = 1; i < CAPACITY; i++) {
+        EXPECT_EQ(rec_state[i-1]+1,rec_state[i]);
     }
 }
