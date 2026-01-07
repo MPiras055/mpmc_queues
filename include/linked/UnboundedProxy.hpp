@@ -1,16 +1,41 @@
+#include "OptionsPack.hpp"
 #include <IProxy.hpp>               //proxy interface
 #include <DynamicThreadTicket.hpp>  //cached thread tickets for hazard pointers
 #include <HazardVector.hpp>         //basic hazard pointer implementation
+#include <atomic>
 #include <specs.hpp>                //padding definition
 #include <bit.hpp>                  //bit manipulation
 
 template <
     typename T,
-    template<typename,typename,bool,bool>
-    typename Seg, bool pow2 = false
+    template<typename,typename,typename,typename> typename Seg,
+    typename SegmentOpt,
+    typename ProxyOp
 >
-class UnboundedProxy: public base::IProxy<T,Seg> {
-    using Segment = Seg<T, UnboundedProxy,pow2,true>;
+class UnboundedProxy;
+
+template <
+    typename T,
+    template<typename,typename,typename,typename> typename Seg,
+    typename SegmentOpt = meta::EmptyOptions,
+    typename ProxyOp    = meta::EmptyOptions
+>
+class UnboundedProxy//:
+    // public base::IProxy<T,Seg<T,void,SegmentOpt,ProxyOp>>
+{
+    using Segment = Seg<T,UnboundedProxy,SegmentOpt,void>;
+
+    inline bool dequeueAfterNextLinked(Segment* lhead,T& out) {
+        // This is a hack for LinkedSCQ.
+        // See SCQ::prepareDequeueAfterNextLinked for details.
+        if constexpr(requires(Segment s) {
+        s.prepareDequeueAfterNextLinked();
+        }) {
+            lhead->prepareDequeueAfterNextLinked();
+        }
+
+        return lhead->dequeue(out);
+    }
 
 public:
     explicit UnboundedProxy(size_t cap, size_t maxThreads) :
@@ -32,7 +57,7 @@ public:
         delete head_.load();
     }
 
-    bool enqueue(T item) override {
+    void enqueue(T item) {
         uint64_t ticket = get_ticket_();
 
         Segment* tail = hazard_.protect(tail_.load(std::memory_order_relaxed), ticket);
@@ -61,8 +86,8 @@ public:
 
             //enqueue failed: segment is full or stale
             //allocate a new segment and push current item
-            Segment* newTail = new Segment(seg_capacity_, tail->getNextStartIndex());
-            (void)newTail->enqueue(item);
+            Segment* newTail = new Segment(item, seg_capacity_, 0);
+            // (void) newTail->enqueue(item);
 
             Segment* null = nullptr;
             //try to link the private segment as the new tail
@@ -79,12 +104,9 @@ public:
 
         hazard_.clear(ticket);
         recordEnqueue(ticket);
-        return true;
     }
 
-
-
-    bool dequeue(T& out) override {
+    bool dequeue(T& out) {
         uint64_t ticket = get_ticket_();
         Segment *head = hazard_.protect(head_.load(std::memory_order_relaxed),ticket);
         while(1) {
@@ -104,15 +126,14 @@ public:
                     hazard_.clear(ticket);
                     return false;
                 }
-
                 //next was setted: try one more time to dequeue on the current segment
-                if(!head->dequeue(out)) {
+                if(!dequeueAfterNextLinked(head,out)) {
                     //if dequeue failed then no-one will enqueue on this segment
                     //try to update the current head
-                    if(head_.compare_exchange_strong(head,next)) {
+                    if(head_.compare_exchange_strong(head,next,std::memory_order_acq_rel,std::memory_order_acquire)) {
                         //retire the current segment
-                        hazard_.retire(head,ticket);
-                        head = hazard_.protect(next,ticket);
+                        (void) hazard_.retire(head,ticket);
+                        head = hazard_.protect(next,ticket);    //update protection
                     } else {
                         head = hazard_.protect(head,ticket);
                     }
@@ -131,16 +152,16 @@ public:
      * @brief get the underlying segment capacity
      * @returns `size_t` capacity of all segments
      */
-    size_t capacity() const override { return seg_capacity_; }
+    size_t capacity() const { return seg_capacity_; }
 
     /**
      * @brief get an approximation of the total number of elements the queue holds
      *
      * @warning requires the thread to have acquired an operation slot
      */
-    size_t size() const override {
+    size_t size() const {
         int64_t total = 0;
-        hazard_.metadataIter([&total](const std::atomic<int64_t>& m) {
+        hazard_.metadataIter([&total](const std::atomic_int64_t& m) {
             total += m.load(std::memory_order_relaxed);
         });
         assert(total >= 0 && "Negative size detected");
@@ -158,10 +179,9 @@ public:
      * @warning operating on the data structure without acquiring a slot results in
      * undefined behaviour
      */
-    bool acquire() override {
+    bool acquire() {
         uint64_t ignore;
         return ticketing_.acquire(ignore);
-
     }
 
     /**
@@ -171,7 +191,7 @@ public:
      * @note this method is idempotent (calling it multiple times results in no
      * side effects)
      */
-    void release() override {
+    void release() {
         return ticketing_.release();
     }
 
@@ -191,17 +211,17 @@ private:
      * @note asserts that the calling thread possesses a ticket
      */
     inline uint64_t get_ticket_() {
-        uint64_t retval;
-        assert(ticketing_.acquire(retval) && "Warning: no ticket could be acquired");
-        return retval;
+        uint64_t ticket = -1;
+        bool ok = ticketing_.acquire(ticket);
+        assert(ok && "Warning: no ticket could be acquired");
+        return ticket;
     }
 
-    ALIGNED_CACHE std::atomic<Segment*> head_{nullptr};
-    char pad_head_[CACHE_LINE - sizeof(std::atomic<Segment *>)];
-    ALIGNED_CACHE std::atomic<Segment*> tail_{nullptr};
-    char pad_tail_[CACHE_LINE - sizeof(std::atomic<Segment *>)];
+    ALIGNED_CACHE std::atomic<Segment*> head_{};
+    CACHE_PAD_TYPES(std::atomic<Segment*>);
+    ALIGNED_CACHE std::atomic<Segment*> tail_{};
+    CACHE_PAD_TYPES(std::atomic<Segment*>);
     util::threading::DynamicThreadTicket ticketing_;
-    util::hazard::HazardVector<Segment*,std::atomic<int64_t>> hazard_;
+    util::hazard::HazardVector<Segment*,std::atomic_int64_t> hazard_;
     const size_t seg_capacity_;
-
 };

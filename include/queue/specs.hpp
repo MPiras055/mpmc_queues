@@ -62,7 +62,7 @@ namespace align {
 
 // Macro: Add padding using types
 #define CACHE_PAD_TYPES(...) \
-    char UNIQUE_NAME(_pad)[align::padding_for_types<__VA_ARGS__>()]
+    [[maybe_unused]] char UNIQUE_NAME(_pad)[align::padding_for_types<__VA_ARGS__>()]
 
 // Optional: shorthand for aligning a struct
 #define ALIGNED_CACHE alignas(CACHE_LINE)

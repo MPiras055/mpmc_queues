@@ -72,7 +72,7 @@ public:
     void metadataIter(Func&& fn) const {
         if constexpr (!std::is_same_v<Meta,void>) {
             for (size_t tid = 0; tid < maxThreads_; ++tid) {
-            fn(storage_[tid].get_metadata_ronly_()); // passes const Meta&
+            fn(storage_[tid].metadata()); // passes const Meta&
         }
         } else {
             static_assert(!sizeof(Meta),"metadataIter is noly available when Meta is non-void");
@@ -158,7 +158,7 @@ public:
      */
     inline T protect(T ptr, size_t tid, size_t hpid = 0) {
         assert(tid < maxThreads_ && hpid < HV_MAX_HPS);
-        storage_[tid].data[hpid].store(ptr, std::memory_order_release);
+        storage_[tid].data()[hpid].store(ptr, std::memory_order_release);
         return ptr;
     }
 
@@ -191,7 +191,7 @@ public:
      */
     inline void clear(size_t tid, size_t hpid = 0) {
         assert(tid < maxThreads_ && hpid < HV_MAX_HPS);
-        storage_[tid].data[hpid].store(nullptr, std::memory_order_release);
+        storage_[tid].data()[hpid].store(nullptr, std::memory_order_release);
     }
 
     /**
@@ -238,7 +238,7 @@ public:
             // Scan all hazard pointers
             for (size_t t = 0; (t < maxThreads_) && canDelete; ++t) {
                 for (size_t h = 0; h < HV_MAX_HPS; ++h) {
-                    if (storage_[t].data[h].load(std::memory_order_acquire) == obj) {
+                    if (storage_[t].data()[h].load(std::memory_order_acquire) == obj) {
                         canDelete = false;
                         break;
                     }
@@ -268,7 +268,7 @@ private:
     void storage_init() {
         for(size_t i = 0; i < maxThreads_; i++) {
             auto& cell = storage_[i];
-            auto& data = cell.getData();
+            auto& data = cell.data();
             for(size_t j = 0; j < HV_MAX_HPS; j++){
                 data[j].store(nullptr,std::memory_order_relaxed);
             }
@@ -302,7 +302,7 @@ private:
     template<typename T, typename Meta>
     template<typename M, typename>
     inline M& HazardVector<T, Meta>::getMetadata(uint64_t tid) {
-        return storage_[tid].getMetadata();
+        return storage_[tid].metadata();
     }
 
 }   //namespace util::hazard

@@ -49,7 +49,7 @@ private:
 
     // FIX: Use LimboBuffer to ensure slots are physically cleared (exchange EMPTY_VAL) upon dequeue.
     // This prevents the "double reclaim" bug where old data is read after bucket rotation.
-    using Bucket         = details::DebugBucket<Capacity>;
+    using Bucket         = details::Cache<Capacity>;
     // using Bucket = details::DebugBucket<Capacity,meta::EmptyOptions>;
 
     static_assert(std::is_same_v<Index, details::Value>, "Recycler: Index type mismatch with Bucket Value");
@@ -80,17 +80,12 @@ public:
         buckets_{new Bucket[4]}
     {
         // Initialize: Fill the 'initial' Free bucket (index 2 for epoch 0)
-        if constexpr (NO_CACHE) {
-            Bucket& initialFree = buckets_[2];
-            for(size_t i = 0; i < Capacity; ++i) {
-                initialFree.enqueue(Index{i});
-            }
-        } else {
-            RealCache& initialFree = static_cast<RealCache&>(cache_);
-            for(size_t i = 0; i < Capacity; ++i) {
-                initialFree.enqueue(Index{i});
-            }
+
+        Bucket& initialFree = get_bucket(epoch_.load(std::memory_order_relaxed),BucketState::Free);
+        for(size_t i = 0; i < Capacity; ++i) {
+            initialFree.enqueue(Index{i});
         }
+
     }
 
     ~Recycler() {
@@ -138,11 +133,13 @@ public:
     }
 
     void unregister_thread() {
-        uint64_t t;
-        if(ticketing_.acquire(t)) {
-            threadRecord_[t].data().clear();
+        if(ticketing_.has_ticket()) {
+            uint64_t t;
+            if(ticketing_.acquire(t)) {
+                threadRecord_[t].data().clear();
+            }
+            ticketing_.release();
         }
-        ticketing_.release();
     }
 
     // =========================================================================
@@ -181,7 +178,7 @@ public:
             uint64_t current = epoch_.load(std::memory_order_acquire);
             cell.protect(current);
             val = atom.load(std::memory_order_acquire);
-        } while(val == atom.load(std::memory_order_acquire));
+        } while(val != atom.load(std::memory_order_acquire));
 
         return val;
     }
@@ -203,8 +200,7 @@ public:
     void put_cache(Index idx) {
         if constexpr (NO_CACHE) {
             assert(false && "Recycler: put_cache called while cache disabled");
-        }
-        else {
+        } else {
             static_cast<RealCache&>(cache_).enqueue(idx);
         }
     }
@@ -223,20 +219,18 @@ public:
         c.snapshot(was_active, current_epoch);
 
         if (!was_active) {
-            // 2. Stabilize Protection
+            // Protect the current epoch
             current_epoch = epoch_.load(std::memory_order_acquire);
             c.protect(current_epoch);
-            current_epoch = epoch_.load(std::memory_order_acquire);
+            // at this point epoch can have shifted
+            // so the Index is placed in the Grace bucket
+            // Epoch can not advance more than once since protection
         }
 
-        // 3. Queue to the bucket of the epoch we are holding (Protected)
-        // FIX: Use current_epoch, NOT epoch_.load(). Using epoch_.load()
-        // introduces a race where we retire into a future epoch bucket
-        // while protecting an old one.
-        Bucket& target = get_bucket(current_epoch, BucketState::Current);
+        Bucket& target = get_bucket(current_epoch, BucketState::Grace);
         target.enqueue(idx);
 
-        // 4. Cleanup if we started protection
+        // cleanup if we protected
         if (!was_active) {
             c.clear();
         }
@@ -255,16 +249,16 @@ public:
         constexpr size_t MAX_ATTEMPTS = 3;
 
         for(size_t i = 0; i < MAX_ATTEMPTS; i++) {
-            // 1. Stabilize Epoch and Protect
-            // Protecting 'e' ensures we don't read from a bucket that unexpectedly
-            // shifts from Free (Safe) to Current (Unsafe) while we are reading.
+
+            //if thread wasn't active protect the current epoch
             if(!was_active) {
                 e = epoch_.load(std::memory_order_acquire);
                 c.protect(e);
-                e = epoch_.load(std::memory_order_relaxed); //account for epoch shifting
+                // by now epoch can have shifted to the Grace bucket
+                //
             }
 
-            // 2. Try Dequeue from Free Bucket
+            // Try Dequeue from Free Bucket
             Bucket& free_b = get_bucket(e, BucketState::Free);
             if (gotIdx = free_b.dequeue(out_idx); gotIdx) {
                 break;
@@ -275,24 +269,14 @@ public:
                 //if epoch can be advanced then fix the state of the bucket
                 // get_bucket(e,BucketState::Next).reset();
                 Epoch dummy_e = e;
-                bool ok = epoch_.compare_exchange_strong(
+                (void)epoch_.compare_exchange_strong(
                     dummy_e,dummy_e + 1,
                     std::memory_order_acq_rel,
                     std::memory_order_acquire
                 );
-
-                if(ok || dummy_e > e) {
-                    continue;
-                }
-
             }
 
-            //check if the epoch advanced
-            if (epoch_.load(std::memory_order_acquire) != e) {
-                continue;
-            } else {
-                // Cannot advance (blocked by Grace threads) and Free is empty.
-                // No point spinning further.
+            if(epoch_.load(std::memory_order_acquire) == e) {
                 break;
             }
         }
@@ -325,7 +309,7 @@ private:
             threadRecord_[i].data().snapshot(active, t_epoch);
             // If any thread is stuck on the 'unsafe' epoch (Grace), we cannot advance.
             // Note: t_epoch == expected_epoch (Active on Current) is OK.
-            if (active && t_epoch != expected_epoch ||
+            if ((active && t_epoch != expected_epoch) ||
                 epoch_.load(std::memory_order_relaxed) != expected_epoch) {
                 return false;
             }

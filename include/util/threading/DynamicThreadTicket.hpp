@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <specs.hpp>
+#include <bit>
 
 #ifndef DTT_MAX_BITS
 #define DTT_MAX_BITS 1024
@@ -36,7 +37,7 @@ public:
     static constexpr std::uint64_t NumCells     = (MaxThreads + 63) / 64;
 
     /// Sentinel for "no ticket".
-    static constexpr std::uint64_t INVALID_ID   = std::uint64_t(-1);
+    static constexpr std::uint64_t NO_TICKET   = std::uint64_t(-1);
 
     using Ticket = uint64_t;
 
@@ -72,7 +73,7 @@ public:
         }
 
         // Ensure this thread's TLS slot for this instance is initialized.
-        tls_id_cache()[instance_id_] = INVALID_ID;
+        tls_id_cache()[instance_id_] = NO_TICKET;
     }
 
     /**
@@ -101,7 +102,7 @@ public:
         std::uint64_t& local_id = tls_id_cache()[instance_id_];
 
         // Fast path: already have a ticket for this instance.
-        if (local_id != INVALID_ID) {
+        if (local_id != NO_TICKET) {
             out_ticket = local_id;
             return true;
         }
@@ -136,20 +137,24 @@ public:
         return false;
     }
 
+    inline bool has_ticket() const {
+        return tls_id_cache()[instance_id_] != NO_TICKET;
+    }
+
     /**
      * @brief Release the ticket held by the calling thread (if any).
      * Safe to call multiple times (idempotent).
      */
     void release() {
         std::uint64_t& local_id = tls_id_cache()[instance_id_];
-        if (local_id == INVALID_ID) return;
+        if (local_id == NO_TICKET) return;
 
         const std::uint64_t cell = local_id / 64;
         const std::uint64_t bit  = local_id % 64;
         storage_[cell].fetch_or(std::uint64_t{1} << bit, std::memory_order_release);
 
         // Clear TLS so the next acquire (for this thread) recomputes from smallest free.
-        local_id = INVALID_ID;
+        local_id = NO_TICKET;
     }
 
     /// @return runtime-configured maximum number of tickets for this instance.
@@ -169,7 +174,7 @@ private:
         static thread_local std::array<std::uint64_t, MaxInstances> cache;
         static thread_local bool initialized = false;
         if (!initialized) {
-            cache.fill(INVALID_ID);
+            cache.fill(NO_TICKET);
             initialized = true;
         }
         return cache;

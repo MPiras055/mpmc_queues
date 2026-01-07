@@ -64,6 +64,9 @@ cmake/*
 # pyright
 pyrightconfig.json
 
+#old folder
+mpmc_queues_TITANIC
+
 # benchmarking
 __pycache__
 scripts

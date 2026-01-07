@@ -17,20 +17,23 @@ namespace base {
 ///
 /// @note: @tparam Derived should have `IQueue<T>` as indirect or direct base class
 
-template <typename T, typename Derived>
+template <typename T, typename NextT>
 class ILinkedSegment {
+    static_assert(std::is_trivially_default_constructible_v<NextT>,
+        "NextT has to be trivially default constructible");
+
 public:
     /// @brief Retrieves the next segment in the chain.
     ///
     /// @return Pointer to the next segment, or `nullptr` if this is the last segment.
-    virtual Derived* getNext() const = 0;
+    virtual NextT getNext() const noexcept = 0;
 
     // =============================
     // Enqueue/Dequeue with checks
     // =============================
-    virtual bool enqueue(T item, [[maybe_unused]] bool info) = 0;
+    virtual bool enqueue(const T item, [[maybe_unused]] bool info) noexcept = 0;
 
-    virtual bool dequeue(T& out, [[maybe_unused]] bool info) = 0;
+    virtual bool dequeue(T& out, [[maybe_unused]] bool info) noexcept = 0;
 
 
     // ==========================
@@ -43,24 +46,25 @@ public:
     /// but may still allow `dequeue` of remaining items.
     ///
     /// @return true if successfully closed, false otherwise.
-    virtual bool close() = 0;
+    virtual bool close() noexcept = 0;
 
     /// @brief Marks the queue as open.
     ///
     /// An open queue can accept new items (`enqueue` succeeds if not full).
     ///
     /// @return true if successfully opened, false otherwise.
-    virtual bool open() = 0;
+    virtual bool open() noexcept = 0;
 
     /// @brief Checks if the queue has been closed.
     ///
     /// @return true if closed, false otherwise.
-    virtual bool isClosed() const = 0;
+    virtual bool isClosed() const noexcept = 0;
 
     /// @brief Checks if the queue is currently open.
     ///
     /// @return true if open, false otherwise.
-    virtual bool isOpened() const = 0;
+    virtual bool isOpened() const noexcept = 0;
+
 
     using linked_segment_tag = void;
 };

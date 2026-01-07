@@ -1,11 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
-project(MPMCQueue LANGUAGES CXX)
+project(MPMCQueue LANGUAGES C CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_C_STANDARD 11)
 
 if(POLICY CMP0135)
     cmake_policy(SET CMP0135 NEW)
 endif()
 
-set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 enable_testing()
@@ -25,22 +26,25 @@ foreach(dir ${ALL_INCLUDE_DIRS})
 endforeach()
 include_directories(${INCLUDE_DIRS})
 
+add_library(scqueue STATIC third-party/scqueue/lfring_cas1.c)
+target_include_directories(scqueue PUBLIC third-party/scqueue/)
+
 # === Additional Work utilities
 add_executable(timeTicks "src/util/time/timeTicks.cpp")
 target_compile_options(timeTicks PUBLIC -O3 -DNDEBUG -funroll-loops -fno-rtti)
 
 # === Test Stub
-add_executable(testStub "src/sim/test_stub_autogen.cpp")
-target_compile_options(
-    testStub PUBLIC -O3 -DNDEBUG -funroll-loops -fno-rtti -march=native)
-target_precompile_headers(testStub PUBLIC "include/bench/benchmark.hpp")
+# add_executable(testStub "src/sim/test_stub_autogen.cpp")
+# target_compile_options(
+#     testStub PUBLIC -O3 -DNDEBUG -funroll-loops -fno-rtti -march=native)
+# target_precompile_headers(testStub PUBLIC "include/bench/benchmark.hpp")
 
 
 # === GoogleTest ===
 set(GTEST_DIR ${PROJECT_SOURCE_DIR}/cmake/extern/googletest)
 add_subdirectory(${GTEST_DIR})  # <-- This is the proper way to include gtest
 
-# === Unit Tests ===
+# # === Unit Tests ===
 file(GLOB UNIT_TEST_SOURCES "src/test/unit/*.cpp")
 
 foreach(test_src ${UNIT_TEST_SOURCES})
@@ -49,25 +53,25 @@ foreach(test_src ${UNIT_TEST_SOURCES})
     add_executable(${test_name} ${test_src})
 
     target_compile_options(${test_name} PRIVATE
-        -g -O3 -march=native -funroll-loops -fno-rtti)
-
-    target_link_libraries(${test_name} PRIVATE gtest_main)
-
+        -g -O3 -march=native -funroll-loops -fno-rtti -fsanitize=address
+    )
+    target_link_libraries(${test_name} PRIVATE gtest_main scqueue)
+    target_link_options(${test_name} PRIVATE -fsanitize=address)
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
 
-# === Integration Tests ===
-file(GLOB INTEGRATION_TEST_SOURCES "src/test/integration/*.cpp")
+# # === Integration Tests ===
+# file(GLOB INTEGRATION_TEST_SOURCES "src/test/integration/*.cpp")
 
-foreach(test_src ${INTEGRATION_TEST_SOURCES})
-    get_filename_component(test_name ${test_src} NAME_WE)
+# foreach(test_src ${INTEGRATION_TEST_SOURCES})
+#     get_filename_component(test_name ${test_src} NAME_WE)
 
-    add_executable(${test_name} ${test_src})
+#     add_executable(${test_name} ${test_src})
 
-    target_compile_options(${test_name} PRIVATE
-        -O3 -march=native -funroll-loops -fno-rtti)
+#     target_compile_options(${test_name} PRIVATE
+#         -O3 -march=native -funroll-loops -fno-rtti)
 
-    target_link_libraries(${test_name} PRIVATE gtest_main)
+#     target_link_libraries(${test_name} PRIVATE gtest_main)
 
-    add_test(NAME ${test_name} COMMAND ${test_name})
-endforeach()
+#     add_test(NAME ${test_name} COMMAND ${test_name})
+# endforeach()

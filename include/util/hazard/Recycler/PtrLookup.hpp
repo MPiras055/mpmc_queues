@@ -110,12 +110,8 @@ public:
     }
 
 private:
-    /**
-     * @brief Internal cleanup helper.
-     */
-    void cleanup() {
 
-    }
+    void cleanup() {};
 
     T* __restrict data_; // __restrict hint (no aliasing)
     size_t capacity_;

@@ -147,8 +147,8 @@ TEST(DynamicThreadTicketStandalone, MultipleInstancesIndependent) {
     ASSERT_TRUE(dtt1.acquire(t1));
     ASSERT_TRUE(dtt2.acquire(t2));
 
-    EXPECT_NE(t1, DynamicThreadTicket::INVALID_ID);
-    EXPECT_NE(t2, DynamicThreadTicket::INVALID_ID);
+    EXPECT_NE(t1, DynamicThreadTicket::NO_TICKET);
+    EXPECT_NE(t2, DynamicThreadTicket::NO_TICKET);
 
     dtt1.release();
     dtt2.release();

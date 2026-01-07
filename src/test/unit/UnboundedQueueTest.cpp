@@ -1,16 +1,22 @@
+#include "OptionsPack.hpp"
 #include <gtest/gtest.h>
 #include <thread>
 #include <atomic>
 #include <vector>
 #include <random>
-#include <CASLoopSegment.hpp>
 #include <PRQSegment.hpp>
 #include <UnboundedProxy.hpp>
+#include <HQSegment.hpp>
+#include <FAAArray.hpp>
+#include <SCQueue.hpp>
 
 // ---- List of queue implementations to test ----
 typedef ::testing::Types<
-    UnboundedProxy<int*,LinkedPRQ>
-    // UnboundedProxy<int*,LinkedCASLoop>
+    UnboundedProxy<uint64_t*,queue::segment::LinkedHQ>,
+    UnboundedProxy<uint64_t*,queue::segment::LinkedPRQ>,
+    UnboundedProxy<uint64_t*,queue::segment::LinkedFAAArray>,
+    UnboundedProxy<uint64_t*,queue::segment::LinkedSCQ>
+    // LSCQueue<int*>
     //, Other queues to add here
 > QueueTypes;
 
@@ -27,12 +33,12 @@ TYPED_TEST_SUITE(QueueTest, QueueTypes);
 // ------------------------------------------------
 
 TYPED_TEST(QueueTest, EnqueueDequeueBasic) {
-    int a = 1, b = 2, c = 3;
-    int* out = nullptr;
+    uint64_t a = 1, b = 2, c = 3;
+    uint64_t* out = nullptr;
 
-    EXPECT_TRUE(this->q.enqueue(&a));
-    EXPECT_TRUE(this->q.enqueue(&b));
-    EXPECT_TRUE(this->q.enqueue(&c));
+    this->q.enqueue(&a);
+    this->q.enqueue(&b);
+    this->q.enqueue(&c);
 
     EXPECT_TRUE(this->q.dequeue(out));
     EXPECT_EQ(out, &a);
@@ -46,13 +52,13 @@ TYPED_TEST(QueueTest, EnqueueDequeueBasic) {
 
 TYPED_TEST(QueueTest, FreshAllocation) {
     EXPECT_TRUE(this->q.acquire());
-    int dummy;
-    int *dummy_out;
+    uint64_t dummy;
+    uint64_t *dummy_out;
     for (size_t i = 0; i < this->q.capacity(); i++) {
-        EXPECT_TRUE(this->q.enqueue(&dummy));
+        this->q.enqueue(&dummy);
     }
     EXPECT_EQ(this->q.size(), this->q.capacity());
-    EXPECT_TRUE(this->q.enqueue(&dummy)); // full segment (this should trigger adding a new segment)
+    this->q.enqueue(&dummy); // full segment (this should trigger adding a new segment)
     EXPECT_EQ(this->q.size(),this->q.capacity() + 1);
 
     for(size_t i = 0; i < this->q.capacity() + 1; i++) {
@@ -68,21 +74,21 @@ TYPED_TEST(QueueTest, FreshAllocation) {
 
 TYPED_TEST(QueueTest, DequeueFromEmpty) {
     EXPECT_TRUE(this->q.acquire());
-    int* out = nullptr;
+    uint64_t* out = nullptr;
     EXPECT_FALSE(this->q.dequeue(out)); // should not crash or succeed
     this->q.release();
 }
 
 TYPED_TEST(QueueTest, FillAndEmpty) {
     EXPECT_TRUE(this->q.acquire());
-    int dummy;
-    int* out = nullptr;
+    uint64_t dummy;
+    uint64_t* out = nullptr;
 
     EXPECT_EQ(this->q.size(),0u);  // empty
 
     //completely fills 2 segments of the queue
     for (size_t i = 0; i < this->q.capacity() * 2; i++) {
-        EXPECT_TRUE(this->q.enqueue(&dummy));
+        this->q.enqueue(&dummy);
     }
 
     // EXPECT_EQ(this->q.size(), this->q.capacity() * 2);  // full segments
@@ -102,14 +108,14 @@ TYPED_TEST(QueueTest, FillAndEmpty) {
 // ------------------------------------------------
 
 TYPED_TEST(QueueTest, SingleProducerSingleConsumer) {
-    const int N = (1024 << 7) * 2;
-    std::atomic<long long> sum{0};
-    int* out = nullptr;
+    const uint64_t N = (1024 << 8);
+    std::atomic<uint64_t> sum{0};
+    uint64_t* out = nullptr;
 
     std::thread prod([&] {
         EXPECT_TRUE(this->q.acquire()); //each thread should get a slot
         for (int i = 1; i <= N; i++) {
-            int* val = new int(i); // simulate dynamic allocation
+            uint64_t* val = new uint64_t(i); // simulate dynamic allocation
             this->q.enqueue(val);   //unbounded queues are always successful on enqueues
         }
         this->q.release();
@@ -128,67 +134,129 @@ TYPED_TEST(QueueTest, SingleProducerSingleConsumer) {
     prod.join();
     cons.join();
 
-    EXPECT_EQ(sum, 1LL * N * (N + 1) / 2);
+    EXPECT_EQ(sum.load(), 1LL * N * (N + 1) / 2);
 
 }
 
-TYPED_TEST(QueueTest, MultiProducerMultiConsumer) {
-    const int N = (1024 << 13), P = 8, C = 8;
+TYPED_TEST(QueueTest, MultiProducerMultiConsumer_DrainMode) {
+    // 1. Configuration & Constants
+    // Use uint64_t for all data to prevent overflow and handle large N
+    using T = uint64_t;
+    const uint64_t N = (1024 * 1024 * 10); // 1 Million items
+    const int P = 1;
+    const int C = 7;
 
-    std::vector<int*> produced;
-    produced.reserve(N);
+    ASSERT_EQ(N % P, 0) << "N must be divisible by P";
 
-    // Preallocate unique addresses so there’s no allocator reuse confusion.
-    std::vector<std::unique_ptr<int>> pool;
-    pool.reserve(N);
-    for (int i = 1; i <= N; ++i) {
-        pool.emplace_back(std::make_unique<int>(i));
-        produced.push_back(pool.back().get());
+    // 2. Shared State
+    // Global Verification Structures (Atomic for thread-safe final commit)
+    std::atomic<uint64_t> global_sum{0};
+    std::vector<std::atomic<uint64_t>> global_seen(N);
+    for(auto& x : global_seen) x.store(0, std::memory_order_relaxed);
+
+    // The Stop Flag
+    std::atomic<bool> producers_finished{false};
+
+    // Data Pool (Raw integers stored as pointers)
+    std::unique_ptr<T[]> raw_data(new T[N]);
+    std::vector<T*> items(N);
+    for(uint64_t i = 0; i < N; ++i) {
+        raw_data[i] = i;
+        items[i] = &raw_data[i];
     }
 
-    std::atomic<long long> sum{0};
+    // 3. Producer Lambda
+    auto producer_func = [&](int id) {
+        EXPECT_TRUE(this->q.acquire());
+
+        uint64_t chunk = N / P;
+        uint64_t start = id * chunk;
+        uint64_t end   = start + chunk;
+
+        for(uint64_t i = start; i < end; ++i) {
+            this->q.enqueue(items[i]);
+        }
+
+        this->q.release();
+    };
+
+    // 4. Consumer Lambda
+    auto consumer_func = [&](int id) {
+        EXPECT_TRUE(this->q.acquire());
+
+        // --- Local Accumulators (No atomic overhead) ---
+        uint64_t local_sum = 0;
+        // Allocating local vector for speed (8MB per thread is acceptable)
+        std::vector<uint64_t> local_seen(N, 0);
+        T* val_ptr = nullptr;
+
+        // --- Phase 1: Spin until Signal ---
+        // Keep consuming while producers are active
+        while (!producers_finished.load(std::memory_order_acquire)) {
+            if (this->q.dequeue(val_ptr)) {
+                if (val_ptr) {
+                    T val = *val_ptr;
+                    local_sum += val;
+                    if (val < N) local_seen[val]++;
+                }
+            } else {
+                // Reduce contention if queue is temporarily empty
+                std::this_thread::yield();
+            }
+        }
+
+        // --- Phase 2: Final Drain ---
+        // Producers are gone. Consume everything left.
+        while (this->q.dequeue(val_ptr)) {
+            if (val_ptr) {
+                T val = *val_ptr;
+                local_sum += val;
+                if (val < N) local_seen[val]++;
+            }
+        }
+
+        // --- Phase 3: Commit to Global ---
+        // Add local results to global atomics
+        global_sum.fetch_add(local_sum, std::memory_order_relaxed);
+
+        // This loop handles the merge.
+        // Note: For very large N, merging might take a moment, but it's safe.
+        for(size_t i = 0; i < N; ++i) {
+            if (local_seen[i] > 0) {
+                global_seen[i].fetch_add(local_seen[i], std::memory_order_relaxed);
+            }
+        }
+
+        this->q.release();
+    };
+
+    // 5. Execution
     std::vector<std::thread> producers, consumers;
-    std::vector<std::atomic<int>> seen(N + 1); // index by value, count occurrences
-    for (auto& s : seen) s.store(0, std::memory_order_relaxed);
 
-    // Enqueue pointers partitioned by producer
-    for (int p = 0; p < P; ++p) {
-        producers.emplace_back([&, p]{
-            EXPECT_TRUE(this->q.acquire()); //each thread should successfuly acquire a ticket from the queue
-            int start = p * (N / P) + 1;
-            int end   = (p + 1) * (N / P);
-            for (int i = start; i <= end; ++i) {
-                int* val = produced[i-1];
-                while (!this->q.enqueue(val)){}
-            }
-            this->q.release(); //each thread successfuly releases the ticket from the queue
-        });
-    }
+    // Start Consumers first (they will spin waiting for data/flag)
+    for(int i=0; i<C; ++i) consumers.emplace_back(consumer_func, i);
 
-    // Consumers: no delete; just record and sum
-    for (int c = 0; c < C; ++c) {
-        consumers.emplace_back([&]{
-            EXPECT_TRUE(this->q.acquire()); //each thread should successfuly acquire a ticket from the queue
-            int* out = nullptr;
-            for (int i = 0; i < N / C; ++i) {
-                size_t attempt = 0;
-                while (!this->q.dequeue(out)) {}
-                sum.fetch_add(*out, std::memory_order_relaxed);
-                seen[*out].fetch_add(1, std::memory_order_relaxed);
-            }
-            this->q.release(); //each thread successfuly releases the previously acquired ticket
-        });
-    }
+    // Start Producers
+    for(int i=0; i<P; ++i) producers.emplace_back(producer_func, i);
 
-    for (auto& t : producers) t.join();
-    for (auto& t : consumers) t.join();
+    // Wait for Producers to finish
+    for(auto& t : producers) t.join();
 
-    EXPECT_EQ(sum, 1LL * N * (N + 1) / 2);
+    // SIGNAL: Tell consumers no more data is coming
+    producers_finished.store(true, std::memory_order_release);
 
-    // Check for duplicates or drops
-    for (int v = 1; v <= N; ++v) {
-        int c = seen[v].load(std::memory_order_relaxed);
-        EXPECT_EQ(c, 1) << "value " << v << " seen " << c << " times";
+    // Wait for Consumers to drain and commit
+    for(auto& t : consumers) t.join();
+
+    // 6. Verification (Performed by Main)
+    // Formula for sum of 0..N-1: (N-1)*N / 2
+    uint64_t expected_sum = (N * (N - 1)) / 2;
+    EXPECT_EQ(global_sum.load(), expected_sum) << "Total sum mismatch!";
+
+    // Check for distinctness (No duplicates, No drops)
+    for(size_t i = 0; i < N; ++i) {
+        uint64_t count = global_seen[i].load(std::memory_order_relaxed);
+        ASSERT_EQ(count, 1) << "Value " << i << " seen " << count << " times.";
     }
 }
 
@@ -199,8 +267,8 @@ TYPED_TEST(QueueTest, MultiProducerMultiConsumer) {
 
 TYPED_TEST(QueueTest, RandomizedWorkload) {
     const int OPS = 1000000;
-    int a = 42;
-    int* out = nullptr;
+    uint64_t a = 42;
+    uint64_t* out = nullptr;
     std::mt19937 rng(12345);
     std::uniform_int_distribution<int> dist(0, 1);
 

@@ -1,8 +1,6 @@
 #pragma once
 #include <atomic>
 #include <cassert>
-#include <atomic>
-#include <cassert>
 #include <specs.hpp>            //  padding and compatibility def
 #include <IQueue.hpp>           //  base queue interface
 #include <ILinkedSegment.hpp>   //  base linked segment interface
@@ -22,8 +20,8 @@ struct PRQOption {
 };
 
 // Forward declaration
-template<typename T, typename Proxy, typename Opt, typename NextT>
-class LinkedPRQ;
+// template<typename T, typename Proxy, typename Opt, typename NextT>
+// class LinkedPRQ;
 
 /**
  * @brief Lock-free queue implementation using fetch-add loop
@@ -45,7 +43,7 @@ class PRQueue: public base::IQueue<T> {
 
     inline size_t mod(uint64_t i) const noexcept {
         if constexpr (POW2) {
-            return i & (mask_);
+            return i & mask_;
         } else {
             return i % size_;
         }
@@ -78,14 +76,42 @@ public:
     }
 
     /**
+     * @brief constructs a queue with the given capacity
+     * with an item already installed
+     *
+     * @tparam item:    item to be installed
+     * @param size:     capacity of the queue
+     * @param start:    start offset
+     */
+     explicit PRQueue(T item, size_t size, uint64_t start = 0):
+        size_(POW2 && !bit::is_pow2(size)? bit::next_pow2(size) : size),
+        mask_(POW2 && size_ != 1? (size_ - 1) : 0),
+        array_{new Cell[size_]} {
+        assert(item != nullptr && "Cannot insert nullptr");
+        assert(size_ != 0 && "PRQueue: null capacity");
+        assert(!POW2 || mask_ != 0 && "PRQueue: null bitmask");
+        assert(bit::get_msb(start + size_) == 0ull && "PRQueue: sequence overflow");
+
+        for(uint64_t i = start; i < start + size_; i++) {
+             array_[mod(i)].val.store(nullptr, std::memory_order_relaxed);
+             array_[mod(i)].seq.store(i, std::memory_order_relaxed);
+        }
+
+        array_[mod(start)].val.store(item,std::memory_order_relaxed);
+        array_[mod(start)].seq.store(start + size_,std::memory_order_relaxed);
+        head_.store(start, std::memory_order_relaxed);
+        tail_.store(start + 1, std::memory_order_relaxed);
+     }
+
+    /**
      * @brief Enqueues an item into the queue.
      *
      * @param item Value to insert into the queue.
      * @return true If the enqueue succeeds.
      * @return false If the queue is full or closed.
      */
-    bool enqueue(T item) final override {
-
+    bool enqueue(T item) noexcept override {
+        assert(item != nullptr && "Cannot insert nullptr");
         while(1) {
             uint64_t tailTicket = tail_.fetch_add(1,std::memory_order_relaxed);
             if constexpr(AUTO_CLOSE) {
@@ -133,7 +159,7 @@ public:
      * @return true If the dequeue succeeds.
      * @return false If the queue is empty.
      */
-    bool dequeue(T& container) override {
+    bool dequeue(T& container) noexcept override {
         while(1) {
             uint64_t headTicket = head_.fetch_add(1,std::memory_order_relaxed);
             uint64_t headIndex  = mod(headTicket);
@@ -209,7 +235,7 @@ public:
      *
      * @return Maximum number of elements that can be stored.
      */
-    size_t capacity() const override {
+    size_t capacity() const noexcept override {
         return size_;
     }
 
@@ -222,7 +248,7 @@ public:
      * @return Current number of elements in the queue.
      *
      */
-    size_t size() const override {
+    size_t size() const noexcept override {
         uint64_t t = bit::clear_msb(tail_.load(std::memory_order_relaxed));
         uint64_t h = head_.load(std::memory_order_acquire);
         return t > h? (t - h) : 0;
@@ -262,7 +288,7 @@ private:
      * @note a per-thread reserved pointer has the LSB setted and non
      * null 63-MSB
      */
-    bool isReserved(T ptr) const {
+    bool isReserved(T ptr) const noexcept {
         return (reinterpret_cast<uintptr_t>(ptr) & 1) != 0;
     }
 
@@ -323,12 +349,13 @@ class LinkedPRQ:
 
 public:
     /**
-     * @brief Constructs a linked CAS loop queue segment.
+     * @brief Constructs a linked PRQ segment.
      *
      * @param size Capacity of this segment.
      * @param start Initial sequence number (defaults to 0).
      */
     LinkedPRQ(size_t size, uint64_t start = 0): Base(size,start) {}
+    LinkedPRQ(T item, size_t size, uint64_t start = 0): Base(item,size,start) {}
 
     /// @brief Defaulted destructor.
     ~LinkedPRQ() override = default;
@@ -340,7 +367,7 @@ private:
      *
      * @return Pointer to the next segment, or nullptr if none.
      */
-    Next getNext() const override {
+    Next getNext() const noexcept override  {
         return next_.load(std::memory_order_acquire);
     }
 
@@ -354,7 +381,7 @@ private:
     /**
      * @brief closes the queue to further insertions (until open() is called)
      */
-    bool close() final override {
+    bool close() noexcept final override {
         Base::tail_.fetch_or(bit::set_msb(uint64_t{0}),std::memory_order_acq_rel);
         return true;
     }
@@ -368,7 +395,7 @@ private:
      * @warning it is supposed that this method gets called on a fully drained queue,
      * undefined behaviour can occur if it's not the case.
      */
-    bool open() final override {
+    bool open() noexcept final override {
         uint64_t tail = Base::tail_.load(std::memory_order_relaxed);
         if(bit::get_msb(tail) != 0) {
             uint64_t head = Base::head_.load(std::memory_order_relaxed);
@@ -382,14 +409,14 @@ private:
     /**
      * @brief checks if the segment is closed to further insertions
      */
-    bool isClosed() const final override {
+    bool isClosed() const noexcept final override {
         return is_closed_(Base::tail_);
     }
 
     /**
      * @brief checks if the segment is open to further insertions
      */
-    bool isOpened() const final override {
+    bool isOpened() const noexcept final override {
         return !isClosed();
     }
 
@@ -398,12 +425,12 @@ private:
     /// @param bool info: if true check if the segment is closed before attempting the operation
     ///
     /// @note: this is necessary to prevent thrashing indexes that can lead to livelock of the segment
-    bool enqueue(T item, [[maybe_unused]] bool info = false) final override {
+    bool enqueue(T item, [[maybe_unused]] bool info = false) noexcept final override {
         return info && isClosed()? false : Base::enqueue(item);
     }
 
     /// @brief dequeue with additional info
-    bool dequeue(T item, [[maybe_unused]] bool info = true) final override {
+    bool dequeue(T& item, [[maybe_unused]] bool info = true) noexcept final override {
         return Base::dequeue(item);
     }
 
