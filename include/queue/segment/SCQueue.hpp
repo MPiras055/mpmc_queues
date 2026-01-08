@@ -214,9 +214,11 @@ private:
         return true;
     }
 
+
     inline bool enqueue(T item, [[maybe_unused]] bool info = false) noexcept final override {
-        return Base::enqueue(item);
+        return info && isClosed()? false : Base::enqueue(item);
     }
+
 
     /// @brief dequeue with additional info
     inline bool dequeue(T& item, [[maybe_unused]] bool info = true) noexcept final override {

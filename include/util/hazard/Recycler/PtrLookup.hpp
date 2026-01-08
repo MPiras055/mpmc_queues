@@ -111,7 +111,21 @@ public:
 
 private:
 
-    void cleanup() {};
+    void cleanup() {
+        if (data_) {
+            // 1. Manually call the destructor for each constructed object.
+            // It is standard practice to destroy in reverse order of construction.
+            for (size_t i = capacity_; i > 0; --i) {
+                data_[i - 1].~T();
+            }
+
+            // 2. Free the raw memory using the matching operator.
+            // We cast to void* to emphasize we are deallocating raw bytes,
+            // preventing the compiler from trying to call destructors again.
+            ::operator delete[](static_cast<void*>(data_));
+        }
+
+    };
 
     T* __restrict data_; // __restrict hint (no aliasing)
     size_t capacity_;

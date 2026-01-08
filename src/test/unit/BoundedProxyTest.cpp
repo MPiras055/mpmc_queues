@@ -32,16 +32,16 @@ using namespace meta;
 // ---- List of queue implementations to test ----
 template<typename V>
 using QueueTypes = ::testing::Types<
-    // BoundedCounterProxy<V,queue::segment::LinkedPRQ,OptionsPack<BoundedCounterProxyOpt::ChunkFactor<SEGMENTS>>>,
-    // BoundedCounterProxy<V,queue::segment::LinkedHQ,OptionsPack<BoundedCounterProxyOpt::ChunkFactor<SEGMENTS>>>,
+    BoundedCounterProxy<V,queue::segment::LinkedPRQ,OptionsPack<BoundedCounterProxyOpt::ChunkFactor<SEGMENTS>>>,
+    BoundedCounterProxy<V,queue::segment::LinkedHQ,OptionsPack<BoundedCounterProxyOpt::ChunkFactor<SEGMENTS>>>,
     BoundedCounterProxy<V,queue::segment::LinkedSCQ,OptionsPack<BoundedCounterProxyOpt::ChunkFactor<SEGMENTS>>>,
-    // BoundedCounterProxy<V,queue::segment::LinkedFAAArray,OptionsPack<BoundedCounterProxyOpt::ChunkFactor<SEGMENTS>>>,
-    // BoundedCounterProxy<V,queue::segment::LinkedCASLoop,OptionsPack<BoundedCounterProxyOpt::ChunkFactor<SEGMENTS>>>,
-    // BoundedChunkProxy<V,queue::segment::LinkedPRQ>,
-    // BoundedChunkProxy<V,queue::segment::LinkedHQ>,
-    BoundedChunkProxy<V,queue::segment::LinkedSCQ>
-    // BoundedChunkProxy<V,queue::segment::LinkedFAAArray>,
-    // BoundedChunkProxy<V,queue::segment::LinkedCASLoop>
+    BoundedCounterProxy<V,queue::segment::LinkedFAAArray,OptionsPack<BoundedCounterProxyOpt::ChunkFactor<SEGMENTS>>>,
+    BoundedCounterProxy<V,queue::segment::LinkedCASLoop,OptionsPack<BoundedCounterProxyOpt::ChunkFactor<SEGMENTS>>>,
+    BoundedChunkProxy<V,queue::segment::LinkedPRQ>,
+    BoundedChunkProxy<V,queue::segment::LinkedHQ>,
+    BoundedChunkProxy<V,queue::segment::LinkedSCQ>,
+    BoundedChunkProxy<V,queue::segment::LinkedFAAArray>,
+    BoundedChunkProxy<V,queue::segment::LinkedCASLoop>
 
     //, Other queues to add here
 >;

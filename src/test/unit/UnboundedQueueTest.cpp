@@ -1,4 +1,3 @@
-#include "OptionsPack.hpp"
 #include <gtest/gtest.h>
 #include <thread>
 #include <atomic>
@@ -9,13 +8,16 @@
 #include <HQSegment.hpp>
 #include <FAAArray.hpp>
 #include <SCQueue.hpp>
+#include <HQSegment.hpp>
+#include <CASLoopSegment.hpp>
 
 // ---- List of queue implementations to test ----
 typedef ::testing::Types<
-    // UnboundedProxy<uint64_t*,queue::segment::LinkedHQ>,
-    // UnboundedProxy<uint64_t*,queue::segment::LinkedPRQ>,
-    // UnboundedProxy<uint64_t*,queue::segment::LinkedFAAArray>,
-    UnboundedProxy<uint64_t*,queue::segment::LinkedSCQ>
+    UnboundedProxy<uint64_t*,queue::segment::LinkedHQ>,
+    UnboundedProxy<uint64_t*,queue::segment::LinkedPRQ>,
+    UnboundedProxy<uint64_t*,queue::segment::LinkedFAAArray>,
+    UnboundedProxy<uint64_t*,queue::segment::LinkedSCQ>,
+    UnboundedProxy<uint64_t*,queue::segment::LinkedCASLoop>
     //, Other queues to add here
 > QueueTypes;
 
