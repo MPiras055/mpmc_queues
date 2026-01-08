@@ -32,7 +32,7 @@ public:
     /// @warning if no slot can be acquired using the data structure results in undefined
     /// behaviour
     ///
-    virtual bool acquire() = 0;
+    virtual bool acquire() noexcept = 0;
 
     /// @brief clears a booked slot
     /// @returns true (always successful)
@@ -40,7 +40,7 @@ public:
     /// @note the method must be idenpotent (calling it multiple times results
     /// in no side effects)
     ///
-    virtual void release() = 0;
+    virtual void release() noexcept = 0;
 };
 
 // ===========================================================

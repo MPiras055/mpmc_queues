@@ -31,6 +31,12 @@ public:
     // =============================
     // Enqueue/Dequeue with checks
     // =============================
+    //
+    // info_required can be overriden by derived implementation in order to
+    // optimize proxies safeEnqueue_ performances (see Bounded<Chunk/Counter/Memory>Proxy::safeEnqueue_ for reference)
+
+    static constexpr bool info_required = false;
+
     virtual bool enqueue(const T item, [[maybe_unused]] bool info) noexcept = 0;
 
     virtual bool dequeue(T& out, [[maybe_unused]] bool info) noexcept = 0;
@@ -66,6 +72,7 @@ public:
     virtual bool isOpened() const noexcept = 0;
 
 
+    //LinkedTag
     using linked_segment_tag = void;
 };
 

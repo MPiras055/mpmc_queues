@@ -6,12 +6,13 @@
 #include <chrono>
 #include <CASLoopSegment.hpp>
 #include <PRQSegment.hpp>
-#include <BoundedCounterProxy.hpp>
+#include <SCQueue.hpp>
 
 // ---- List of queue implementations to test ----
 typedef ::testing::Types<
+    queue::SCQueue<int*>
     // CASLoopQueue<int*>,
-    PRQueue<int*>
+    // PRQueue<int*>
     //, Other queues to add here
 > QueueTypes;
 
@@ -125,7 +126,7 @@ TYPED_TEST(QueueTest, SingleProducerSingleConsumer) {
 }
 
 TYPED_TEST(QueueTest, MultiProducerMultiConsumer) {
-    const int N = 2000000, P = 4, C = 4, MAX_SLEEP = 5;
+    const int N = 1024 * 1024 * 8, P = 4, C = 4, MAX_SLEEP = 5;
 
     std::vector<int*> produced;
     produced.reserve(N);

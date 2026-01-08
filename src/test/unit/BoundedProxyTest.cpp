@@ -7,7 +7,10 @@
 #include <PRQSegment.hpp>
 #include <BoundedCounterProxy.hpp>
 #include <BoundedChunkProxy.hpp>
-#include <BoundedMemProxy.hpp>
+// #include <BoundedMemProxy.hpp>
+#include <HQSegment.hpp>
+#include <SCQueue.hpp>
+#include <FAAArray.hpp>
 #include <IProxy.hpp>
 
 struct Data {
@@ -23,12 +26,22 @@ static constexpr size_t SEGMENTS = 4;
 static constexpr size_t FULL_CAPACITY = 1024 * 16;
 static constexpr size_t SEG_CAPACITY = FULL_CAPACITY / SEGMENTS;
 
+using namespace meta;
+
 // ---- List of queue implementations to test ----
 template<typename V>
 using QueueTypes = ::testing::Types<
-    BoundedChunkProxy<V,LinkedPRQ,SEGMENTS>,
-    BoundedCounterProxy<V,LinkedPRQ,SEGMENTS>,
-    BoundedMemProxy<V,LinkedPRQ,SEGMENTS>
+    BoundedCounterProxy<V,queue::segment::LinkedPRQ,OptionsPack<BoundedCounterProxyOpt::ChunkFactor<SEGMENTS>>>,
+    BoundedCounterProxy<V,queue::segment::LinkedHQ,OptionsPack<BoundedCounterProxyOpt::ChunkFactor<SEGMENTS>>>,
+    BoundedCounterProxy<V,queue::segment::LinkedSCQ,OptionsPack<BoundedCounterProxyOpt::ChunkFactor<SEGMENTS>>>,
+    BoundedCounterProxy<V,queue::segment::LinkedFAAArray,OptionsPack<BoundedCounterProxyOpt::ChunkFactor<SEGMENTS>>>,
+    BoundedCounterProxy<V,queue::segment::LinkedCASLoop,OptionsPack<BoundedCounterProxyOpt::ChunkFactor<SEGMENTS>>>,
+    BoundedChunkProxy<V,queue::segment::LinkedPRQ>,
+    BoundedChunkProxy<V,queue::segment::LinkedHQ>,
+    BoundedChunkProxy<V,queue::segment::LinkedSCQ>,
+    BoundedChunkProxy<V,queue::segment::LinkedFAAArray>,
+    BoundedChunkProxy<V,queue::segment::LinkedCASLoop>
+
     //, Other queues to add here
 >;
 
@@ -97,7 +110,7 @@ TYPED_TEST(Semantics,EnqueueDequeueBasic) {
 TYPED_TEST(Semantics, SegmentLinking) {
     const size_t batchSize = this->q.capacity();
     auto batch = std::vector<Data>(batchSize, {0, 0});
-    const size_t Segments = this->q.Segments; // static constexpr member
+    const size_t Segments = this->q.ChunkFactor; // static constexpr member
     const size_t SegmentCapacity = batchSize / Segments;
 
     // Check no rounding error in division
@@ -255,6 +268,10 @@ TYPED_TEST(Concurrency,MultiProducerMultiConsumer) {
         }
         producerBarrier.arrive_and_wait();  //now producers are joinable (automatic)
         //expect items count to match
+        Data * dummy;
+        EXPECT_TRUE(this->q.acquire());
+        EXPECT_FALSE(this->q.dequeue(dummy));
+        this->q.release();
         EXPECT_EQ(N,consumerItems.load());
     };
 

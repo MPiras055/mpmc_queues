@@ -84,6 +84,12 @@ public:
         tail_.store(start, std::memory_order_relaxed);
     }
 
+    CASLoopQueue(T item, size_t size, uint64_t start = 0): CASLoopQueue(size, start) {
+        array_[mod(0)].val.store(item, std::memory_order_relaxed);
+        array_[mod(0)].seq.store(start + 1,std::memory_order_relaxed);
+        tail_.fetch_add(1,std::memory_order_release);
+        }
+
     /**
      * @brief Enqueues an item into the queue.
      *
@@ -94,7 +100,7 @@ public:
      * @return true If the enqueue succeeds.
      * @return false If the queue is full or closed.
      */
-        bool enqueue(T item) final override {
+        bool enqueue(T item) noexcept final override {
         uint64_t tailTicket, seq;
         size_t index;
 
@@ -145,7 +151,7 @@ public:
      * @return true If the dequeue succeeds.
      * @return false If the queue is empty.
      */
-    bool dequeue(T& container) final override {
+    bool dequeue(T& container) noexcept final override {
         uint64_t headTicket, seq;
         size_t index;
         do {
@@ -177,7 +183,7 @@ public:
      *
      * @return Maximum number of elements that can be stored.
      */
-    size_t capacity() const override {
+    size_t capacity() const noexcept override {
         return size_;
     }
 
@@ -189,7 +195,7 @@ public:
      *
      * @return Current number of elements in the queue.
      */
-    size_t size() const override {
+    size_t size() const noexcept override {
         return bit::clear_msb(tail_.load(std::memory_order_acquire)) - head_.load(std::memory_order_acquire);
     }
 
@@ -256,6 +262,8 @@ public:
      */
     LinkedCASLoop(size_t size, uint64_t start = 0): Base(size,start) {}
 
+    LinkedCASLoop(T item,size_t size, uint64_t start = 0): Base(item,size,start) {}
+
     /// @brief Defaulted destructor.
     ~LinkedCASLoop() override = default;
 
@@ -265,7 +273,7 @@ protected:
      *
      * @return Pointer to the next segment, or nullptr if none.
      */
-    Next getNext() const override {
+    Next getNext() const noexcept final override {
         return next_.load(std::memory_order_acquire);
     }
 
@@ -285,7 +293,7 @@ protected:
      * @warning it is supposed that this method gets called on a fully drained queue,
      * undefined behaviour can occur if it's not the case.
      */
-    bool open() final override {
+    bool open() noexcept final override {
         uint64_t tail = Base::tail_.load(std::memory_order_relaxed);
         if(bit::get_msb(tail) != 0) {
             uint64_t head = Base::head_.load(std::memory_order_relaxed);
@@ -299,7 +307,7 @@ protected:
     /**
      * @brief closes the queue to further insertions (until open() is called)
      */
-    bool close() final override {
+    bool close() noexcept final override {
         Base::tail_.fetch_or(bit::set_msb(uint64_t{0}),std::memory_order_acq_rel);
         return true;
     }
@@ -307,26 +315,26 @@ protected:
     /**
      * @brief checks if the segment is closed to further insertions
      */
-    bool isClosed() const final override {
+    inline bool isClosed() const noexcept final override {
         return is_closed_(Base::tail_);
     }
 
     /**
      * @brief checks if the segment is closed to further insertions
      */
-    bool isOpened() const final override {
+    inline bool isOpened() const noexcept final override {
         return !isClosed();
     }
 
     /// @brief enqueue with additional info
     /// @note same as base segment for this implementation
-    bool enqueue(T item, [[maybe_unused]] bool info = true) final override {
+    inline bool enqueue(T item, [[maybe_unused]] bool info = true) noexcept final override {
         return Base::enqueue(item);
     }
 
     /// @brief dequeue with additional info
     /// @note same as base segment for this implementation
-    bool dequeue(T item, [[maybe_unused]] bool info = true) final override {
+    inline bool dequeue(T& item, [[maybe_unused]] bool info = true) noexcept final override {
         return Base::dequeue(item);
     }
 

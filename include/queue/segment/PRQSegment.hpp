@@ -348,6 +348,8 @@ class LinkedPRQ:
     static_assert(!Opt::template has<PRQOption::DisableAutoClose>,"LinkedPRQ: AutoClose disabled");
 
 public:
+    static constexpr bool info_required = true;
+
     /**
      * @brief Constructs a linked PRQ segment.
      *

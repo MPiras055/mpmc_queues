@@ -176,7 +176,7 @@ public:
         assert(tid < maxThreads_ && hpid < HV_MAX_HPS);
         while(true) {
             T tmp = atom.load(std::memory_order_acquire);
-            storage_[tid].data[hpid].store(tmp,std::memory_order_release);
+            storage_[tid].data()[hpid].store(tmp,std::memory_order_release);
             if(atom.load(std::memory_order_acquire) == tmp) {
                 return tmp;
             }

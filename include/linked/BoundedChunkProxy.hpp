@@ -1,29 +1,57 @@
 #include <IProxy.hpp>               //proxy interface
 #include <DynamicThreadTicket.hpp>  //cached thread tickets for hazard pointers
 #include <HazardVector.hpp>         //basic hazard pointer implementation
+#include <atomic>
 #include <specs.hpp>                //padding definition
 #include <bit.hpp>                  //bit manipulation
+#include <OptionsPack.hpp>          //Options
+
+
+struct BoundedChunkProxyOpt {
+    template<size_t N> struct ChunkFactor{};
+};
 
 template <
     typename T,
-    template<typename,typename,bool,bool> typename Seg,
-    size_t Seg_count = 4,
-    bool Pow2 = false
+    template<typename,typename,typename,typename> typename Seg,
+    typename ProxyOpt   = meta::EmptyOptions,
+    typename SegmentOpt = meta::EmptyOptions
 >
-class BoundedChunkProxy: public base::IProxy<T,Seg> {
-    using Segment = Seg<T, BoundedChunkProxy,Pow2,true>;
-    using ThreadRecord = std::atomic<int64_t>;  //for accurate length computation
+class BoundedChunkProxy:
+    public base::IProxy<T,Seg<T,void,SegmentOpt,ProxyOpt>> {
+    using Segment = Seg<T, BoundedChunkProxy,SegmentOpt,void>;
+    static constexpr bool INFO_REQUIRED = Segment::info_required;
     using Ticket = util::threading::DynamicThreadTicket::Ticket;    //ticket for thread access
-    static_assert(Seg_count != 0, "Chunk factor cannot be 0");
+
+    struct ThreadMetadata { //the whole struct gets automatically aligned and padded to cache Line;
+        std::atomic_int64_t OpCounter{0};
+        uint64_t lastSeen{0};
+    };
+
+
+    inline bool dequeueAfterNextLinked(Segment* lhead,T& out) {
+        // This is a hack for LinkedSCQ.
+        // See SCQ::prepareDequeueAfterNextLinked for details.
+        if constexpr(requires(Segment s) {
+        s.prepareDequeueAfterNextLinked();
+        }) {
+            lhead->prepareDequeueAfterNextLinked();
+        }
+
+        return lhead->dequeue(out);
+    }
 
 public:
-    static constexpr size_t Segments = Seg_count;
+
+    static constexpr size_t ChunkFactor = ProxyOpt::template get<BoundedChunkProxyOpt::ChunkFactor,4>;
+    static_assert(ChunkFactor > 1, "ChunkFactor must be greater than 1 === queue capacity must be a direct multiple of ChunkFactor");
+
     explicit BoundedChunkProxy(size_t cap, size_t maxThreads) :
-        ticketing_{maxThreads},hazard_{maxThreads},seg_capacity_{cap / Seg_count},full_capacity_{cap} {
+        ticketing_{maxThreads},hazard_{maxThreads},seg_capacity_{cap / ChunkFactor} {
         assert(cap != 0 && "Segment Capacity must be non-null");
-        assert(cap / Seg_count > 0 && "Underlying segment capacity overflow");
-        assert(maxThreads > 0 && "Cannot manage 0 threads");
-        Segment* sentinel = new Segment(seg_capacity_,0);
+        assert(cap % ChunkFactor == 0 && "Queue capacity must be a direct multiple of ChunkFactor");
+        assert(cap / ChunkFactor > 0 && "Queue capacity must be a direct multple of ChunkFactor");
+        Segment* sentinel = new Segment(seg_capacity_);
         head_.store(sentinel,std::memory_order_relaxed);
         tail_.store(sentinel,std::memory_order_relaxed);
     }
@@ -31,7 +59,7 @@ public:
     ~BoundedChunkProxy() {
         T ignore;
         while(dequeue(ignore));
-        delete head_.load();
+        delete head_.load(std::memory_order_seq_cst);
     }
 
     bool enqueue(T item) override {
@@ -52,7 +80,7 @@ public:
             }
 
             //try to enqueue on current segment
-            if(safeEnqueue_(tail,item)) {
+            if(safeEnqueue_(tail,ticket,item)) {
                 break;
             }
 
@@ -64,8 +92,7 @@ public:
 
             //enqueue failed: segment is full or stale
             //allocate a new segment and push current item
-            Segment* newTail = new Segment(seg_capacity_, tail->getNextStartIndex());
-            (void)newTail->enqueue(item);
+            Segment* newTail = new Segment(item,seg_capacity_);
 
             Segment* null = nullptr;
             //try to link the private segment as the new tail
@@ -103,13 +130,13 @@ public:
                 }
 
                 //next was setted: try one more time to dequeue on the current segment
-                if(!head->dequeue(out)) {
+                if(!dequeueAfterNextLinked(head,out)) {
                     //if dequeue failed then no-one will enqueue on this segment
                     //try to update the current head
                     if(head_.compare_exchange_strong(head,next)) {
-                        head_idx_.fetch_add(1,std::memory_order_release);
+                        (void)head_idx_.fetch_add(1,std::memory_order_release);
                         //retire the current segment (delayed - since the caller holds protection)
-                        hazard_.retire(head,ticket);
+                        (void)hazard_.retire(head,ticket);
                         //update protection on the current segment
                         head = hazard_.protect(next,ticket);
                     } else {
@@ -124,26 +151,25 @@ public:
         }
     }
 
-    static std::string toString() {
-        return std::string("BoundedChunk") + Segment::toString();
-    }
-
 
     /**
      * @brief get the underlying segment capacity
      * @returns `size_t` capacity of all segments
+     *
+     * @warning: actual capacity may grow (due to unexpected timing windows) up to
+     * (seg_capacity_ + 1) * ChunkFactor;
      */
-    size_t capacity() const override { return full_capacity_; }
+    size_t capacity() const override { return seg_capacity_ * ChunkFactor; }
 
     /**
      * @brief size method
      *
      * @note doesn't require a thread to have acquired an operational slot
      */
-    size_t size() const override {
+    size_t size() const noexcept final override {
         int64_t total = 0;
-        hazard_.metadataIter([&total](const std::atomic<int64_t>& m) {
-            total += m.load(std::memory_order_relaxed);
+        hazard_.metadataIter([&total](const ThreadMetadata& m) {
+            total += m.OpCounter.load(std::memory_order_relaxed);
         });
         assert(total >= 0 && "Negative size detected");
         return static_cast<size_t>(total);
@@ -160,7 +186,7 @@ public:
      * @warning operating on the data structure without acquiring a slot results in
      * undefined behaviour
      */
-    bool acquire() override {
+    bool acquire() noexcept final override {
         Ticket ignore;
         return ticketing_.acquire(ignore);
 
@@ -173,7 +199,7 @@ public:
      * @note this method is idempotent (calling it multiple times results in no
      * side effects)
      */
-    void release() override {
+    void release() noexcept final override {
         return ticketing_.release();
     }
 
@@ -182,15 +208,15 @@ private:
     /**
     * @brief records an enqueue in the caller thread metadata section
     */
-    inline void recordEnqueue(Ticket t) {
-        hazard_.getMetadata(t).fetch_add(1,std::memory_order_relaxed);
+    inline void recordEnqueue(Ticket t) noexcept {
+        hazard_.getMetadata(t).OpCounter.fetch_add(1,std::memory_order_relaxed);
     }
 
     /**
     * @brief records a dequeue in the caller thread metadata section
     */
-    inline void recordDequeue(Ticket t) {
-        hazard_.getMetadata(t).fetch_sub(1,std::memory_order_relaxed);
+    inline void recordDequeue(Ticket t) noexcept {
+        hazard_.getMetadata(t).OpCounter.fetch_sub(1,std::memory_order_relaxed);
     }
 
     /**
@@ -201,26 +227,26 @@ private:
      * can make dequeues have to do extra work (to reallineate indexes) and
      * in some cases lead to livelock phoenomena.
      *
-     * This method uses a TLS cached tail pointer, to avoid calling inner
-     * segment enqueues if the segment was already recorded as close
+     * The Segment::info_required flag allows us to optimize this method for any
+     * given segment
+     *
+     * This method uses a cached pointer (see HazardCell for caching implementation),
+     * and for each segment enqueue call provides the segment with info on whether itself
+     * may be already closed. If enqueue fails then the
      *
      *  @warning requires the pointer to be hazard protected
      */
-    inline bool safeEnqueue_(Segment *tail, T item) {
-    // Thread-local pointer to track the last seen tail that was closed or full
-        static thread_local uint64_t lastSeen = 0;
-
-        if ((lastSeen == tail_idx_.load(std::memory_order_relaxed)) && tail->isClosed()) {
-            return false;  // Don't attempt enqueue if the segment is already closed
+    inline bool safeEnqueue_(Segment *tail, Ticket t, T item) {
+        if constexpr (INFO_REQUIRED) {
+            uint64_t& lastSeen = hazard_.getMetadata(t).lastSeen;
+            uint64_t actualTail = tail_idx_.load(std::memory_order_relaxed);
+            bool info = actualTail == lastSeen;
+            bool enq_ok = tail->enqueue(item,info);
+            lastSeen = enq_ok? 0 : actualTail;
+            return enq_ok;
+        } else {
+            return tail->enqueue(item);
         }
-
-        if (!tail->enqueue(item)) {
-            lastSeen = tail_idx_.load(std::memory_order_acquire);
-            return false;  // Enqueue failed, mark the segment as stale/full
-        }
-
-        lastSeen = 0;
-        return true;
     }
 
 
@@ -234,7 +260,7 @@ private:
         tail = tail_idx_.load(std::memory_order_relaxed);
         head = head_idx_.load(std::memory_order_acquire);
 
-        return ((tail - head) + 1) < Seg_count;
+        return ((tail - head) + 1) < ChunkFactor;
 
     }
 
@@ -259,8 +285,7 @@ private:
     ALIGNED_CACHE std::atomic<uint64_t> head_idx_{1};
     CACHE_PAD_TYPES(std::atomic<uint64_t>);
     util::threading::DynamicThreadTicket ticketing_;
-    util::hazard::HazardVector<Segment*,ThreadRecord> hazard_;
+    util::hazard::HazardVector<Segment*,ThreadMetadata> hazard_;
     const size_t seg_capacity_;
-    const size_t full_capacity_;
 
 };

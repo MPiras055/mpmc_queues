@@ -9,8 +9,8 @@
 template <
     typename T,
     template<typename,typename,typename,typename> typename Seg,
-    typename SegmentOpt,
-    typename ProxyOp
+    typename ProxyOp,
+    typename SegmentOpt
 >
 class UnboundedProxy;
 
@@ -18,12 +18,16 @@ template <
     typename T,
     template<typename,typename,typename,typename> typename Seg,
     typename SegmentOpt = meta::EmptyOptions,
-    typename ProxyOp    = meta::EmptyOptions
+    typename ProxyOpt    = meta::EmptyOptions
 >
-class UnboundedProxy//:
-    // public base::IProxy<T,Seg<T,void,SegmentOpt,ProxyOp>>
+class UnboundedProxy:
+    public base::IProxy<T,Seg<T,void,SegmentOpt,ProxyOpt>>
 {
     using Segment = Seg<T,UnboundedProxy,SegmentOpt,void>;
+
+    struct ThreadMetadata {
+        std::atomic_int64_t opCounter{0};
+    };
 
     inline bool dequeueAfterNextLinked(Segment* lhead,T& out) {
         // This is a hack for LinkedSCQ.
@@ -57,7 +61,10 @@ public:
         delete head_.load();
     }
 
-    void enqueue(T item) {
+    /**
+     * @note boolean value always true: kept for compatibility
+     */
+    bool enqueue(const T item) noexcept final override {
         uint64_t ticket = get_ticket_();
 
         Segment* tail = hazard_.protect(tail_.load(std::memory_order_relaxed), ticket);
@@ -86,8 +93,7 @@ public:
 
             //enqueue failed: segment is full or stale
             //allocate a new segment and push current item
-            Segment* newTail = new Segment(item, seg_capacity_, 0);
-            // (void) newTail->enqueue(item);
+            Segment* newTail = new Segment(item, seg_capacity_);
 
             Segment* null = nullptr;
             //try to link the private segment as the new tail
@@ -104,9 +110,10 @@ public:
 
         hazard_.clear(ticket);
         recordEnqueue(ticket);
+        return true;
     }
 
-    bool dequeue(T& out) {
+    bool dequeue(T& out) noexcept final override {
         uint64_t ticket = get_ticket_();
         Segment *head = hazard_.protect(head_.load(std::memory_order_relaxed),ticket);
         while(1) {
@@ -152,17 +159,16 @@ public:
      * @brief get the underlying segment capacity
      * @returns `size_t` capacity of all segments
      */
-    size_t capacity() const { return seg_capacity_; }
+    size_t capacity() const noexcept final override { return seg_capacity_; }
 
     /**
      * @brief get an approximation of the total number of elements the queue holds
      *
-     * @warning requires the thread to have acquired an operation slot
      */
-    size_t size() const {
+    size_t size() const noexcept final override {
         int64_t total = 0;
-        hazard_.metadataIter([&total](const std::atomic_int64_t& m) {
-            total += m.load(std::memory_order_relaxed);
+        hazard_.metadataIter([&total](const ThreadMetadata& m) {
+            total += m.opCounter.load(std::memory_order_relaxed);
         });
         assert(total >= 0 && "Negative size detected");
         return static_cast<size_t>(total);
@@ -179,7 +185,7 @@ public:
      * @warning operating on the data structure without acquiring a slot results in
      * undefined behaviour
      */
-    bool acquire() {
+    bool acquire() noexcept final override {
         uint64_t ignore;
         return ticketing_.acquire(ignore);
     }
@@ -191,7 +197,7 @@ public:
      * @note this method is idempotent (calling it multiple times results in no
      * side effects)
      */
-    void release() {
+    void release() noexcept final override {
         return ticketing_.release();
     }
 
@@ -222,6 +228,6 @@ private:
     ALIGNED_CACHE std::atomic<Segment*> tail_{};
     CACHE_PAD_TYPES(std::atomic<Segment*>);
     util::threading::DynamicThreadTicket ticketing_;
-    util::hazard::HazardVector<Segment*,std::atomic_int64_t> hazard_;
+    util::hazard::HazardVector<Segment*,ThreadMetadata> hazard_;
     const size_t seg_capacity_;
 };

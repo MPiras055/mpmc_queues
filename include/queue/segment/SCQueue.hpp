@@ -29,10 +29,10 @@ class SCQueue: public base::IQueue<T> {
 
 protected:
     struct alignas(CACHE_LINE) Legacy {
+        const size_t scq_order; //size power of 2
         char *aq_;         //acquired slots
         char *fq_;         //free slots
         T* underlying;    //underlying storage
-        const size_t scq_order; //size power of 2
         CACHE_PAD_TYPES(char*,char*,T*,size_t);
 
         template<typename V>
@@ -67,9 +67,9 @@ protected:
         }
 
         ~Legacy() {
-            if(aq_) std::free(aq_);
-            if(fq_) std::free(fq_);
-            if(underlying) std::free(underlying);
+            if(aq_ != nullptr) std::free(aq_);
+            if(fq_ != nullptr) std::free(fq_);
+            if(underlying != nullptr) std::free(underlying);
         }
 
         // 1. Delete Copy Constructor and Assignment to prevent double-frees
@@ -97,17 +97,18 @@ public:
 
     bool enqueue(T item) noexcept override {
         size_t eidx = lfring_dequeue(lf.fq(), lf.scq_order, false);
-        if constexpr (AUTO_CLOSE) {
-            if (eidx == LFRING_EMPTY) {
+        if (eidx == LFRING_EMPTY) {
+            if constexpr (AUTO_CLOSE) {
                 lfring_close(lf.aq());
-                return false;
             }
+            return false;
         }
+
         lf.underlying[eidx] = item;
         if (lfring_enqueue(lf.aq(), lf.scq_order, eidx, false))
             return true;
 
-        lfring_enqueue(lf.fq(), lf.scq_order, eidx, false);
+        (void) lfring_enqueue(lf.fq(), lf.scq_order, eidx, false);
         return false;
     }
 
