@@ -62,6 +62,7 @@ protected:
             fq_{init_storage<char>(LFRING_SIZE(scq_order))},
             underlying{init_storage<T>(1u << scq_order)}
         {
+            assert(bit::log2(size) >= LFRING_MIN_ORDER && "Size < LFRING_MIN_ORDER");
             lfring_init_empty(aq(), scq_order);
             lfring_init_full(fq(),  scq_order);
         }
@@ -170,6 +171,7 @@ class LinkedSCQ:
     static_assert(!Opt::template has<SCQOption::DisableAutoClose>,"LinkedSCQ: AutoClose disabled");
 
 public:
+    static constexpr bool info_required = true;
     /**
      * @brief Constructs a linked SCQ segment.
      *
@@ -208,6 +210,7 @@ private:
 
     inline bool open() noexcept final override {
         lfring_open(Base::lf.fq());
+        lfring_reset_threshold(Base::lf.fq(),Base::lf.scq_order);
         return true;
     }
 

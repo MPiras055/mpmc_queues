@@ -57,12 +57,10 @@ namespace align {
 #define UNIQUE_NAME(base) CONCAT(base, __COUNTER__)
 
 // Macro: Add padding using objects or sizes
-#define CACHE_PAD(...) \
-    char UNIQUE_NAME(_pad)[align::padding(__VA_ARGS__)]
+#define CACHE_PAD(...) char UNIQUE_NAME(_pad)[align::padding(__VA_ARGS__)]\
 
 // Macro: Add padding using types
-#define CACHE_PAD_TYPES(...) \
-    [[maybe_unused]] char UNIQUE_NAME(_pad)[align::padding_for_types<__VA_ARGS__>()]
+#define CACHE_PAD_TYPES(...) [[maybe_unused]] char UNIQUE_NAME(_pad)[align::padding_for_types<__VA_ARGS__>()]
 
 // Optional: shorthand for aligning a struct
 #define ALIGNED_CACHE alignas(CACHE_LINE)

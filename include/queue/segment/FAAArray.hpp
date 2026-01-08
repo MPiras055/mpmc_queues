@@ -3,7 +3,6 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdlib>
-#include <new>
 #include <cstdint>
 #include <cstring>
 #include <specs.hpp>

@@ -17,6 +17,10 @@
 #include <IProxy.hpp>
 #include <CASLoopSegment.hpp>  // replace with your actual linked segment header
 #include <PRQSegment.hpp>
+#include <SCQueue.hpp>
+#include <HQSegment.hpp>
+#include <FAAArray.hpp>
+#include <OptionsPack.hpp>
 
 // =========================================================
 // Test Proxy
@@ -29,9 +33,9 @@
  *
  * @tparam Seg Linked segment type (e.g., CASLoopSegment<int*>)
  */
-template <typename T, template<typename, typename,bool,bool> typename Seg>
+template <typename T, template<typename,typename,typename,typename> typename Seg>
 struct TestProxy {
-    using Segment = Seg<T, TestProxy,false,true>;
+    using Segment = Seg<T, TestProxy, meta::EmptyOptions,void>;
 
     explicit TestProxy(size_t cap) : seg(cap) {}
 
@@ -52,8 +56,8 @@ private:
 // Test Fixture
 // =========================================================
 typedef ::testing::Types<
-    TestProxy<int *,LinkedCASLoop>,  ///< Replace `void` with actual proxy type if needed
-    TestProxy<int *,LinkedPRQ>
+    TestProxy<int *,queue::segment::LinkedCASLoop>,  ///< Replace `void` with actual proxy type if needed
+    TestProxy<int *,queue::segment::LinkedPRQ>
 > LinkedQueueTypes;
 
 template <typename T>

@@ -33,7 +33,7 @@ class BoundedChunkProxy:
         // This is a hack for LinkedSCQ.
         // See SCQ::prepareDequeueAfterNextLinked for details.
         if constexpr(requires(Segment s) {
-        s.prepareDequeueAfterNextLinked();
+            s.prepareDequeueAfterNextLinked();
         }) {
             lhead->prepareDequeueAfterNextLinked();
         }

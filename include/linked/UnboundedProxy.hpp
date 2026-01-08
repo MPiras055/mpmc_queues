@@ -49,10 +49,11 @@ public:
         head_.store(sentinel,std::memory_order_relaxed);
         tail_.store(sentinel,std::memory_order_relaxed);
 
-        //Initialize thread metadata for accurate length tracking
-        for(size_t i = 0; i < maxThreads; i++) {
-            hazard_.getMetadata(i).store(0,std::memory_order_relaxed);
-        }
+        // //Initialize thread metadata for accurate length tracking
+        // DEBUG: Managed by struct initialization
+        // for(size_t i = 0; i < maxThreads; i++) {
+        //     hazard_.getMetadata(i)..store(0,std::memory_order_relaxed);
+        // }
     }
 
     ~UnboundedProxy() {
@@ -204,11 +205,11 @@ public:
 private:
 
     inline void recordEnqueue(uint64_t t) {
-        hazard_.getMetadata(t).fetch_add(1,std::memory_order_relaxed);
+        hazard_.getMetadata(t).opCounter.fetch_add(1,std::memory_order_relaxed);
     }
 
     inline void recordDequeue(uint64_t t) {
-        hazard_.getMetadata(t).fetch_sub(1,std::memory_order_relaxed);
+        hazard_.getMetadata(t).opCounter.fetch_sub(1,std::memory_order_relaxed);
     }
 
     /**
