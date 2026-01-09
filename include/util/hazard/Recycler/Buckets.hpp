@@ -191,7 +191,7 @@ public:
     }
 
     /*
-    * @brief Dequeues an item using wait-free synchronization and lazy reset.
+    * @brief Dequeues an item using lock-free synchronization and lazy reset.
     * * @details
     * Fetches and adds to the Head (Low bits).
     * If Head >= Tail (Empty), it atomically wipes the Tail (High bits)

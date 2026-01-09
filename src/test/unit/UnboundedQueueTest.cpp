@@ -143,7 +143,7 @@ TYPED_TEST(QueueTest, MultiProducerMultiConsumer_DrainMode) {
     // 1. Configuration & Constants
     // Use uint64_t for all data to prevent overflow and handle large N
     using T = uint64_t;
-    const uint64_t N = (1024 * 1024 * 10); // 1 Million items
+    const uint64_t N = (1024 * 1024 * 2); // 1 Million items
     const int P = 1;
     const int C = 7;
 

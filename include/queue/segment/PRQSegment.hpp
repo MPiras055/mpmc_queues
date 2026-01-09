@@ -8,8 +8,6 @@
 #include <bit.hpp>              //  bit manipulation utilities
 #include <OptionsPack.hpp>      //  options
 
-
-
 namespace queue {
 
 /// Options for the queue

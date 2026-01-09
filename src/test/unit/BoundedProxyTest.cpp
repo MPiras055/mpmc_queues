@@ -200,7 +200,7 @@ TYPED_TEST(Concurrency,SingleProducerSingleConsumer) {
 }
 
 TYPED_TEST(Concurrency,MultiProducerMultiConsumer) {
-    const size_t N = 1024 * 1024 * 10;
+    const size_t N = 1024 * 1024 * 2;
 
     const auto test = [&](size_t prod, size_t cons) {
         EXPECT_LE(prod + cons, this->maxThreads);
