@@ -1,3 +1,5 @@
+//
+
 #pragma once
 
 extern "C" {
@@ -5,14 +7,15 @@ extern "C" {
 #include "lfring_cas1.h"
 }
 
-#pragma once
 #include <cassert>
-#include <specs.hpp>            //  padding and compatibility def
-#include <IQueue.hpp>           //  base queue interface
-#include <ILinkedSegment.hpp>   //  base linked segment interface
-#include <SequencedCell.hpp>    //  cell definition
-#include <bit.hpp>              //  bit manipulation utilities
-#include <OptionsPack.hpp>      //  options
+#include <cstdlib>      // aligned_alloc, free
+#include <new>          // placement new
+#include <specs.hpp>
+#include <IQueue.hpp>
+#include <ILinkedSegment.hpp>
+#include <SequencedCell.hpp>
+#include <bit.hpp>
+#include <OptionsPack.hpp>
 
 namespace queue {
 
@@ -22,79 +25,124 @@ struct SCQOption {
 
 template<typename T, typename Opt = meta::EmptyOptions, typename Derived = void>
 class SCQueue: public base::IQueue<T> {
-    //SCQueue doesn't require pointer items
     using Effective = std::conditional_t<std::is_void_v<Derived>,SCQueue,Derived>;
     static constexpr bool AUTO_CLOSE = !Opt::template has<SCQOption::DisableAutoClose> &&
         base::is_linked_segment_v<Effective>;
 
 protected:
+    // =========================================================================
+    // LEGACY STRUCT (Internal Memory Manager)
+    // =========================================================================
     struct alignas(CACHE_LINE) Legacy {
-        const size_t scq_order; //size power of 2
-        char *aq_;         //acquired slots
-        char *fq_;         //free slots
-        T* underlying;    //underlying storage
-        CACHE_PAD_TYPES(char*,char*,T*,size_t);
+        const size_t scq_order;
 
-        template<typename V>
-        static V* init_storage(size_t size) {
-            assert(size != 0 && "Legacy Init Storage: Size must be non-null");
-            size_t bytes = sizeof(T) * size;
-            if(bytes % CACHE_LINE != 0)
-                bytes += CACHE_LINE - (bytes % CACHE_LINE);
-            V* buffer = static_cast<V*>(std::aligned_alloc(CACHE_LINE,bytes));
-            assert(buffer != nullptr && "Failed aligned_alloc");
-            return buffer;
+        // Pointers into the allocated block
+        char *aq_;          // Acquired slots ring
+        char *fq_;          // Free slots ring
+        T* underlying;      // Data buffer
+
+        // If true, this struct allocated the block and must free it.
+        // If false, the block is part of a larger allocation (LinkedSCQ) and we don't own it.
+        bool owns_memory_;
+        void* memory_block_; // Pointer to the start of the allocated block
+
+        CACHE_PAD_TYPES(char*,char*,T*,size_t, bool, void*);
+
+        // --- Helper to calculate size and offsets ---
+        static size_t align_size(size_t s) {
+            if(s % CACHE_LINE != 0) return s + CACHE_LINE - (s % CACHE_LINE);
+            return s;
         }
 
-        inline struct lfring* aq() const {
-            return reinterpret_cast<struct lfring*>(aq_);
+        static size_t ring_bytes(size_t order) {
+            return align_size(LFRING_SIZE(order));
         }
 
-        inline struct lfring* fq() const {
-            return reinterpret_cast<struct lfring*>(fq_);
+        static size_t buffer_bytes(size_t order) {
+            return align_size(sizeof(T) * (1ull << order));
         }
+
+    public:
+        // Helper to calculate total bytes needed for the rings + buffer
+        static size_t total_bytes_needed(size_t order) {
+            // 2 Rings + 1 Data Buffer
+            return (ring_bytes(order) * 2) + buffer_bytes(order);
+        }
+
+        // --- Layout Initializer ---
+        // Sets up aq_, fq_, underlying based on a base pointer
+        void setup_pointers(void* base, size_t order) {
+            char* ptr = static_cast<char*>(base);
+            size_t r_sz = ring_bytes(order);
+
+            aq_ = ptr;
+            ptr += r_sz;
+
+            fq_ = ptr;
+            ptr += r_sz;
+
+            underlying = reinterpret_cast<T*>(ptr);
+
+            // Initialize the C-rings
+            lfring_init_empty(aq(), order);
+            lfring_init_full(fq(),  order);
+        }
+
+        inline struct lfring* aq() const { return reinterpret_cast<struct lfring*>(aq_); }
+        inline struct lfring* fq() const { return reinterpret_cast<struct lfring*>(fq_); }
 
         Legacy() = delete;
 
+        // 1. STANDARD CONSTRUCTOR (Allocates its own single block)
         explicit Legacy(size_t size):
-            scq_order{bit::log2(size) >= LFRING_MIN_ORDER? bit::log2(size) : 0},
-            aq_{init_storage<char>(LFRING_SIZE(scq_order))},
-            fq_{init_storage<char>(LFRING_SIZE(scq_order))},
-            underlying{init_storage<T>(1u << scq_order)}
+            scq_order{bit::log2(size) >= LFRING_MIN_ORDER? bit::log2(size) : LFRING_MIN_ORDER},
+            owns_memory_{true}
         {
             assert(bit::log2(size) >= LFRING_MIN_ORDER && "Size < LFRING_MIN_ORDER");
-            lfring_init_empty(aq(), scq_order);
-            lfring_init_full(fq(),  scq_order);
+
+            size_t bytes = total_bytes_needed(scq_order);
+            memory_block_ = std::aligned_alloc(CACHE_LINE, bytes);
+            if(!memory_block_) throw std::bad_alloc();
+
+            setup_pointers(memory_block_, scq_order);
+        }
+
+        // 2. INJECTED CONSTRUCTOR (Uses external block from LinkedSCQ::create)
+        Legacy(size_t size, void* external_block) :
+             scq_order{bit::log2(size) >= LFRING_MIN_ORDER? bit::log2(size) : LFRING_MIN_ORDER},
+             owns_memory_{false},
+             memory_block_{external_block}
+        {
+            assert(external_block != nullptr);
+            setup_pointers(memory_block_, scq_order);
         }
 
         ~Legacy() {
-            if(aq_ != nullptr) std::free(aq_);
-            if(fq_ != nullptr) std::free(fq_);
-            if(underlying != nullptr) std::free(underlying);
+            if(owns_memory_ && memory_block_) {
+                std::free(memory_block_);
+            }
         }
 
-        // 1. Delete Copy Constructor and Assignment to prevent double-frees
-        Legacy(const Legacy&) = delete;
-        Legacy& operator=(const Legacy&) = delete;
-
-        // 2. Implement Move Constructor to transfer ownership
+        // Move Semantics
         Legacy(Legacy&& other) noexcept
-            : aq_(other.aq_)
-            , fq_(other.fq_)
-            , underlying(other.underlying)
-            , scq_order(other.scq_order)
+            : scq_order(other.scq_order)
+            , aq_(other.aq_), fq_(other.fq_), underlying(other.underlying)
+            , owns_memory_(other.owns_memory_), memory_block_(other.memory_block_)
         {
-            // Null out the source pointers so the other destructor doesn't free them
+            other.owns_memory_ = false;
+            other.memory_block_ = nullptr;
             other.aq_ = nullptr;
             other.fq_ = nullptr;
             other.underlying = nullptr;
         }
 
-        // 3. Delete Move Assignment (optional, but required here because scq_order is const)
+        Legacy(const Legacy&) = delete;
+        Legacy& operator=(const Legacy&) = delete;
         Legacy& operator=(Legacy&&) = delete;
     };
 
 public:
+    // ... [Enqueue / Dequeue logic UNCHANGED] ...
 
     bool enqueue(T item) noexcept override {
         size_t eidx = lfring_dequeue(lf.fq(), lf.scq_order, false);
@@ -123,28 +171,32 @@ public:
         return true;
     }
 
-
+    // Standard Constructor
     explicit SCQueue(size_t size, uint64_t start = 0):
-        lf(size),
-        offset(start) {};
+        lf(size), offset(start) {};
 
+    // Standard with Item
     explicit SCQueue(T item, size_t size, uint64_t start = 0): lf(size), offset(start) {
         enqueue(item);
     };
 
-    size_t offset;
-    Legacy lf;
+protected:
+    // Protected Constructor for Co-Allocation
+    SCQueue(size_t size, uint64_t start, void* external_buffer) :
+        lf(size, external_buffer), offset(start)
+    {}
 
-    size_t capacity() const noexcept override {
-        return 1u << lf.scq_order;
-    }
+public:
+    Legacy lf;
+    size_t offset;
+
+    size_t capacity() const noexcept override { return 1u << lf.scq_order; }
 
     size_t size() const noexcept override {
         uint64_t h = lfring_get_head(lf.aq());
         uint64_t t = lfring_get_tail(lf.aq());
         return h > t? 0 : t - h;
     }
-
 };
 
 namespace segment {
@@ -164,34 +216,93 @@ class LinkedSCQ:
 {
     using Base = SCQueue<T,Opt,LinkedSCQ<T,Proxy,Opt,NextT>>;
     using Next = std::conditional_t<std::is_void_v<NextT>,LinkedSCQ<T,Proxy,Opt,NextT>*,NextT>;
+    static constexpr bool optimized_alloc = true;
     friend Base;
-    friend Proxy;   ///< Proxy class can access private methods
+    friend Proxy;
 
-    //proxies require segments to be on AutoClose mode
     static_assert(!Opt::template has<SCQOption::DisableAutoClose>,"LinkedSCQ: AutoClose disabled");
+
+    // =========================================================================
+    // CO-ALLOCATION MECHANICS
+    // =========================================================================
+    struct CoAllocTag {};
+
+    static void* compute_buffer_addr(void* self) {
+        // Calculate where the arrays start: Immediately after this object
+        // NOTE: We must ensure this offset respects alignment.
+        // aligned_alloc guarantees the base is aligned.
+        // sizeof(LinkedSCQ) should be padded to alignment by the compiler if struct alignas is used.
+        // To be safe, we manually align the offset calculation.
+
+        uintptr_t addr = reinterpret_cast<uintptr_t>(self) + sizeof(LinkedSCQ);
+        if(addr % CACHE_LINE != 0) {
+            addr += CACHE_LINE - (addr % CACHE_LINE);
+        }
+        return reinterpret_cast<void*>(addr);
+    }
 
 public:
     static constexpr bool info_required = true;
-    /**
-     * @brief Constructs a linked SCQ segment.
-     *
-     * @param size Capacity of this segment.
-     * @param start Initial sequence number (defaults to 0).
-     */
+
+    // =========================================================================
+    // FACTORY METHOD
+    // =========================================================================
+    static LinkedSCQ* create(size_t s, uint64_t start = 0) {
+        // 1. Calculate Order
+        size_t order = bit::log2(s) >= LFRING_MIN_ORDER ? bit::log2(s) : LFRING_MIN_ORDER;
+
+        // 2. Calculate Header Size (Aligned)
+        size_t header_size = sizeof(LinkedSCQ);
+        if(header_size % CACHE_LINE != 0) header_size += CACHE_LINE - (header_size % CACHE_LINE);
+
+        // 3. Calculate Payload Size
+        size_t legacy_payload_size = Base::Legacy::total_bytes_needed(order);
+
+        size_t total_bytes = header_size + legacy_payload_size;
+
+        // 4. Allocate
+        void* mem = std::aligned_alloc(alignof(LinkedSCQ), total_bytes);
+        if(!mem) throw std::bad_alloc();
+
+        // 5. Construct
+        return ::new (mem) LinkedSCQ(CoAllocTag{}, s, start);
+    }
+
+    // =========================================================================
+    // MEMORY OPERATORS
+    // =========================================================================
+    static void operator delete(void* ptr) { std::free(ptr); }
+    static void* operator new(size_t size) {
+        void* ptr = std::aligned_alloc(alignof(LinkedSCQ), size);
+        if(!ptr) throw std::bad_alloc();
+        return ptr;
+    }
+
+    // =========================================================================
+    // CONSTRUCTORS
+    // =========================================================================
+
+    // Standard
     LinkedSCQ(size_t size, uint64_t start = 0): Base(size,start) {}
     LinkedSCQ(T item, size_t size, uint64_t start = 0): Base(item,size,start) {}
 
-    /// @brief Defaulted destructor.
     ~LinkedSCQ() override = default;
 
 private:
+    // Optimized
+    LinkedSCQ(CoAllocTag, size_t size, uint64_t start)
+        : Base(size, start, compute_buffer_addr(this))
+    {}
+
+public:
+    // ... [Linked Segment Logic UNCHANGED] ...
+
     inline Next getNext() const noexcept override {
         return next_.load(std::memory_order_acquire);
     }
 
     static inline bool is_closed_(uint64_t val) {
         uint64_t mask = ~__LFRING_CLOSED;
-        //check if the closed bit is set
         return !(val & mask);
     }
 
@@ -214,18 +325,14 @@ private:
         return true;
     }
 
-
     inline bool enqueue(T item, [[maybe_unused]] bool info = false) noexcept final override {
         return info && isClosed()? false : Base::enqueue(item);
     }
 
-
-    /// @brief dequeue with additional info
     inline bool dequeue(T& item, [[maybe_unused]] bool info = true) noexcept final override {
         return Base::dequeue(item);
     }
 
-    /// @brief Reset threshold after observing a new queue linked
     void prepareDequeueAfterNextLinked() {
         lfring_reset_threshold(Base::lf.aq(), Base::lf.scq_order);
     }
@@ -234,7 +341,5 @@ private:
     CACHE_PAD_TYPES(std::atomic<Next>);
 };
 
-
-}   //namespace segment
-
-}   //namespace queue
+} //namespace segment
+} //namespace queue

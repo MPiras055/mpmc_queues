@@ -41,7 +41,7 @@ All interface specifications can be found in `include/queue/base`. Mainly we lev
 - [x] _SCQueue_ - _LinkedSCQ_: respectively standalone queue and linked segment implementations of the (_non-blocking_ See Note 2) [[insert-reference]].
 - [x] _FAAArray_: linked segment implementation of the (_obstruction-free_) [[insert-reference]]
 - [x] HQSegment: linked segment implementation of an _obstruction-free_ linear buffer, that supposedly allows for a better memory footprint. Strongly based on _FAAArray_
-- [-] LFCASLoopSegment: linked segment implementation of a _lock-free_ linear buffer, based on [[insert-reference]] that supposedly avoids ABA, by not reusing buffer cells.
+- [ ] LFCASLoopSegment: linked segment implementation of a _lock-free_ linear buffer, based on [[insert-reference]] that supposedly avoids ABA, by not reusing buffer cells.
 
 > Note 1: With `PTR` we mark implementations that as far as now, allow only for generic pointer storage
 

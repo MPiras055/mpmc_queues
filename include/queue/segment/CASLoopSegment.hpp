@@ -1,14 +1,14 @@
 #pragma once
 #include <atomic>
 #include <cassert>
-#include <atomic>
-#include <cassert>
-#include <specs.hpp>            //  padding and compatibility def
-#include <IQueue.hpp>           //  base queue interface
-#include <ILinkedSegment.hpp>   //  base linked segment interface
-#include <SequencedCell.hpp>    //  cell definition
-#include <bit.hpp>              //  bit manipulation utilities
-#include <OptionsPack.hpp>      //  options
+#include <cstdlib>      // for aligned_alloc, free
+#include <new>          // for placement new
+#include <specs.hpp>    // padding and compatibility def
+#include <IQueue.hpp>   // base queue interface
+#include <ILinkedSegment.hpp> // base linked segment interface
+#include <SequencedCell.hpp>  // cell definition
+#include <bit.hpp>      // bit manipulation utilities
+#include <OptionsPack.hpp>    // options
 
 namespace queue {
 
@@ -26,12 +26,6 @@ class LinkedCASLoop;
 /**
  * @brief Lock-free queue implementation using a compare-and-swap loop.
  *
- * This queue is based on a circular buffer of cells, where each cell
- * maintains a sequence number to coordinate between producers (enqueue)
- * and consumers (dequeue). It uses atomics and sequence numbers to ensure
- * wait-free progress for single producer/consumer pairs, and lock-free
- * progress for multiple threads.
- *
  * @tparam T Type of elements stored in the queue.
  * @tparam OptionsPack<> list of options to customize the queue
  * @tparam Derived Type of the derived segment (CRTP) default void
@@ -40,15 +34,23 @@ template<typename T, typename Opt = meta::EmptyOptions, typename Derived = void>
 class CASLoopQueue: public base::IQueue<T> {
     static_assert(std::is_pointer_v<T>, "CASLoopQueue: non-pointer item type");
 
-
     using Effective = std::conditional_t<std::is_void_v<Derived>, CASLoopQueue, Derived>;
     static constexpr bool AUTO_CLOSE    = !Opt::template has<CASLoopOption::DisableAutoClose> &&
         base::is_linked_segment_v<Effective>;
 
-    static constexpr bool POW2          = Opt::template has<CASLoopOption::Pow2Size>;
     static constexpr bool PAD_CELL      = !Opt::template has<CASLoopOption::DisableCellPadding>;
 
+protected:
+    static constexpr bool POW2          = Opt::template has<CASLoopOption::Pow2Size>;
     using Cell = cell::SequencedCell<T,PAD_CELL>; ///< Internal buffer cell (value + sequence counter).
+
+    // =========================================================================
+    // 1. OWNERSHIP FLAG
+    // =========================================================================
+    const bool owns_buffer_;
+    const size_t size_;
+    const size_t mask_;
+    Cell* array_; ///< Underlying circular buffer storage.
 
     inline size_t mod(uint64_t i) const noexcept{
         if constexpr (POW2) {
@@ -59,48 +61,72 @@ class CASLoopQueue: public base::IQueue<T> {
     }
 
 public:
-    /**
-     * @brief Constructs a queue with the given capacity.
-     *
-     * Initializes all cells in the buffer with default-constructed values
-     * and assigns sequence numbers for correct enqueue/dequeue ordering.
-     *
-     * @param size Capacity of the queue.
-     * @param start Initial sequence number (defaults to 0).
-     */
+    // =========================================================================
+    // 2. STANDARD CONSTRUCTOR (Allocates separate buffer)
+    // =========================================================================
     CASLoopQueue(size_t size, uint64_t start = 0):
+        owns_buffer_{true}, // We own the memory
         size_(POW2 && !bit::is_pow2(size)? bit::next_pow2(size) : size),
         mask_(POW2 && size_ != 1? (size_ - 1) : 0),
         array_{new Cell[size_]}
     {
         assert(size_ != 0 && "CASLoopQueue: null capacity");
         assert(!POW2 || mask_ != 0 && "CASLoopQueue: null bitmask");
+        init_slots(start);
+    }
 
+    // Standard Constructor with item
+    CASLoopQueue(T item, size_t size, uint64_t start = 0):
+        CASLoopQueue(size, start)
+    {
+        // Inject initial item
+        array_[mod(0)].val.store(item, std::memory_order_relaxed);
+        array_[mod(0)].seq.store(start + 1,std::memory_order_relaxed);
+        tail_.fetch_add(1,std::memory_order_release);
+    }
 
-        for(uint64_t i = start; i < start + size_; i++) {
+    // =========================================================================
+    // 3. DESTRUCTOR (Conditional Free)
+    // =========================================================================
+    ~CASLoopQueue() override {
+        if(owns_buffer_) {
+            delete[] array_;
+        }
+    }
+
+protected:
+    // =========================================================================
+    // 4. CO-ALLOCATION CONSTRUCTOR (Uses injected buffer)
+    // =========================================================================
+    CASLoopQueue(size_t size, uint64_t start, Cell* raw_buffer) :
+        owns_buffer_{false}, // We do NOT own the memory
+        size_(POW2 && !bit::is_pow2(size)? bit::next_pow2(size) : size),
+        mask_(POW2 && size_ != 1? (size_ - 1) : 0),
+        array_{raw_buffer}
+    {
+        assert(size_ != 0 && "CASLoopQueue: null capacity");
+
+        // Bless the raw memory as Cell objects
+        for(size_t i = 0; i < size_; ++i) {
+            new (&array_[i]) Cell();
+        }
+        init_slots(start);
+    }
+
+    void init_slots(uint64_t start) {
+         for(uint64_t i = start; i < start + size_; i++) {
             array_[mod(i)].seq.store(i, std::memory_order_relaxed);
+            // Ensure values are null (important for raw memory)
+            array_[mod(i)].val.store(nullptr, std::memory_order_relaxed);
         }
         head_.store(start, std::memory_order_relaxed);
         tail_.store(start, std::memory_order_relaxed);
     }
 
-    CASLoopQueue(T item, size_t size, uint64_t start = 0): CASLoopQueue(size, start) {
-        array_[mod(0)].val.store(item, std::memory_order_relaxed);
-        array_[mod(0)].seq.store(start + 1,std::memory_order_relaxed);
-        tail_.fetch_add(1,std::memory_order_release);
-        }
+public:
+    // ... [Enqueue/Dequeue logic UNCHANGED] ...
 
-    /**
-     * @brief Enqueues an item into the queue.
-     *
-     * Uses CAS on the tail index to reserve a slot, then writes the item
-     * into the reserved cell. If the queue is full, the enqueue will fail.
-     *
-     * @param item Value to insert into the queue.
-     * @return true If the enqueue succeeds.
-     * @return false If the queue is full or closed.
-     */
-        bool enqueue(T item) noexcept final override {
+    bool enqueue(T item) noexcept final override {
         uint64_t tailTicket, seq;
         size_t index;
 
@@ -135,22 +161,10 @@ public:
                         return false;
                 }
             }
-
             //CAS failed: retry
         } while (true);
     }
 
-
-    /**
-     * @brief Dequeues an item from the queue.
-     *
-     * Uses CAS on the head index to reserve a slot, then reads and clears
-     * the value. If the queue is empty, the dequeue will fail.
-     *
-     * @param[out] container Reference where the dequeued item is stored.
-     * @return true If the dequeue succeeds.
-     * @return false If the queue is empty.
-     */
     bool dequeue(T& container) noexcept final override {
         uint64_t headTicket, seq;
         size_t index;
@@ -178,42 +192,17 @@ public:
         } while(true);
     }
 
-    /**
-     * @brief Returns the capacity of the queue.
-     *
-     * @return Maximum number of elements that can be stored.
-     */
-    size_t capacity() const noexcept override {
-        return size_;
-    }
+    size_t capacity() const noexcept override { return size_; }
 
-    /**
-     * @brief Returns the approximate number of items in the queue.
-     *
-     * This value may not be exact in multithreaded use, but is safe to use
-     * for metrics or capacity checks.
-     *
-     * @return Current number of elements in the queue.
-     */
     size_t size() const noexcept override {
         return bit::clear_msb(tail_.load(std::memory_order_acquire)) - head_.load(std::memory_order_acquire);
     }
 
-    /// @brief Defaulted destructor.
-    ~CASLoopQueue() override {
-        delete[] array_;
-    }
-
 protected:
-    // Only accessible to LinkedSegment version
-
     ALIGNED_CACHE std::atomic_uint64_t head_; ///< Head ticket index for dequeue.
     CACHE_PAD_TYPES(std::atomic_uint64_t);
     ALIGNED_CACHE std::atomic_uint64_t tail_; ///< Tail ticket index for enqueue.
     CACHE_PAD_TYPES(std::atomic_uint64_t);
-    const size_t size_;
-    const size_t mask_;
-    Cell* array_; ///< Underlying circular buffer storage.
 
 };
 
@@ -230,12 +219,9 @@ namespace segment {
  */
 template<typename T, typename Proxy, typename Opt = meta::EmptyOptions, typename NextT = void>
 class LinkedCASLoop:
-    //Base queue
     public CASLoopQueue<
         T,Opt,LinkedCASLoop<T,Proxy,Opt,NextT>
     >,
-
-    //Base linked interface
     public base::ILinkedSegment<
         T, std::conditional_t<
             std::is_void_v<NextT>,
@@ -244,103 +230,125 @@ class LinkedCASLoop:
         >
     >
 {
-
     using Base = CASLoopQueue<T,Opt,LinkedCASLoop<T,Proxy,Opt,NextT>>;
     using Next = std::conditional_t<std::is_void_v<NextT>,LinkedCASLoop<T,Proxy,Opt,NextT>*,NextT>;
+    using Cell = typename Base::Cell; // Import Cell type
+
     friend Base;    ///< Base class can access lifecycle methods
     friend Proxy;   ///< Proxy class can access private methods.
 
-    //proxies require segments to be on auto_close mode;
     static_assert(!Opt::template has<CASLoopOption::DisableAutoClose>,"LinkedCASLoop: AutoClose disabled");
 
-public:
-    /**
-     * @brief Constructs a linked CAS loop queue segment.
-     *
-     * @param size Capacity of this segment.
-     * @param start Initial sequence number (defaults to 0).
-     */
-    LinkedCASLoop(size_t size, uint64_t start = 0): Base(size,start) {}
+    // =========================================================================
+    // 5. INTERNAL MECHANICS FOR CO-ALLOCATION
+    // =========================================================================
+    struct CoAllocTag {};
 
+    static Cell* compute_buffer_addr(void* self) {
+        return reinterpret_cast<Cell*>(reinterpret_cast<char*>(self) + sizeof(LinkedCASLoop));
+    }
+
+public:
+    static constexpr bool info_required = false; // Note: CASLoop usually doesn't need info hint, updated based on original
+    static constexpr bool optimized_alloc = true;//proxies may want to optimize allocation as a single memory block
+    // =========================================================================
+    // 6. FACTORY METHOD (The "Smart" Allocator)
+    // =========================================================================
+    static LinkedCASLoop* create(size_t s, uint64_t start = 0) {
+        // Size calculation logic
+        size_t real_size = s;
+        if constexpr (Base::POW2) {
+             if(!bit::is_pow2(s)) real_size = bit::next_pow2(s);
+        }
+
+        size_t total_bytes = sizeof(LinkedCASLoop) + (sizeof(Cell) * real_size);
+
+        // Cache Line Alignment
+        if(total_bytes % CACHE_LINE != 0)
+            total_bytes += CACHE_LINE - (total_bytes % CACHE_LINE);
+
+        void* mem = std::aligned_alloc(alignof(LinkedCASLoop), total_bytes);
+        if(!mem) throw std::bad_alloc();
+
+        // Use global placement new with the Tagged Constructor
+        return ::new (mem) LinkedCASLoop(CoAllocTag{}, real_size, start);
+    }
+
+    // =========================================================================
+    // 7. MEMORY OPERATOR OVERRIDES
+    // =========================================================================
+    static void operator delete(void* ptr) {
+        std::free(ptr);
+    }
+
+    static void* operator new(size_t size) {
+        void* ptr = std::aligned_alloc(alignof(LinkedCASLoop), size);
+        if (!ptr) throw std::bad_alloc();
+        return ptr;
+    }
+
+    // =========================================================================
+    // 8. CONSTRUCTORS
+    // =========================================================================
+
+    // Standard Constructors
+    LinkedCASLoop(size_t size, uint64_t start = 0): Base(size,start) {}
     LinkedCASLoop(T item,size_t size, uint64_t start = 0): Base(item,size,start) {}
 
-    /// @brief Defaulted destructor.
     ~LinkedCASLoop() override = default;
 
-protected:
-    /**
-     * @brief Returns the next linked segment in the chain.
-     *
-     * @return Pointer to the next segment, or nullptr if none.
-     */
+private:
+    // Tagged Constructor (Co-Allocated Buffer)
+    LinkedCASLoop(CoAllocTag, size_t size, uint64_t start)
+        : Base(size, start, compute_buffer_addr(this))
+    {}
+
+public:
+    // ... [Rest of Segment Logic UNCHANGED] ...
+
     Next getNext() const noexcept final override {
         return next_.load(std::memory_order_acquire);
     }
 
-    /**
-     * @brief internal method to check if the queue is closed
-     */
     static bool is_closed_(uint64_t tail) noexcept {
         return bit::get_msb(tail) != uint64_t{0};
     }
 
-    /**
-     * @brief reopens a previously closed segment
-     *
-     * Checks if the closure bit is setted, if so it alignes the head and tail index
-     * via CAS and clears the next pointer.
-     *
-     * @warning it is supposed that this method gets called on a fully drained queue,
-     * undefined behaviour can occur if it's not the case.
-     */
     bool open() noexcept final override {
         uint64_t tail = Base::tail_.load(std::memory_order_relaxed);
         if(bit::get_msb(tail) != 0) {
             uint64_t head = Base::head_.load(std::memory_order_relaxed);
-            next_.store(nullptr,std::memory_order_relaxed); //this is guarded by the CAS
+            next_.store(nullptr,std::memory_order_relaxed);
             bool ok = Base::tail_.compare_exchange_strong(tail,head,std::memory_order_acq_rel);
             assert(ok && "LinkedCASLoopQueue: failed open - not exclusive ownership");
         }
         return true;
     }
 
-    /**
-     * @brief closes the queue to further insertions (until open() is called)
-     */
     bool close() noexcept final override {
         Base::tail_.fetch_or(bit::set_msb(uint64_t{0}),std::memory_order_acq_rel);
         return true;
     }
 
-    /**
-     * @brief checks if the segment is closed to further insertions
-     */
     inline bool isClosed() const noexcept final override {
         return is_closed_(Base::tail_);
     }
 
-    /**
-     * @brief checks if the segment is closed to further insertions
-     */
     inline bool isOpened() const noexcept final override {
         return !isClosed();
     }
 
-    /// @brief enqueue with additional info
-    /// @note same as base segment for this implementation
     inline bool enqueue(T item, [[maybe_unused]] bool info = true) noexcept final override {
         return Base::enqueue(item);
     }
 
-    /// @brief dequeue with additional info
-    /// @note same as base segment for this implementation
     inline bool dequeue(T& item, [[maybe_unused]] bool info = true) noexcept final override {
         return Base::dequeue(item);
     }
 
     static_assert(detail::atomic_compatible_v<Next>,"LinkedCASLoop Next field: not lock free");
     static_assert(std::is_default_constructible_v<Next>,"LinkedCASLoop Next field: not default constructible");
-    ALIGNED_CACHE std::atomic<Next> next_{}; ///< Pointer to the next segment in the chain.
+    ALIGNED_CACHE std::atomic<Next> next_{};
     CACHE_PAD_TYPES(std::atomic<Next>);
 };
 

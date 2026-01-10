@@ -94,7 +94,13 @@ public:
 
             //enqueue failed: segment is full or stale
             //allocate a new segment and push current item
-            Segment* newTail = new Segment(item, seg_capacity_);
+            Segment * newTail;
+            if constexpr (Segment::optimized_alloc) {
+                newTail = Segment::create(seg_capacity_);
+            } else {
+                newTail = new Segment(seg_capacity_);
+            }
+            (void)newTail->enqueue(item);
 
             Segment* null = nullptr;
             //try to link the private segment as the new tail

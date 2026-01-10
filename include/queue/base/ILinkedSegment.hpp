@@ -23,6 +23,7 @@ class ILinkedSegment {
         "NextT has to be trivially default constructible");
 
 public:
+    static constexpr bool optimized_alloc = false;
     /// @brief Retrieves the next segment in the chain.
     ///
     /// @return Pointer to the next segment, or `nullptr` if this is the last segment.
