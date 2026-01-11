@@ -301,13 +301,8 @@ public:
         return next_.load(std::memory_order_acquire);
     }
 
-    static inline bool is_closed_(uint64_t val) {
-        uint64_t mask = ~__LFRING_CLOSED;
-        return !(val & mask);
-    }
-
     inline bool isClosed() const noexcept final override {
-        return is_closed_(lfring_get_tail(Base::lf.fq()));
+        return lfring_is_closed(Base::lf.fq());
     }
 
     inline bool isOpened() const noexcept final override {

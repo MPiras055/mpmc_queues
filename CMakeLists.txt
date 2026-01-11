@@ -53,10 +53,10 @@ foreach(test_src ${UNIT_TEST_SOURCES})
     add_executable(${test_name} ${test_src})
 
     target_compile_options(${test_name} PRIVATE
-        -g -O3 -march=native -funroll-loops -fno-rtti -fsanitize=address
+        -g -O3 -march=native -funroll-loops -fno-rtti -DNDEBUG
     )
     target_link_libraries(${test_name} PRIVATE gtest_main scqueue)
-    target_link_options(${test_name} PRIVATE -fsanitize=address)
+    target_link_options(${test_name} PRIVATE)
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
 

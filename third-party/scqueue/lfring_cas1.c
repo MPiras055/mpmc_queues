@@ -182,6 +182,11 @@ void lfring_open(struct lfring *ring) {
     );
 }
 
+bool lfring_is_closed(struct lfring *ring) {
+    struct __lfring * q = (struct __lfring *) ring;
+    return (atomic_load(&q->tail) & __LFRING_CLOSED) != 0;
+}
+
 lfatomic_t lfring_get_head(struct lfring * ring) {
     struct __lfring * q = (struct __lfring *) ring;
     return atomic_load(&q->head);

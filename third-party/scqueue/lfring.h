@@ -63,6 +63,8 @@ void lfring_close(struct lfring * ring);
  */
 void lfring_open(struct lfring * ring);
 
+bool lfring_is_closed(struct lfring *ring);
+
 lfatomic_t lfring_get_head(struct lfring * ring);
 
 lfatomic_t lfring_get_tail(struct lfring * ring);
