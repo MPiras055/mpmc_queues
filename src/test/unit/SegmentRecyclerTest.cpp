@@ -53,26 +53,25 @@ TEST_F(SegmentRecyclerTest, BasicCachePutGet) {
     static constexpr size_t CAPACITY    = 100;
     static constexpr size_t threads     = 1;
     using Rec = util::hazard::recycler::Recycler<Segment,CAPACITY>;
-    using Index = Rec::Index;
-    std::vector<Index> indexes;
+    std::vector<size_t> indexes;
     indexes.reserve(CAPACITY);
 
     Rec r(threads); //initialize the recycler
 
-    Index idx = 0xDEAD;
+    size_t idx = 0xDEAD;
 
     //initialize the recyclers cache
     while(r.reclaim(idx)) {
-        r.put_cache(idx);
+        r.put_in_cache(idx);
     }
 
     //drain the recyclers cache
     for(size_t i = 0; i < CAPACITY; i++) {
-        EXPECT_TRUE(r.get_cache(idx));
+        EXPECT_TRUE(r.get_from_cache(idx));
         indexes.emplace_back(idx);
     }
 
-    EXPECT_FALSE(r.get_cache(idx));
+    EXPECT_FALSE(r.get_from_cache(idx));
 
     //sort indexes and see if they map to an interval
     std::sort(indexes.begin(),indexes.end());
@@ -88,17 +87,17 @@ TEST_F(SegmentRecyclerTest, BasicCachePutGet) {
 
     //put back indexes to cache
     while(!indexes.empty()) {
-        r.put_cache(indexes.back());
+        r.put_in_cache(indexes.back());
         indexes.pop_back();
     }
 
     //drain the recycler cache again
     for(size_t i = 0; i < CAPACITY; i++) {
-        EXPECT_TRUE(r.get_cache(idx));
+        EXPECT_TRUE(r.get_from_cache(idx));
         indexes.emplace_back(idx);
     }
 
-    EXPECT_FALSE(r.get_cache(idx));
+    EXPECT_FALSE(r.get_from_cache(idx));
 }
 
 // 2. Test Basic Reclaim and Retire Interaction
@@ -107,7 +106,7 @@ TEST_F(SegmentRecyclerTest, BasicRetireReclaim) {
     static constexpr size_t threads     = 1;
     using Opt = util::hazard::recycler::RecyclerOpt;
     using Rec = util::hazard::recycler::Recycler<Segment,CAPACITY,meta::OptionsPack<Opt::Disable_Cache>>;
-    using Index = Rec::Index;
+    using Index = size_t;
     std::vector<Index> indexes;
 
     indexes.reserve(CAPACITY);
@@ -268,7 +267,7 @@ TEST_F(SegmentRecyclerTest, EpochProtectionBlocksReclaim) {
 
     using Opt = util::hazard::recycler::RecyclerOpt;
     using Rec = util::hazard::recycler::Recycler<Segment, CAPACITY, meta::OptionsPack<Opt::Disable_Cache>>;
-    using Index = Rec::Index;
+    using Index = size_t;
     Rec r(TOTAL_THREADS);
     // Increased barriers to strictly order the "Check Fail" and "Clear Epoch" phases
     std::barrier sync_point(TOTAL_THREADS);
@@ -374,7 +373,7 @@ TEST_F(SegmentRecyclerTest, StressCacheAndReclaim) {
     static constexpr size_t TOTAL_ITERATIONS = 1000000;
 
     using Rec = util::hazard::recycler::Recycler<Segment, CAPACITY>;
-    using Index = Rec::Index;
+    using Index = size_t;
 
     Rec r(TEST_THREADS);
     std::barrier sync_point(TEST_THREADS);
@@ -405,7 +404,7 @@ TEST_F(SegmentRecyclerTest, StressCacheAndReclaim) {
 
             // Acquire an index
             do {
-                if (r.get_cache(idx)) {
+                if (r.get_from_cache(idx)) {
                     got = true;
                     EXPECT_TRUE(r.decode(idx)->isOpen());
                 } else if (r.reclaim(idx)) {
@@ -418,12 +417,11 @@ TEST_F(SegmentRecyclerTest, StressCacheAndReclaim) {
             } while (!got);
 
             // 50%: return to cache
-            // if (next_rand() % 2) {
-            //     Segment* seg = r.decode(idx);
-            //     r.put_cache(idx);  // MUST not overfill (design guarantee)
-            //     continue;
-            // } else
-            {
+            if (next_rand() % 2) {
+                Segment* seg = r.decode(idx);
+                r.put_in_cache(idx);  // MUST not overfill (design guarantee)
+                continue;
+            } else {
                 // 50%: retire
                 Segment* seg = r.decode(idx);
                 r.protect_epoch();
@@ -450,7 +448,7 @@ TEST_F(SegmentRecyclerTest, StressCacheAndReclaim) {
     rec_state.reserve(CAPACITY);
 
     Index idx;
-    while (r.get_cache(idx))
+    while (r.get_from_cache(idx))
         rec_state.push_back(idx);
     while (r.reclaim(idx))
         rec_state.push_back(idx);

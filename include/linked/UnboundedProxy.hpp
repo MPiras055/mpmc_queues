@@ -97,7 +97,9 @@ public:
             Segment * newTail;
             if constexpr (Segment::optimized_alloc) {
                 newTail = Segment::create(seg_capacity_);
-            } else {
+            }
+            else
+            {
                 newTail = new Segment(seg_capacity_);
             }
             (void)newTail->enqueue(item);

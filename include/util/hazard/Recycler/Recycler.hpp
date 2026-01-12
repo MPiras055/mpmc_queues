@@ -6,9 +6,8 @@
 #include <type_traits>
 #include <cassert>
 
-#include "Buckets.hpp"              //Cache and LimboBuffer Implementation
+#include <LFring.hpp>               //For bucket and cache impl
 #include "PtrLookup.hpp"            //Immutable Lookup Table Implementation
-#include "VersionedIndex.hpp"       //DynamicPackedU64 Impkementation
 #include "OptionsPack.hpp"          //Template Options
 #include "HazardCell.hpp"           //Padded SingleWriterLocation with general Metadata field
 #include "DynamicThreadTicket.hpp"  //TLS Ticket Manager
@@ -21,8 +20,6 @@ namespace util::hazard::recycler {
  * @brief Configuration options for the Recycler.
  */
 struct RecyclerOpt {
-    struct Pow2_Cache{};
-    struct Disable_Cache_Padding{};
     struct Disable_Cache{};
 };
 
@@ -31,36 +28,24 @@ struct RecyclerOpt {
  */
 template<typename T, size_t Capacity, typename Opt = meta::EmptyOptions, typename Meta = void>
 class Recycler {
-public:
-    using VersionedIndex = details::VersionedIndex<Capacity>;
-    using Index          = typename VersionedIndex::Index;
-
-private:
     // Configuration
-    static constexpr bool POW2          = Opt::template has<RecyclerOpt::Pow2_Cache>;
     static constexpr bool NO_CACHE      = Opt::template has<RecyclerOpt::Disable_Cache>;
 
     // Internal Types
     using EpochCell      = details::EpochCell;
+    using Epoch          = EpochCell::Epoch;
     using ThreadCell     = HazardCell<EpochCell, Meta>;
-    using Epoch          = typename EpochCell::Epoch;
     using PtrLookupT     = details::ImmutablePtrLookup<T>;
     using Ticketing      = threading::DynamicThreadTicket;
 
-    // FIX: Use LimboBuffer to ensure slots are physically cleared (exchange EMPTY_VAL) upon dequeue.
-    // This prevents the "double reclaim" bug where old data is read after bucket rotation.
-    using Bucket         = details::Cache<Capacity>;
-    // using Bucket = details::DebugBucket<Capacity,meta::EmptyOptions>;
+    using Bucket        = queue::LFring<size_t>;
 
-    static_assert(std::is_same_v<Index, details::Value>, "Recycler: Index type mismatch with Bucket Value");
+    using RealCache      = queue::LFring<size_t>;
 
-    // Cache Types
-    using CacheOpt       = typename meta::EmptyOptions
-                           ::template add_if<POW2, details::CacheOpt::Pow2Size>;
-    using RealCache      = details::DebugBucket<Capacity>;
-
-    struct DisabledCache {};
-    using CacheMember    = std::conditional_t<NO_CACHE, DisabledCache, RealCache>;
+    struct DisabledCache {
+        DisabledCache() = default;
+    };
+    using CacheMember    = Bucket;
 
 public:
     enum class BucketState : uint64_t {
@@ -76,21 +61,20 @@ public:
         threadRecord_{new ThreadCell[maxThreads]},
         ticketing_{maxThreads},
         lookup_{Capacity, std::forward<Args>(args)...},
-        cache_(),
-        buckets_{new Bucket[4]}
+        buckets_{queue::LFringSlab<size_t>(NO_CACHE? 4 : 5,Capacity)},
+        cache_{*buckets_.get(NO_CACHE? 0 : 4)}
     {
         // Initialize: Fill the 'initial' Free bucket (index 2 for epoch 0)
 
         Bucket& initialFree = get_bucket(epoch_.load(std::memory_order_relaxed),BucketState::Free);
         for(size_t i = 0; i < Capacity; ++i) {
-            initialFree.enqueue(Index{i});
+            initialFree.enqueue(i);
         }
 
     }
 
     ~Recycler() {
         delete[] threadRecord_;
-        delete[] buckets_;
     }
 
     // =========================================================================
@@ -146,12 +130,8 @@ public:
     // Pointer Access
     // =========================================================================
 
-    T* decode(Index idx) const noexcept {
+    T* decode(size_t idx) const noexcept {
         return lookup_[idx];
-    }
-
-    T* decode(VersionedIndex idx) const noexcept {
-        return lookup_[idx.index()];
     }
 
     // =========================================================================
@@ -187,17 +167,15 @@ public:
     // Cache Operations
     // =========================================================================
 
-    bool get_cache(Index& out_idx) {
+    bool get_from_cache(size_t& out_idx) {
         if constexpr (NO_CACHE) {
-            assert(false && "Recycler: get_cache called while cache disabled");
             return false;
-        }
-        else {
+        } else {
             return static_cast<RealCache&>(cache_).dequeue(out_idx);
         }
     }
 
-    void put_cache(Index idx) {
+    void put_in_cache(size_t idx) {
         if constexpr (NO_CACHE) {
             assert(false && "Recycler: put_cache called while cache disabled");
         } else {
@@ -209,7 +187,7 @@ public:
     // Core Logic: Retire & Reclaim
     // =========================================================================
 
-    void retire(Index idx) {
+    void retire(size_t idx) {
         uint64_t ticket = get_ticket();
         bool was_active;
         Epoch current_epoch;
@@ -236,7 +214,7 @@ public:
         }
     }
 
-    bool reclaim(Index& out_idx) {
+    bool reclaim(size_t& out_idx) {
         uint64_t ticket = get_ticket();
         bool was_active;
         Epoch e;
@@ -297,7 +275,7 @@ private:
 
     Bucket& get_bucket(uint64_t epoch, BucketState state) {
         uint64_t offset = static_cast<uint64_t>(state);
-        return buckets_[(epoch + offset) & 3];
+        return *buckets_.get((epoch + offset) & 3);
     }
 
     bool can_advance_epoch(uint64_t expected_epoch) const {
@@ -317,15 +295,14 @@ private:
         return true;
     }
 
-    ALIGNED_CACHE std::atomic<uint64_t> epoch_;
-    CACHE_PAD_TYPES(std::atomic_uint64_t);
-
     ThreadCell* threadRecord_;
     Ticketing   ticketing_;
     PtrLookupT  lookup_;
 
-    ALIGNED_CACHE CacheMember cache_;
-    ALIGNED_CACHE Bucket* buckets_;
+    ALIGNED_CACHE std::atomic<uint64_t> epoch_;
+    CACHE_PAD_TYPES(std::atomic_uint64_t);
+    queue::LFringSlab<size_t> buckets_;
+    CacheMember& cache_;
 };
 
 } // namespace util::hazard::recycler

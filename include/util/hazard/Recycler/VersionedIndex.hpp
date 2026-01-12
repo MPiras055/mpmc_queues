@@ -5,6 +5,8 @@
 
 namespace util::hazard::recycler::details {
 
+using RawVersionedIndex = uint64_t;
+
 /**
  * @brief A packed, atomic-compatible 64-bit structure storing an Index and a Version.
  * * This struct dynamically calculates the bit-width required for the Index based on
@@ -39,8 +41,6 @@ struct VersionedIndex {
     static constexpr Index      INDEX_MASK = (1ULL << INDEX_BITS) - 1;
     static constexpr Version    VERSION_MASK = ~INDEX_MASK;
 
-    // The specific value used to indicate "None" or "Reserved"
-    static constexpr Index RESERVED_VAL = Capacity;
 
     // =========================================================================
     // Data
@@ -57,7 +57,7 @@ struct VersionedIndex {
      * Initializes the Index to RESERVED_VAL (Capacity) and Version to 0.
      * This represents a "Null" or "Empty" state.
      */
-    constexpr VersionedIndex() noexcept : raw_(RESERVED_VAL) {}
+    constexpr VersionedIndex() noexcept {};
 
     constexpr VersionedIndex(Version ver, Index idx) noexcept {
         assert(idx <= Capacity && "VersionedIndex: Index out of range");
@@ -70,6 +70,10 @@ struct VersionedIndex {
     // Explicit conversion from raw uint64_t (useful for atomic CAS debugging)
     explicit constexpr VersionedIndex(uint64_t raw_val) noexcept : raw_(raw_val) {}
 
+    constexpr RawVersionedIndex getRaw() const noexcept {
+        return raw_;
+    }
+
     // =========================================================================
     // Accessors
     // =========================================================================
@@ -80,10 +84,6 @@ struct VersionedIndex {
 
     [[nodiscard]] constexpr Version version() const noexcept {
         return raw_ >> INDEX_BITS;
-    }
-
-    [[nodiscard]] constexpr bool isReserved() const noexcept {
-        return index() == RESERVED_VAL;
     }
 
     /**
@@ -116,13 +116,6 @@ struct VersionedIndex {
     }
 
     /**
-     * @brief Sets index to RESERVED, preserving the current version.
-     */
-    void setReserved() noexcept {
-        raw_ = (raw_ & VERSION_MASK) | RESERVED_VAL;
-    }
-
-    /**
      * @brief Increments the version.
      * Effectively adds 1 to the high bits.
      */
@@ -142,6 +135,8 @@ struct VersionedIndex {
     constexpr bool operator!=(const VersionedIndex& other) const noexcept {
         return raw_ != other.raw_;
     }
+
+
 };
 
 } // namespace util::hazard::recycler

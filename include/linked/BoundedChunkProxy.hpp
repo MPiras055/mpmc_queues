@@ -67,7 +67,7 @@ public:
 
         while (true) {
             //check for tail consistency
-            Segment* tail= hazard_.protect(tail_,ticket);
+            Segment* tail = hazard_.protect(tail_,ticket);
 
             //check if next ptr was setted
             Segment* next = tail->getNext();
@@ -95,7 +95,8 @@ public:
             Segment* newTail;
             if constexpr (Segment::optimized_alloc) {
                 newTail = Segment::create(seg_capacity_);
-            } else {
+            } else
+            {
                 newTail = new Segment(seg_capacity_);
             }
             (void)newTail->enqueue(item);
@@ -121,9 +122,14 @@ public:
 
     bool dequeue(T& out) override {
         Ticket ticket = get_ticket_();
+        Segment* head = head = hazard_.protect(head_.load(std::memory_order_relaxed),ticket);
         while(1) {
             //check for head consistency
-            Segment* head = hazard_.protect(head_,ticket);
+            Segment* head2 = head_.load(std::memory_order_acquire);
+            if(head != head2) {
+                head = hazard_.protect(head2,ticket);
+                continue;
+            }
 
             //try to dequeue on current segment
             if(!head->dequeue(out)) {
