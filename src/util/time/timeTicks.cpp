@@ -1,7 +1,7 @@
 #include <chrono>
 #include <iostream>
 #include <cmath>        // For std::abs
-#include "TicksWait.h"  // Assumed available and functional
+#include <util/timing/TicksWait.h>  // Assumed available and functional
 
 #define NSEC_TICKS          static_cast<size_t>(648)    // 100 ns ≈ 648 ticks
 #define TOLERANCE_DEFAULT   0.1                         // 10%

@@ -1,3 +1,16 @@
+// ============================================================================
+// LEGACY -- NOT IN USE. Kept deliberately; do not wire in without review.
+//
+// This file predates the include-path reorganisation (include/queue/* ->
+// include/segment/* + include/cell/*). It still uses the old flat include
+// paths, so it does NOT compile, and nothing in include/ or src/ includes it.
+// It is intentionally excluded from the "every header compiles" sweep.
+//
+// Superseded by: BoundedMemProxy.hpp defines its own VersionedIndex at global
+// scope. This version is the more general one (it sizes the index field by
+// capacity rather than fixing a 32/32 split).
+// ============================================================================
+
 #pragma once
 #include <cstdint>
 #include <cassert>
@@ -57,12 +70,9 @@ struct VersionedIndex {
      * Initializes the Index to RESERVED_VAL (Capacity) and Version to 0.
      * This represents a "Null" or "Empty" state.
      */
-    constexpr VersionedIndex() noexcept {};
+    constexpr VersionedIndex() noexcept = default;
 
     constexpr VersionedIndex(Version ver, Index idx) noexcept {
-        assert(idx <= Capacity && "VersionedIndex: Index out of range");
-        assert(ver >> VERSION_BITS == 0 && "VersionedIndex: Version out of range");
-
         // Pack: (Version << shift) | Index
         raw_ = (ver << INDEX_BITS) | (idx & INDEX_MASK);
     }

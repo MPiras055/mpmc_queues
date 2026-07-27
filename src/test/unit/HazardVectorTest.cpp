@@ -11,7 +11,7 @@
  */
 
 #include <gtest/gtest.h>
-#include <HazardVector.hpp>
+#include <util/hazard/HazardVector.hpp>
 #include <thread>
 #include <vector>
 #include <atomic>

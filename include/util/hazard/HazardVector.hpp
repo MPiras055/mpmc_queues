@@ -4,8 +4,8 @@
 #include <vector>
 #include <type_traits>
 #include <cassert>
-#include <specs.hpp>
-#include <HazardCell.hpp>
+#include <util/specs.hpp>
+#include <util/hazard/HazardCell.hpp>
 
 namespace util::hazard {
 

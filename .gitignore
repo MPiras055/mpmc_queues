@@ -64,6 +64,10 @@ cmake/*
 # pyright
 pyrightconfig.json
 
+# python
+python/experiments
+python/plotter
+
 #old folder
 mpmc_queues_TITANIC
 
@@ -71,3 +75,9 @@ mpmc_queues_TITANIC
 __pycache__
 scripts
 src/sim
+
+# python tooling
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.clangd

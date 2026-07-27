@@ -1,7 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <type_traits>
-#include <specs.hpp>
+#include <util/specs.hpp>
 
 namespace util::hazard {
     /**

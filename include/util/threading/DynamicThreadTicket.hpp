@@ -3,8 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <stdexcept>
-#include <specs.hpp>
-#include <bit>
+#include <util/specs.hpp>
 
 #ifndef DTT_MAX_BITS
 #define DTT_MAX_BITS 1024

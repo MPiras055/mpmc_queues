@@ -3,7 +3,7 @@
 #include <vector>
 #include <atomic>
 #include <unordered_set>
-#include "DynamicThreadTicket.hpp"
+#include <util/threading/DynamicThreadTicket.hpp>
 
 using util::threading::DynamicThreadTicket;
 

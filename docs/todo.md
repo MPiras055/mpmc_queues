@@ -1,18 +1,14 @@
-## Infrastructure
-- [x] define interfaces `IQueue<T>,IBoundedSegment<T>`
-- [x] define stack-heap storage policy
-- [x] define static and dynamic internal thread tickets (per instance of class)
-- [x] define hazard pointer integration
-- [x] define Unbounded Proxy template
+## implementations
+- [x] add compliant c++11 interface for lfring
+- [x] add compliant c++11 interface for scqueue (w indirection)
+- [ ] add compliant c++11 interface for scqueue (direct storing CAS2 vs software-emulation)
 
-## Proxies
-- [ ] Add linked proxy compliant with iproxy interface
-- [ ] Add memory reuse option (copying collection gc)
+> Remember to add direct struct storing ::create() method for scqueue with indirection as well
+as lfring(size_t) 
 
-## Segments
-- [x] Add CAS-loop segment compliant with bounded and linked interface
-- [x] Add PRQ segment compliant with bounded and linked interface
+## utilities
+- [ ] rework hazard pointers
+- [ ] rework unbounded proxy 
 
-## Testing
-- [x] Add test interface for all classes
-- [ ] 
+## test
+- [ ] test difference in standard c lfring/scqueue and c++ versions

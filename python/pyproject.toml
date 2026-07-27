@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mpmc-bench"
+version = "0.2.0"
+description = "Experiment driver, plotting and CPU-topology tooling for the mpmc_queues benchmarks"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas>=2.0",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+mpmc-run = "mpmc_bench.runner:main"
+mpmc-plot = "mpmc_bench.plotting.plots:main"
+mpmc-topology = "mpmc_bench.topology.generator:main"
+
+[tool.setuptools.packages.find]
+include = ["mpmc_bench*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

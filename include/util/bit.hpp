@@ -25,8 +25,8 @@ namespace bit {
     /**
      * @brief Returns the mask for all bits except the Most Significant Bit.
      */
-    template <typename T>
-    static constexpr T non_msb_mask = ~msb_mask<T>;
+     template <typename T>
+     static constexpr T non_msb_mask = static_cast<T>(~msb_mask<T>);;
 
     // === General Bit Utilities ===
 
@@ -147,6 +147,23 @@ namespace bit {
         n--; // Decrement to handle exact powers of 2 correctly
 
         // Unrolled loop logic generically for any type width
+        constexpr size_t digits = std::numeric_limits<T>::digits;
+
+        for (size_t shift = 1; shift < digits; shift <<= 1) {
+            n |= n >> shift;
+        }
+
+        return n + 1;
+    }
+
+    template <typename T>
+    [[nodiscard]] static constexpr T round_to_next_pow2(T n) noexcept {
+        static_assert(is_unsigned_int_v<T>, "T must be unsigned integral type");
+
+        if (n == 0) return 1;
+        if (is_pow2(n)) return n;
+
+        n--;
         constexpr size_t digits = std::numeric_limits<T>::digits;
 
         for (size_t shift = 1; shift < digits; shift <<= 1) {

@@ -6,13 +6,13 @@
 #include <type_traits>
 #include <cassert>
 
-#include <LFring.hpp>               //For bucket and cache impl
-#include "PtrLookup.hpp"            //Immutable Lookup Table Implementation
-#include "OptionsPack.hpp"          //Template Options
-#include "HazardCell.hpp"           //Padded SingleWriterLocation with general Metadata field
-#include "DynamicThreadTicket.hpp"  //TLS Ticket Manager
-#include "EpochCell.hpp"            //EpochCell SWL
-#include "specs.hpp"                //Cache alignment and compatibility checks
+#include <mem/detail/RingSlab.hpp>          //Positionally-addressed collection of index rings
+#include <util/hazard/Recycler/PtrLookup.hpp> //Immutable Lookup Table Implementation
+#include <meta/OptionsPack.hpp>          //Template Options
+#include <util/hazard/HazardCell.hpp>           //Padded SingleWriterLocation with general Metadata field
+#include <util/threading/DynamicThreadTicket.hpp>  //TLS Ticket Manager
+#include <util/bit.hpp>
+#include <util/specs.hpp>                //Cache alignment and compatibility checks
 
 namespace util::hazard::recycler {
 
@@ -26,47 +26,71 @@ struct RecyclerOpt {
 /**
  * @brief A high-performance Epoch-Based Recycler (EBR).
  */
-template<typename T, size_t Capacity, typename Opt = meta::EmptyOptions, typename Meta = void>
+template<typename T, size_t Capacity, typename Opt = meta::EmptyOptions, typename Meta = void,
+         typename Lookup = details::ImmutablePtrLookup<T>>
 class Recycler {
+    using Epoch = uint64_t;
+
+    struct EpochCell {
+        static constexpr Epoch INACTIVE = 0;
+
+        std::atomic<Epoch> local_epoch;
+        void snapshot(bool& active, Epoch& epoch) const {
+            Epoch e = local_epoch.load();
+            active = bit::get_msb(e) != 0;
+            epoch  = bit::clear_msb(e);
+            return;
+        }
+
+        void protect(Epoch e) {
+            local_epoch.store(bit::set_msb<Epoch>(e));
+        }
+
+        void clear() {
+            local_epoch.store(INACTIVE);
+        }
+    };
+
+    using ThreadCell    = hazard::HazardCell<EpochCell,Meta>;
+    // Defaulted to ImmutablePtrLookup, which builds each T inline in a flat array.
+    // Segments allocated as a single block (header + trailing cells) cannot be built
+    // that way, so mem::source::Pool substitutes mem::detail::SlabLookup.
+    using PtrLookupT    = Lookup;
+    using Ticketing     = threading::DynamicThreadTicket;
+    using Ticket        = Ticketing::Ticket;
+
+
     // Configuration
     static constexpr bool NO_CACHE      = Opt::template has<RecyclerOpt::Disable_Cache>;
 
-    // Internal Types
-    using EpochCell      = details::EpochCell;
-    using Epoch          = EpochCell::Epoch;
-    using ThreadCell     = HazardCell<EpochCell, Meta>;
-    using PtrLookupT     = details::ImmutablePtrLookup<T>;
-    using Ticketing      = threading::DynamicThreadTicket;
-
-    using Bucket        = queue::LFring<size_t>;
-
-    using RealCache      = queue::LFring<size_t>;
+    // The buckets hold slot indices, which is exactly what an index ring stores.
+    using Bucket        = mem::detail::RingSlab::Ring;
+    using RealCache     = mem::detail::RingSlab::Ring;
 
     struct DisabledCache {
         DisabledCache() = default;
     };
     using CacheMember    = Bucket;
 
-public:
-    enum class BucketState : uint64_t {
-        Current = 0,
-        Grace   = 3,
-        Free    = 2,
-        Next    = 1,
-    };
+    static constexpr uint8_t FREE_OFFSET     = 2;
+    static constexpr uint8_t STAGE_OFFSET    = 0;
+    static constexpr size_t STAGES = 4; //4 Buckets used: Current : Grace : Free : Next
 
+public:
     template<typename... Args>
     explicit Recycler(size_t maxThreads, Args&&... args) :
-        epoch_{0},
+        // Listed in declaration order: members are initialized in that order regardless,
+        // and cache_ aliases into buckets_, so buckets_ must precede it.
         threadRecord_{new ThreadCell[maxThreads]},
         ticketing_{maxThreads},
-        lookup_{Capacity, std::forward<Args>(args)...},
-        buckets_{queue::LFringSlab<size_t>(NO_CACHE? 4 : 5,Capacity)},
-        cache_{*buckets_.get(NO_CACHE? 0 : 4)}
+        lookup_(Capacity, std::forward<Args>(args)...),
+        epoch_{0},
+        buckets_(STAGES + (NO_CACHE? 0 : 1), Capacity),
+        cache_{*buckets_.get(NO_CACHE? 0 : STAGES)}
     {
         // Initialize: Fill the 'initial' Free bucket (index 2 for epoch 0)
 
-        Bucket& initialFree = get_bucket(epoch_.load(std::memory_order_relaxed),BucketState::Free);
+        Bucket& initialFree = free_bucket(0);
         for(size_t i = 0; i < Capacity; ++i) {
             initialFree.enqueue(i);
         }
@@ -100,30 +124,25 @@ public:
     }
 
     template<typename Func>
-    void metadataInit(Func&& f) {
+    void metadataInit(Func&& f) const {
         if constexpr (!std::is_void_v<Meta>) {
             for(size_t i = 0; i < ticketing_.max_threads(); ++i) {
                 f(threadRecord_[i].metadata());
             }
         } else {
-            assert(false && "Recycler: metadataInit called on void Metadata");
+            assert(false && "Recycler: metadataIter called on void Metadata");
             std::abort();
         }
     }
 
+
     [[nodiscard]] bool register_thread() noexcept {
-        uint64_t t;
+        Ticket t;
         return ticketing_.acquire(t);
     }
 
     void unregister_thread() {
-        if(ticketing_.has_ticket()) {
-            uint64_t t;
-            if(ticketing_.acquire(t)) {
-                threadRecord_[t].data().clear();
-            }
-            ticketing_.release();
-        }
+        ticketing_.release();
     }
 
     // =========================================================================
@@ -134,33 +153,24 @@ public:
         return lookup_[idx];
     }
 
+    /// Calling thread's ticket, for indexing caller-owned per-thread state.
+    size_t ticket() noexcept { return get_ticket(); }
+
+    size_t max_threads() const noexcept { return ticketing_.max_threads(); }
+
     // =========================================================================
     // Epoch Protection
     // =========================================================================
 
     void protect_epoch() {
-        uint64_t ticket = get_ticket();
-        uint64_t current = epoch_.load(std::memory_order_acquire);
-        threadRecord_[ticket].data().protect(current);
+        Ticket ticket = get_ticket();
+        Epoch epoch = bit::set_msb(epoch_.load());
+        threadRecord_[ticket].data().protect(epoch);
     }
 
     void clear_epoch() {
         uint64_t ticket = get_ticket();
         threadRecord_[ticket].data().clear();
-    }
-
-    template<typename AtomT>
-    AtomT protect_epoch_and_load(std::atomic<AtomT>& atom) {
-        uint64_t ticket = get_ticket();
-        EpochCell& cell = threadRecord_[ticket].data();
-        AtomT val;
-        do {
-            uint64_t current = epoch_.load(std::memory_order_acquire);
-            cell.protect(current);
-            val = atom.load(std::memory_order_acquire);
-        } while(val != atom.load(std::memory_order_acquire));
-
-        return val;
     }
 
     // =========================================================================
@@ -189,79 +199,96 @@ public:
 
     void retire(size_t idx) {
         uint64_t ticket = get_ticket();
-        bool was_active;
+        bool active;
         Epoch current_epoch;
         EpochCell& c = threadRecord_[ticket].data();
 
         // 1. Check if we are already protecting an epoch
-        c.snapshot(was_active, current_epoch);
+        c.snapshot(active, current_epoch);
 
-        if (!was_active) {
+        if (!active) {
             // Protect the current epoch
-            current_epoch = epoch_.load(std::memory_order_acquire);
-            c.protect(current_epoch);
-            // at this point epoch can have shifted
-            // so the Index is placed in the Grace bucket
-            // Epoch can not advance more than once since protection
+            protect_epoch();
+            current_epoch = epoch_.load();
         }
 
-        Bucket& target = get_bucket(current_epoch, BucketState::Grace);
-        target.enqueue(idx);
+        (void)stage_bucket(current_epoch).enqueue(idx);  //enqueue always succeeds
 
         // cleanup if we protected
-        if (!was_active) {
-            c.clear();
+        if (!active) clear_epoch();
+
+    }
+
+    bool reclaim(size_t& index) {
+        uint64_t ticket = get_ticket();
+        Epoch e;
+        bool active;
+        EpochCell& cell = threadRecord_[ticket].data();
+        cell.snapshot(active,e);
+        return active? reclaim_while_protecting(e,index):
+        reclaim_unprotected(cell,index);
+    }
+
+    static Epoch next_epoch(Epoch e) {
+        return (e + 1) & 3;
+    }
+
+
+    bool reclaim_while_protecting(Epoch protected_e, size_t& index) {
+
+        //check the free bucket for the protected epoch
+        if(free_bucket(protected_e).dequeue(index))
+            return true;
+
+        //epoch might have shifted (at most by one: since of the protecting)
+
+        Epoch current = epoch_.load();
+
+        if(current != protected_e) //no point in checking for advancement
+            return free_bucket(current).dequeue(index);
+        //try advance the epoch
+        else if(can_advance_epoch(current)) {
+            current = next_epoch(current);
+            epoch_.store(current);
+            //if we advanced the epoch we have to account for the advancement
+            return free_bucket(current).dequeue(index);
+        } else {    //the advancement failed (either epoch mismatch or one thread was stale)
+            current = epoch_.load();
+            return current != protected_e?
+                free_bucket(current).dequeue(index):   //epoch was advanced in between our check
+                false;  //epoch cannot be advanced (we already checked the free bucket for this epoch)
         }
     }
 
-    bool reclaim(size_t& out_idx) {
-        uint64_t ticket = get_ticket();
-        bool was_active;
+    bool reclaim_unprotected(EpochCell& c, size_t& index) {
+        static constexpr unsigned COUNT = 3;    //full cycle
         Epoch e;
-        EpochCell& c = threadRecord_[ticket].data();
-        bool gotIdx = false;
+        [[maybe_unused]] bool active;
+        unsigned i = COUNT;
 
-        c.snapshot(was_active, e);
+        while(i != 0) {
+            protect_epoch();
+            c.snapshot(active, e);
 
-        // LIMIT: Full epoch rotation Valid epochs are Current - Grace - Free
-        constexpr size_t MAX_ATTEMPTS = 3;
-
-        for(size_t i = 0; i < MAX_ATTEMPTS; i++) {
-
-            //if thread wasn't active protect the current epoch
-            if(!was_active) {
-                e = epoch_.load(std::memory_order_acquire);
-                c.protect(e);
-                // by now epoch can have shifted to the Grace bucket
-                //
+            if(free_bucket(e).dequeue(index)){
+                clear_epoch();
+                return true;
             }
 
-            // Try Dequeue from Free Bucket
-            Bucket& free_b = get_bucket(e, BucketState::Free);
-            if (gotIdx = free_b.dequeue(out_idx); gotIdx) {
-                break;
-            }
+            //check if epoch shifted (we could have dequeued from next bucket)
+            Epoch s = epoch_.load();
+            if(s != e) continue;   //update epoch protection and retry
 
-            // 3. Try to Advance Epoch
+            i--;
+
+            //try to advance
             if(can_advance_epoch(e)) {
-                //if epoch can be advanced then fix the state of the bucket
-                // get_bucket(e,BucketState::Next).reset();
-                Epoch dummy_e = e;
-                (void)epoch_.compare_exchange_strong(
-                    dummy_e,dummy_e + 1,
-                    std::memory_order_acq_rel,
-                    std::memory_order_acquire
-                );
-            }
-
-            if(epoch_.load(std::memory_order_acquire) == e) {
-                break;
+                e = next_epoch(e);
+                epoch_.store(e);
             }
         }
-
-        if(!was_active)
-            c.clear();
-        return gotIdx;
+        clear_epoch();
+        return false;
     }
 
 private:
@@ -273,22 +300,29 @@ private:
         return t;
     }
 
-    Bucket& get_bucket(uint64_t epoch, BucketState state) {
-        uint64_t offset = static_cast<uint64_t>(state);
-        return *buckets_.get((epoch + offset) & 3);
+    Bucket& stage_bucket(Epoch e) {
+        return *buckets_.get((e + STAGE_OFFSET) & 3);
     }
 
-    bool can_advance_epoch(uint64_t expected_epoch) const {
+    Bucket& free_bucket(Epoch e) {
+        return *buckets_.get((e + FREE_OFFSET) & 3);
+    }
+
+    bool can_advance_epoch(Epoch expected_epoch) const {
         const size_t max_t = ticketing_.max_threads();
         bool active;
-        uint64_t t_epoch;
+        Epoch t_epoch;
 
         for (size_t i = 0; i < max_t; ++i) {
+            //acquire epoch and active state of all threads
             threadRecord_[i].data().snapshot(active, t_epoch);
-            // If any thread is stuck on the 'unsafe' epoch (Grace), we cannot advance.
-            // Note: t_epoch == expected_epoch (Active on Current) is OK.
-            if ((active && t_epoch != expected_epoch) ||
-                epoch_.load(std::memory_order_relaxed) != expected_epoch) {
+
+            //kind of optimization: if the epoch already shifted then it's pointless to check all thread states
+            if(epoch_.load() != expected_epoch)
+                return false;
+
+            //if any thread is active but stuck on a previous epoch we cannot advance
+            if (active && (t_epoch != expected_epoch)) {
                 return false;
             }
         }
@@ -299,9 +333,9 @@ private:
     Ticketing   ticketing_;
     PtrLookupT  lookup_;
 
-    ALIGNED_CACHE std::atomic<uint64_t> epoch_;
-    CACHE_PAD_TYPES(std::atomic_uint64_t);
-    queue::LFringSlab<size_t> buckets_;
+    ALIGNED_CACHE std::atomic<Epoch> epoch_{0};
+    CACHE_PAD_TYPES(std::atomic<Epoch>);
+    mem::detail::RingSlab buckets_;
     CacheMember& cache_;
 };
 

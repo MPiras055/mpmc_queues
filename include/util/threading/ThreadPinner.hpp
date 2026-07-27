@@ -15,11 +15,6 @@
 class ThreadPinner {
 public:
     ThreadPinner() {
-        bool ok = load_topology(logical_core_list);
-        if(!ok) {
-            std::cerr << "CORE TOPOLOGY file not found\n";
-            std::abort();
-        }
     }
 
     /**
@@ -43,8 +38,12 @@ public:
     bool pin_threads(
         std::vector<std::thread>& g1,
         std::vector<std::thread>& g2
-    ) const {
-
+    ) {
+        bool ok = load_topology(logical_core_list);
+        if(!ok) {
+            std::cerr << "CORE TOPOLOGY: "<< CORE_TOPOLOGY << " file not found\n";
+            std::abort();
+        }
         if(g1.size() == 0) {
             return pin_threads(g2);
         } else if (g2.size() == 0) {

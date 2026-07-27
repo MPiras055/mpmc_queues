@@ -1,3 +1,16 @@
+// ============================================================================
+// LEGACY -- NOT IN USE. Kept deliberately; do not wire in without review.
+//
+// This file predates the include-path reorganisation (include/queue/* ->
+// include/segment/* + include/cell/*). It still uses the old flat include
+// paths, so it does NOT compile, and nothing in include/ or src/ includes it.
+// It is intentionally excluded from the "every header compiles" sweep.
+//
+// Superseded by: Recycler.hpp defines its own EpochCell inline (see the nested
+// struct near the top of class Recycler). This standalone version is the richer
+// one -- it documents the MSB-as-active-flag encoding in full.
+// ============================================================================
+
 #pragma once
 #include <atomic>
 #include <cassert>
@@ -37,7 +50,7 @@ struct EpochCell {
     void protect(Epoch epoch) {
         assert(bit::get_msb(epoch) == 0 &&
                "SingleWriterCell::setActiveEpoch - epoch parameter MSB cannot be set");
-        activeAndEpoch.store(ACTIVE_MASK | epoch, std::memory_order_release);
+        activeAndEpoch.store(ACTIVE_MASK | epoch, std::memory_order_seq_cst);
     }
 
     /**
@@ -49,7 +62,7 @@ struct EpochCell {
      * @note this method is idempotent
      */
     void clear() noexcept {
-        activeAndEpoch.fetch_and(EPOCH_MASK, std::memory_order_release);
+        activeAndEpoch.store(0,std::memory_order_seq_cst);
     }
 
     /**
@@ -79,7 +92,6 @@ struct EpochCell {
         epoch  = (EPOCH_MASK & snapshot);
     }
 
-private:
     static constexpr Epoch EPOCH_MASK   = ~bit::set_msb(Epoch{0});
     static constexpr Epoch ACTIVE_MASK  =  bit::set_msb(Epoch{0});
     /// Atomic word storing both active flag (MSB) and epoch (lower 63 bits).

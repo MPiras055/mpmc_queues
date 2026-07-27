@@ -1,3 +1,19 @@
+// ============================================================================
+// LEGACY -- NOT IN USE. Kept deliberately; do not wire in without review.
+//
+// This file predates the include-path reorganisation (include/queue/* ->
+// include/segment/* + include/cell/*). It still uses the old flat include
+// paths, so it does NOT compile, and nothing in include/ or src/ includes it.
+// It is intentionally excluded from the "every header compiles" sweep.
+//
+// Contents worth keeping: PhasedBucket (a bucket built for the recycler's exact
+// access pattern -- accumulate with producers only, reclaim with consumers only,
+// never overfills), plus DebugBucket and Cache.
+// Superseded for now by: mem::detail::RingSlab (mem/detail/RingSlab.hpp), which
+// Recycler currently uses. PhasedBucket should be cheaper than a general MPMC
+// ring here; swapping it in is a separate, benchmarkable change.
+// ============================================================================
+
 #pragma once
 #include <cstddef>
 #include <cstdint>

@@ -46,9 +46,11 @@ public:
 
         // Construct objects in-place (placement new)
         for (size_t i = 0; i < size; ++i) {
-            new (&data_[i]) T(args...);
+            ::new (&data_[i]) T(args...);
         }
     }
+
+    ImmutablePtrLookup() = default;
 
     /**
      * @brief Move constructor.
