@@ -1,5 +1,11 @@
 # Architecture Patterns — Current State and Proposal
 
+> **Historical.** Sections 0-3 diagnose the *pre-refactor* code and remain an accurate
+> record of what was wrong; the file:line references point at code that has since been
+> deleted. Section 4's proposals were superseded during implementation — most visibly
+> §4.1's `AnyQueue`, which was dropped because a hand-rolled vtable is still a vtable. See
+> **[[As Shipped]]** for the current design.
+
 This note has two halves. The first names the patterns the codebase actually uses today, with
 `file:line` evidence, and explains what each one costs. The second proposes replacements chosen for
 three properties: **better encapsulation**, **harder to get wrong**, and **cheap to derive new

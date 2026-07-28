@@ -22,11 +22,11 @@ namespace mem::source {
  * Models core::SegmentSource. `acquire()` allocates and therefore never fails, so a
  * proxy over this source is unbounded unless an admission policy says otherwise.
  *
- * @note This does not reuse util::hazard::HazardVector, for a concrete reason: that
- *       class reclaims with `delete obj`, but a co-allocated segment is placement-new'd
- *       into std::aligned_alloc storage and must be released through
- *       SingleBlock::destroy. Pairing `delete` with `aligned_alloc` is undefined, and it
- *       would break outright under sized or aligned deallocation.
+ * @note This owns its hazard slots and retire lists rather than delegating. The earlier
+ *       util::hazard::HazardVector (since removed) reclaimed with `delete obj`, but a
+ *       co-allocated segment is placement-new'd into std::aligned_alloc storage and must
+ *       be released through SingleBlock::destroy. Pairing `delete` with `aligned_alloc`
+ *       is undefined and breaks outright under sized or aligned deallocation.
  *
  * @note One hazard slot per thread is enough: the traversal protects the head *or* the
  *       tail at any moment, never both.

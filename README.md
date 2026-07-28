@@ -116,12 +116,27 @@ reclamation scheme:
 dry, which is a *source that runs out* rather than a rule the proxy enforces. That
 observation is what collapses four proxies into one.
 
-`source::Pool` reuses segments, so it `static_assert`s on `segment_traits<S>::recyclable` —
+`source::Pool` owns its epoch-based reclamation — three limbo buckets and a separate free
+list — and reuses segments, so it `static_assert`s on `segment_traits<S>::recyclable`:
 pairing it with FAAArray or HQ is a compile error, not a runtime abort.
 
 Item admission *reserves* rather than testing-then-acting, so the bound is hard: a plain
 check followed by an enqueue let every producer that passed the check commit, overshooting
 by up to one item per producer.
+
+### Mistakes the compiler catches
+
+| Mistake | Caught by |
+| --- | --- |
+| a linked-only algorithm used standalone | `linkage::Linked` constraint |
+| a pooled source over a non-recyclable segment | `segment_traits<S>::recyclable` assert |
+| a `segment_traits` specialization missing a flag | `core::CompleteSegmentTraits` |
+| an option tag that is misspelled or belongs to another algorithm | `meta::AcceptsOnly` |
+| a registry entry with an ambiguous construction shape | `core::Constructible` |
+
+Each of these used to be silent: an unrecognised option read as "not requested", an
+incomplete traits block failed at some unrelated use site, and a queue that lost its
+`create()` simply took the other branch.
 
 ### Adding an implementation
 
@@ -155,6 +170,7 @@ including the Python tooling, which asks the binary what exists.
 | `TaggingTest` | cell tagging policies, `can_store_null`, claim tokens |
 | `AdmissionTest` | bounds hold, including concurrently |
 | `MemoryLayoutTest` | single-block layout arithmetic |
+| `PoolReclamationTest` | the pooled source's epoch machine, driven deterministically |
 | `ConcurrencyTest` | loss, duplication and per-producer FIFO across thread shapes |
 
 Concurrency defects here are intermittent — a lost-item bug reproduced in 3 runs of 8, a
@@ -163,8 +179,10 @@ it) and treats a stall as a failure rather than hanging.
 
 ## Documentation
 
+- [`docs/notes/As Shipped.md`](docs/notes/As%20Shipped.md) — **the design that exists**,
+  every deviation from the plan, how the pooled reclamation works, and what is still open
 - [`python/README.md`](python/README.md) — running sweeps and plotting
-- [`docs/notes/Architecture Patterns.md`](docs/notes/Architecture%20Patterns.md) — the
-  patterns the pre-refactor code used and what each cost
-- [`docs/notes/Abstraction Map.md`](docs/notes/Abstraction%20Map.md) — the abstraction set,
-  UML diagrams, and the refactor plan
+- [`docs/notes/Architecture Patterns.md`](docs/notes/Architecture%20Patterns.md) —
+  historical: the patterns the pre-refactor code used and what each cost
+- [`docs/notes/Abstraction Map.md`](docs/notes/Abstraction%20Map.md) — the abstraction set
+  and UML; the plan rather than the outcome

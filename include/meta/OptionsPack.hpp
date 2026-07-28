@@ -3,6 +3,12 @@
 
 namespace meta {
 
+namespace detail {
+/// Is @p T one of @p Us? Factored out so `accepts` folds over one pack, not two nested.
+template <typename T, typename... Us>
+inline constexpr bool is_one_of_v = (std::is_same_v<T, Us> || ...);
+} // namespace detail
+
     /**
      * @brief A compile-time immutable container for option types and values.
      *
@@ -30,6 +36,21 @@ namespace meta {
          * @brief The number of options currently in the pack.
          */
         static constexpr auto size = sizeof...(Options);
+
+        /**
+         * @brief Is every option in this pack one of @p Accepted?
+         *
+         * `has<>` answers false for anything it does not recognise, which means a
+         * misspelled tag, or one belonging to a different algorithm, reads as "not
+         * requested" and quietly does nothing. `OptionsPack<VyukovOpt::force_pow2>` handed
+         * to PRQ is the concrete case: PRQ has its own `force_pow2` and would ignore
+         * Vyukov's.
+         *
+         * An algorithm declares what it accepts and asserts this, so an unrecognised tag
+         * becomes an error at the point of instantiation.
+         */
+        template <typename... Accepted>
+        static constexpr bool accepts = (detail::is_one_of_v<Options, Accepted...> && ...);
 
 
         // =============================================================
@@ -132,5 +153,17 @@ namespace meta {
      * @brief A convenience alias for starting a new configuration chain.
      */
     using EmptyOptions = OptionsPack<>;
+
+    /**
+     * @brief Constrain a template so it only accepts option tags it understands.
+     *
+     * Used as a requires-clause rather than an in-class static_assert on purpose: a
+     * constraint is checked when the specialization is *named*, so
+     * `Bad* p = nullptr;` is already an error. An in-class assertion only fires once
+     * something forces instantiation, which lets a wrong configuration travel a long
+     * way before it is caught.
+     */
+    template <typename Opt, typename... Accepted>
+    concept AcceptsOnly = Opt::template accepts<Accepted...>;
 
 } // namespace meta

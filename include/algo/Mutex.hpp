@@ -122,6 +122,7 @@ struct core::segment_traits<algo::Mutex<T, Opt, Link>> {
     static constexpr bool recyclable = true;
     static constexpr bool can_store_null = true;
 };
+MPMC_ASSERT_SEGMENT_TRAITS(algo::Mutex<int*, meta::EmptyOptions, linkage::None>);
 
 namespace queue {
 template <typename T, typename Opt = meta::EmptyOptions>

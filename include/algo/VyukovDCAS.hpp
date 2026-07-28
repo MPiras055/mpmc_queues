@@ -32,8 +32,10 @@ struct VyukovDCASOpt {
  *       all duplicates of things that already existed.
  */
 template <typename T, typename Opt = meta::EmptyOptions, typename Link = linkage::None>
+    requires meta::AcceptsOnly<Opt, typename VyukovDCASOpt::no_cell_padding>
 class VyukovDCAS : public mem::SingleBlock<VyukovDCAS<T, Opt, Link>> {
     using Self = VyukovDCAS<T, Opt, Link>;
+
     static_assert(sizeof(T) == sizeof(uintptr_t), "VyukovDCAS: T must be pointer-sized");
     static_assert(Link::is_linked == false, "VyukovDCAS is a standalone comparator only");
 

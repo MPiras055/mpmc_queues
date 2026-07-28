@@ -31,9 +31,10 @@ struct PSCQOpt {
  */
 template <typename T, typename Opt = meta::EmptyOptions, typename Link = linkage::None,
           typename Tag = cell::MsbTag<T>>
-    requires cell::ClaimingTag<Tag, T>
+    requires meta::AcceptsOnly<Opt, typename PSCQOpt::no_cell_padding> && cell::ClaimingTag<Tag, T>
 class PSCQ : public mem::SingleBlock<PSCQ<T, Opt, Link, Tag>> {
     using Self = PSCQ<T, Opt, Link, Tag>;
+
     using word = typename Tag::word;
     static_assert(Link::is_linked == false, "PSCQ is a standalone comparator only");
 

@@ -14,7 +14,7 @@
 #pragma once
 #include <cstdint>
 #include <cassert>
-#include <bit.hpp>
+#include <util/bit.hpp>
 
 namespace util::hazard::recycler::details {
 

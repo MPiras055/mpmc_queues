@@ -41,9 +41,10 @@ struct HQOpt {
  */
 template <typename T, typename Opt, typename Link,
           typename Tag = cell::LowTag<T>>
-    requires linkage::Linked<Link> && cell::Tagging<Tag, T>
+    requires meta::AcceptsOnly<Opt, typename HQOpt::force_cell_padding> && linkage::Linked<Link> && cell::Tagging<Tag, T>
 class HQ : public mem::SingleBlock<HQ<T, Opt, Link, Tag>> {
     using Self = HQ<T, Opt, Link, Tag>;
+
     using word = typename Tag::word;
 
     static constexpr bool pad_cells = Opt::template has<typename HQOpt::force_cell_padding>;
@@ -225,6 +226,7 @@ struct core::segment_traits<algo::HQ<T, Opt, Link, Tag>> {
     static constexpr bool recyclable = false; ///< see HQ::reopen
     static constexpr bool can_store_null = Tag::can_store_null;
 };
+MPMC_ASSERT_SEGMENT_TRAITS(algo::HQ<int*, meta::EmptyOptions, linkage::Node<mem::PtrHandle>>);
 
 namespace seg {
 template <typename T, typename Opt = meta::EmptyOptions, typename HP = mem::PtrHandle>

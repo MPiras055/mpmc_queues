@@ -33,8 +33,9 @@ namespace core {
  *
  * @note Per-thread proxy bookkeeping is *not* part of this contract. The source only
  *       exposes `ticket()` / `max_threads()`, and the proxy owns its own per-thread
- *       array. That keeps the two concerns from being welded together, which is what
- *       made HazardVector and Recycler non-interchangeable in the first place.
+ *       array. Welding the two together is what made the pre-refactor reclamation
+ *       classes non-interchangeable: each carried the proxy's metadata as a template
+ *       parameter, so a proxy written against one could not move to the other.
  */
 template <typename Src, typename S>
 concept SegmentSource = requires(Src src, const Src csrc, typename Src::handle h,

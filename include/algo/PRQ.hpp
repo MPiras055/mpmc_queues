@@ -40,9 +40,10 @@ struct PRQOpt {
  */
 template <typename T, typename Opt, typename Link,
           typename Tag = cell::MsbTag<T>>
-    requires linkage::Linked<Link> && cell::ClaimingTag<Tag, T>
+    requires meta::AcceptsOnly<Opt, typename PRQOpt::force_pow2, typename PRQOpt::no_cell_padding> && linkage::Linked<Link> && cell::ClaimingTag<Tag, T>
 class PRQ : public mem::SingleBlock<PRQ<T, Opt, Link, Tag>> {
     using Self = PRQ<T, Opt, Link, Tag>;
+
     using word = typename Tag::word;
 
     static constexpr bool pad_cells = !Opt::template has<typename PRQOpt::no_cell_padding>;
@@ -288,6 +289,7 @@ struct core::segment_traits<algo::PRQ<T, Opt, Link, Tag>> {
     static constexpr bool recyclable = true;
     static constexpr bool can_store_null = Tag::can_store_null;
 };
+MPMC_ASSERT_SEGMENT_TRAITS(algo::PRQ<int*, meta::EmptyOptions, linkage::Node<mem::PtrHandle>>);
 
 namespace seg {
 template <typename T, typename Opt = meta::EmptyOptions, typename HP = mem::PtrHandle>

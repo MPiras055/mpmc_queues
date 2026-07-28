@@ -60,9 +60,9 @@ public:
      * @param chunks           bound, in segments, for a bounded Admit; ignored by None
      */
     LinkedProxy(std::size_t segment_capacity, std::size_t max_threads, std::size_t chunks = 4)
-        : seg_capacity_{segment_capacity}, chunks_{chunks},
+        : seg_capacity_{segment_capacity},
           source_{max_threads, segment_capacity},
-          admit_{segment_capacity * chunks, segment_capacity}, meta_(max_threads) {
+          admit_{Admit::config(segment_capacity, chunks)}, meta_(max_threads) {
         assert(segment_capacity != 0 && "LinkedProxy: segment capacity must be non-null");
         assert(max_threads != 0 && "LinkedProxy: max_threads must be non-null");
 
@@ -226,11 +226,8 @@ public:
         return total > 0 ? static_cast<std::size_t>(total) : 0;
     }
 
-    /// Item ceiling for a bounded proxy; the segment capacity for an unbounded one.
-    std::size_t capacity() const noexcept {
-        if constexpr (Admit::bounded) return seg_capacity_ * chunks_;
-        else return seg_capacity_;
-    }
+    /// Item ceiling. What that means is the policy's business, not the traversal's.
+    std::size_t capacity() const noexcept { return admit_.capacity(seg_capacity_); }
 
     [[nodiscard]] bool acquire() noexcept { return source_.register_thread(); }
     void release() noexcept { source_.unregister_thread(); }
@@ -268,7 +265,6 @@ private:
     CACHE_PAD_TYPES(std::atomic<H>);
 
     const std::size_t seg_capacity_;
-    const std::size_t chunks_;
     Source source_;
     [[no_unique_address]] Admit admit_;
     std::vector<Meta> meta_;

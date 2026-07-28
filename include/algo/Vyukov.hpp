@@ -34,8 +34,10 @@ struct VyukovOpt {
  * @tparam Link linkage::None or linkage::Node<HandlePolicy>
  */
 template <typename T, typename Opt = meta::EmptyOptions, typename Link = linkage::None>
+    requires meta::AcceptsOnly<Opt, typename VyukovOpt::force_pow2, typename VyukovOpt::no_cell_padding>
 class Vyukov : public mem::SingleBlock<Vyukov<T, Opt, Link>> {
     using Self = Vyukov<T, Opt, Link>;
+
 
     static constexpr bool pad_cells = !Opt::template has<typename VyukovOpt::no_cell_padding>;
     static constexpr bool force_pow2 = Opt::template has<typename VyukovOpt::force_pow2>;
@@ -197,6 +199,7 @@ struct core::segment_traits<algo::Vyukov<T, Opt, Link>> {
     static constexpr bool recyclable = true;
     static constexpr bool can_store_null = true;
 };
+MPMC_ASSERT_SEGMENT_TRAITS(algo::Vyukov<int*, meta::EmptyOptions, linkage::None>);
 
 namespace queue {
 /// Standalone bounded Vyukov ring.

@@ -11,35 +11,49 @@ namespace core {
  * BoundedChunkProxy was this predicate; everything else in those three files was the
  * same Michael-Scott traversal written out three times.
  *
- * Every policy is constructible as `A(total_capacity, segment_capacity)` so the proxy
- * can build one generically:
- *   - `admit::None`         ignores both (empty struct, costs nothing)
- *   - `admit::ItemCount`    bounds items:    total_capacity
- *   - `admit::SegmentCount` bounds segments: total_capacity / segment_capacity
+ * @note A policy configures *itself*. The proxy hands over the two numbers it knows —
+ *       segment capacity and a chunk count — and the policy decides what they mean to
+ *       it. Previously the proxy did that arithmetic, so it had to know that ItemCount
+ *       wanted `segment_capacity * chunks` while SegmentCount wanted the divisor, and
+ *       `capacity()` branched on whether the policy was bounded at all. That is the
+ *       policy's business, not the traversal's.
+ *
+ * @note Config is passed by value rather than the policy being returned from a factory:
+ *       these hold atomics, so they are not movable and must be constructed in place.
  */
 template <typename A>
-concept AdmissionPolicy =
-    std::constructible_from<A, std::size_t, std::size_t> && requires(A a, const A ca) {
-        { A::bounded } -> std::convertible_to<bool>; ///< does this policy impose any ceiling?
-        { ca.bound() } noexcept -> std::same_as<std::size_t>; ///< 0 means unbounded
+concept AdmissionPolicy = requires(A a, const A ca, std::size_t n) {
+    typename A::Config;
 
-        /**
-         * Claim the right to admit one item. Where the policy can, this *reserves*
-         * rather than merely testing: a plain `may_admit()` check followed by an
-         * enqueue is a check-then-act race, and every producer that passes the test
-         * before any of them commits will overshoot. Measured on the previous
-         * check-then-act version with 4 producers against a bound of 256: peak
-         * occupancy 257.
-         */
-        { a.try_admit() } noexcept -> std::same_as<bool>;
+    /// Derive this policy's configuration from what the proxy knows.
+    { A::config(n, n) } -> std::same_as<typename A::Config>;
+    requires std::constructible_from<A, typename A::Config>;
 
-        /// Release a claim taken by try_admit() when the enqueue could not go through.
-        { a.cancel_admit() } noexcept -> std::same_as<void>;
+    { A::bounded } -> std::convertible_to<bool>; ///< does this policy impose any ceiling?
 
-        { a.on_enqueue() } noexcept -> std::same_as<void>;
-        { a.on_dequeue() } noexcept -> std::same_as<void>;
-        { a.on_segment_linked() } noexcept -> std::same_as<void>;
-        { a.on_segment_retired() } noexcept -> std::same_as<void>;
-    };
+    /// The item ceiling, given the segment capacity. Lets the proxy report a capacity
+    /// without knowing whether the bound counts items, segments, or nothing at all.
+    { ca.capacity(n) } noexcept -> std::same_as<std::size_t>;
+
+    /// The bound in the policy's own unit (items, segments, ...). For diagnostics.
+    { ca.bound() } noexcept -> std::same_as<std::size_t>;
+
+    /**
+     * Claim the right to admit one item. Where the policy can, this *reserves* rather
+     * than merely testing: a plain `may_admit()` check followed by an enqueue is a
+     * check-then-act race, and every producer that passes the test before any of them
+     * commits will overshoot. Measured on the previous check-then-act version with 4
+     * producers against a bound of 256: peak occupancy 257.
+     */
+    { a.try_admit() } noexcept -> std::same_as<bool>;
+
+    /// Release a claim taken by try_admit() when the enqueue could not go through.
+    { a.cancel_admit() } noexcept -> std::same_as<void>;
+
+    { a.on_enqueue() } noexcept -> std::same_as<void>;
+    { a.on_dequeue() } noexcept -> std::same_as<void>;
+    { a.on_segment_linked() } noexcept -> std::same_as<void>;
+    { a.on_segment_retired() } noexcept -> std::same_as<void>;
+};
 
 } // namespace core

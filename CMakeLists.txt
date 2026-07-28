@@ -166,9 +166,9 @@ if(BUILD_TESTING_MPMC)
         TaggingTest               # cell tagging policies
         AdmissionTest             # bound enforcement, per admission policy
         MemoryLayoutTest          # single-block layout arithmetic
+        PoolReclamationTest       # the pooled source's epoch machine, deterministically
         ConcurrencyTest           # MPMC loss/duplication/ordering, several thread shapes
         DynamicThreadTicketTest
-        HazardVectorTest
     )
 
     foreach(test_name IN LISTS UNIT_TESTS)

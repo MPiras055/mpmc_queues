@@ -30,8 +30,10 @@ struct VyukovNoABAOpt {
  * is the comparison point for VyukovDCAS, which instead pays for a real double-width CAS.
  */
 template <typename T, typename Opt = meta::EmptyOptions, typename Link = linkage::None>
+    requires meta::AcceptsOnly<Opt, typename VyukovNoABAOpt::no_cell_padding>
 class VyukovNoABA : public mem::SingleBlock<VyukovNoABA<T, Opt, Link>> {
     using Self = VyukovNoABA<T, Opt, Link>;
+
     static_assert(sizeof(T) == sizeof(uintptr_t), "VyukovNoABA: T must be pointer-sized");
     static_assert(Link::is_linked == false, "VyukovNoABA is a standalone comparator only");
 

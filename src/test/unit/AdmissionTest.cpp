@@ -32,7 +32,7 @@ constexpr std::size_t kChunks = 4;
 // ---------------------------------------------------------------------------
 
 TEST(AdmitNone, AdmitsEverythingAndCostsNothing) {
-    proxy::admit::None a{0, 0};
+    proxy::admit::None a{proxy::admit::None::config(0, 0)};
     EXPECT_TRUE(a.try_admit());
     EXPECT_EQ(a.bound(), 0u);
     EXPECT_FALSE(proxy::admit::None::bounded);
@@ -41,7 +41,7 @@ TEST(AdmitNone, AdmitsEverythingAndCostsNothing) {
 }
 
 TEST(AdmitItemCount, StopsAdmittingAtTheBound) {
-    proxy::admit::ItemCount a{4, kSegment};
+    proxy::admit::ItemCount a{proxy::admit::ItemCount::Config{4}};
     EXPECT_EQ(a.bound(), 4u);
     for (int i = 0; i < 4; ++i) {
         ASSERT_TRUE(a.try_admit()) << "refused at occupancy " << i;
@@ -53,7 +53,7 @@ TEST(AdmitItemCount, StopsAdmittingAtTheBound) {
 }
 
 TEST(AdmitSegmentCount, CountsSegmentsNotItems) {
-    proxy::admit::SegmentCount a{kSegment * kChunks, kSegment};
+    proxy::admit::SegmentCount a{proxy::admit::SegmentCount::config(kSegment, kChunks)};
     EXPECT_EQ(a.bound(), kChunks);
     // Item traffic must not move a segment-based bound.
     for (int i = 0; i < 1000; ++i) a.on_enqueue();

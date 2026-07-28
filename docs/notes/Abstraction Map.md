@@ -1,5 +1,13 @@
 # Abstraction Map — Composable, Vtable-Free Queue Architecture
 
+> **This is the plan, not the outcome.** It was written before implementation and several
+> of its specifics changed while being built — `AnyQueue` was dropped entirely, `namespace
+> link` became `linkage`, `may_admit` became `try_admit`/`cancel_admit`, `queue::LFring`
+> became `queue::IndexRing`, and `Pool` ended up owning its reclamation rather than wrapping
+> `Recycler`. See **[[As Shipped]]** for the design that exists and a table of every
+> deviation. The UML, the layering and the reasoning below are still accurate and are why
+> this note is kept.
+
 Companion to [[Architecture Patterns]], which diagnosed what is wrong with the current tree. This
 note designs the replacement: the full set of abstractions, a UML view of how they compose, the
 target file layout, and the order in which to get there.

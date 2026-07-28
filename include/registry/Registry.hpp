@@ -1,5 +1,6 @@
 #pragma once
 #include <algo/FAAArray.hpp>
+#include <core/Construction.hpp>
 #include <algo/HQ.hpp>
 #include <algo/LFring.hpp>
 #include <algo/Mutex.hpp>
@@ -73,17 +74,14 @@ using Linked = meta::TypeList<
 
     Entry<"chunk-vyukov", proxy::ChunkBounded<T, seg::Vyukov<T>>>,
     Entry<"chunk-prq", proxy::ChunkBounded<T, seg::PRQ<T>>>,
-    Entry<"chunk-faaarray", proxy::ChunkBounded<T, seg::FAAArray<T>>>>;
+    Entry<"chunk-faaarray", proxy::ChunkBounded<T, seg::FAAArray<T>>>,
 
-    /**
-     * Keep comment out the MemBounded Proxy fails right now, to solve
-     */
     // Pooled: the bound is the pool running dry, so the admission policy is None.
     // FAAArray and HQ cannot appear here -- segment_traits says they are not
     // recyclable, and mem::source::Pool static_asserts on exactly that.
-    // Entry<"mem-vyukov", proxy::MemBounded<T, IdxVyukov<T>, 8>>,
-    // Entry<"mem-prq", proxy::MemBounded<T, IdxPRQ<T>, 8>>,
-    // Entry<"mem-scq", proxy::MemBounded<T, IdxSCQ<T>, 8>>>;
+    Entry<"mem-vyukov", proxy::MemBounded<T, IdxVyukov<T>, 8>>,
+    Entry<"mem-prq", proxy::MemBounded<T, IdxPRQ<T>, 8>>,
+    Entry<"mem-scq", proxy::MemBounded<T, IdxSCQ<T>, 8>>>;
 
 /// Everything, for the benchmark.
 template <typename T>
@@ -100,11 +98,19 @@ using All = meta::concat<Standalone<T>, Linked<T>>;
  */
 template <typename Q>
 class Instance {
-    static constexpr bool single_block = requires(std::size_t n) { Q::create(n); };
+    // Declared, not probed. `Constructible` holds only when exactly one shape applies, so
+    // a queue that supports both, or neither, is a diagnosable error here rather than a
+    // silent wrong branch followed by a confusing constructor failure elsewhere.
+    static_assert(core::BlockAllocated<Q> || core::DirectConstructed<Q>,
+                  "registry entry is neither block-allocated (Q::create(capacity)) nor "
+                  "directly constructible from (segment_capacity, max_threads)");
+    static_assert(core::Constructible<Q>,
+                  "registry entry satisfies both construction shapes; which one applies "
+                  "is ambiguous");
 
 public:
     Instance(std::size_t capacity, std::size_t max_threads) {
-        if constexpr (single_block) {
+        if constexpr (core::BlockAllocated<Q>) {
             (void)max_threads;
             block_.reset(Q::create(capacity));
         } else {
@@ -113,16 +119,16 @@ public:
     }
 
     Q& get() noexcept {
-        if constexpr (single_block) return *block_;
+        if constexpr (core::BlockAllocated<Q>) return *block_;
         else return *owned_;
     }
 
     /// Proxies require a per-thread ticket; standalone queues have no such notion.
     static void join(Q& q) noexcept {
-        if constexpr (requires { q.acquire(); }) (void)q.acquire();
+        if constexpr (core::Ticketed<Q>) (void)q.acquire();
     }
     static void leave(Q& q) noexcept {
-        if constexpr (requires { q.release(); }) q.release();
+        if constexpr (core::Ticketed<Q>) q.release();
     }
 
 private:

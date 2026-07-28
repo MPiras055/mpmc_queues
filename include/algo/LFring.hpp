@@ -34,8 +34,10 @@ struct LFringOpt {
  * @note Not a linked segment on its own. SCQ is the segment; this is its component.
  */
 template <typename Opt = meta::EmptyOptions, typename Link = linkage::None>
+    requires meta::AcceptsOnly<Opt, typename LFringOpt::no_cell_padding, typename LFringOpt::indirect_store>
 class LFring : public mem::SingleBlock<LFring<Opt, Link>> {
     using Self = LFring<Opt, Link>;
+
 
     static constexpr bool pad_cells = !Opt::template has<typename LFringOpt::no_cell_padding>;
     static constexpr bool direct_store = !Opt::template has<typename LFringOpt::indirect_store>;

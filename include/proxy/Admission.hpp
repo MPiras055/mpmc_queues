@@ -9,17 +9,25 @@ namespace proxy::admit {
 /**
  * @brief No bound: admit everything.
  *
- * An empty struct, so under [[no_unique_address]] an unbounded proxy pays nothing for
- * the policy hook -- no counters, no cache lines, no atomics on the hot path.
+ * An empty struct apart from its (empty) config, so under [[no_unique_address]] an
+ * unbounded proxy pays nothing for the policy hook -- no counters, no cache lines, no
+ * atomics on the hot path.
  */
 struct None {
+    struct Config {};
+    static constexpr Config config(std::size_t /*segment*/, std::size_t /*chunks*/) noexcept {
+        return {};
+    }
+
     static constexpr bool bounded = false;
 
-    constexpr None(std::size_t /*total*/, std::size_t /*segment*/) noexcept {}
+    constexpr explicit None(Config) noexcept {}
 
     constexpr bool try_admit() noexcept { return true; }
     constexpr void cancel_admit() noexcept {}
     constexpr std::size_t bound() const noexcept { return 0; } ///< 0 == unbounded
+    /// Nothing caps the total, so the useful number is what one segment holds.
+    constexpr std::size_t capacity(std::size_t segment) const noexcept { return segment; }
 
     constexpr void on_enqueue() noexcept {}
     constexpr void on_dequeue() noexcept {}
@@ -30,20 +38,28 @@ struct None {
 /**
  * @brief Bound the number of live items.
  *
- * Two counters rather than one, so producers and consumers touch different cache
- * lines; the difference is the occupancy. Replaces BoundedCounterProxy.
+ * Two counters rather than one, so producers and consumers touch different cache lines;
+ * the difference is the occupancy. Replaces BoundedCounterProxy.
  */
 class ItemCount {
 public:
+    struct Config {
+        std::size_t items;
+    };
+    /// A chunk count times the segment capacity is how many items fit.
+    static constexpr Config config(std::size_t segment, std::size_t chunks) noexcept {
+        return {segment * chunks};
+    }
+
     static constexpr bool bounded = true;
 
-    ItemCount(std::size_t total, std::size_t /*segment*/) noexcept : bound_{total} {}
+    explicit ItemCount(Config c) noexcept : bound_{c.items} {}
 
     /**
      * Reserve a slot, or refuse.
      *
-     * The ticket comes from the fetch_add, so no two producers can claim the same one;
-     * a losing claim is rolled back immediately. `popped_` only ever grows, so reading a
+     * The ticket comes from the fetch_add, so no two producers can claim the same one; a
+     * losing claim is rolled back immediately. `popped_` only ever grows, so reading a
      * stale (smaller) value overstates occupancy and errs towards refusing -- the safe
      * direction. Together those give a hard ceiling rather than one that leaks by the
      * number of concurrent producers.
@@ -60,6 +76,7 @@ public:
     void cancel_admit() noexcept { pushed_.fetch_sub(1, std::memory_order_release); }
 
     std::size_t bound() const noexcept { return bound_; }
+    std::size_t capacity(std::size_t /*segment*/) const noexcept { return bound_; }
 
     /// The reservation in try_admit() already counted this item.
     void on_enqueue() noexcept {}
@@ -79,15 +96,22 @@ private:
  * @brief Bound the number of live segments.
  *
  * Coarser than ItemCount -- the real ceiling is bound() * segment_capacity -- but the
- * counters move once per segment rather than once per item, so the hot path is
- * untouched. Replaces BoundedChunkProxy.
+ * counters move once per segment rather than once per item, so the hot path is untouched.
+ * Replaces BoundedChunkProxy.
  */
 class SegmentCount {
 public:
+    struct Config {
+        std::size_t segments;
+    };
+    /// This policy counts segments, so the chunk count *is* the bound.
+    static constexpr Config config(std::size_t /*segment*/, std::size_t chunks) noexcept {
+        return {chunks};
+    }
+
     static constexpr bool bounded = true;
 
-    SegmentCount(std::size_t total, std::size_t segment) noexcept
-        : bound_{segment ? (total / segment) : 1} {}
+    explicit SegmentCount(Config c) noexcept : bound_{c.segments ? c.segments : 1} {}
 
     /**
      * Tests rather than reserves.
@@ -107,6 +131,7 @@ public:
     void cancel_admit() noexcept {}
 
     std::size_t bound() const noexcept { return bound_; }
+    std::size_t capacity(std::size_t segment) const noexcept { return bound_ * segment; }
 
     void on_enqueue() noexcept {}
     void on_dequeue() noexcept {}

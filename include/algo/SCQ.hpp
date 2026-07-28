@@ -34,8 +34,10 @@ struct SCQOpt {
  *       constexpr and mem::SingleBlock static_asserts that the regions do not overlap.
  */
 template <typename T, typename Opt = meta::EmptyOptions, typename Link = linkage::None>
+    requires meta::AcceptsOnly<Opt, typename SCQOpt::no_cell_padding>
 class SCQ : public mem::SingleBlock<SCQ<T, Opt, Link>> {
     using Self = SCQ<T, Opt, Link>;
+
 
     /// The rings index into our buffer, so they never need a fullness pre-check.
     using RingOpt = typename meta::OptionsPack<typename LFringOpt::indirect_store>::
@@ -214,6 +216,7 @@ struct core::segment_traits<algo::SCQ<T, Opt, Link>> {
     /// The payload is ordinary memory; nothing is stolen from its value space.
     static constexpr bool can_store_null = true;
 };
+MPMC_ASSERT_SEGMENT_TRAITS(algo::SCQ<int*, meta::EmptyOptions, linkage::None>);
 
 namespace queue {
 template <typename T, typename Opt = meta::EmptyOptions>
