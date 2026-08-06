@@ -168,7 +168,7 @@ if(BUILD_TESTING_MPMC)
         MemoryLayoutTest          # single-block layout arithmetic
         PoolReclamationTest       # the pooled source's epoch machine, deterministically
         ConcurrencyTest           # MPMC loss/duplication/ordering, several thread shapes
-        DynamicThreadTicketTest
+        ThreadRegistryTest        # the lock-free thread registry both sources are built on
     )
 
     foreach(test_name IN LISTS UNIT_TESTS)

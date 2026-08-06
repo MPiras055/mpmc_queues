@@ -13,6 +13,13 @@ namespace mem {
  *
  * @note This used to exist twice: once at global scope inside BoundedMemProxy.hpp and
  *       once in a header nothing included. One definition, here.
+ * 
+ * @note: this can be further specialized since BoundedMemProxy knows the size of the pool at
+ * compile time. We can add a template size_t and compute the necessary masks to extract the value
+ * at rutime, this dictates that the Version and Index fields become their own data types, Version has
+ * to be encoded with uint64_t (since at the best/worst case the pool manages 2 segments) so the version
+ * can encode 62 bit value. For the index we can stick to uint32_t so to have a hard cap on the representation
+ * range of Version (less than 32 bit versions may become ineffective for ABA mitigation). 
  */
 struct VersionedIndex {
     uint64_t raw = 0;

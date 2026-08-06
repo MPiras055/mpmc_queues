@@ -40,7 +40,7 @@ struct FAAArrayOpt {
  * @tparam Tag cell::Tagging policy. MsbTag by default, so a null payload is storable.
  */
 template <typename T, typename Opt, typename Link,
-          typename Tag = cell::MsbTag<T>>
+          typename Tag = cell::LowTag<T>>
     requires meta::AcceptsOnly<Opt, typename FAAArrayOpt::force_cell_padding> && linkage::Linked<Link> && cell::Tagging<Tag, T>
 class FAAArray : public mem::SingleBlock<FAAArray<T, Opt, Link, Tag>> {
     using Self = FAAArray<T, Opt, Link, Tag>;
@@ -140,6 +140,24 @@ public:
      * Previously this was `assert(false && "TODO")` — a debug-only runtime abort inside
      * open(). As a return value plus `segment_traits::recyclable == false` it is a fact
      * the pooled source can check before ever selecting this segment.
+     * 
+     * 
+     * @debug: Implementation Hint
+     * Each segment starts with all cells `empty` and after closure and full drain ends up
+     * with all cells as `consumed`. The segment would have to store an additional flag which
+     * simply flips the consumed cells and treats them as opened. Furthermore everytime enqueing
+     * an item each thread should check for `empty/consumed` cells based on the flag, in this way
+     * the reopen only has to flip the instance flag (can be done via CAS with no retry). This would
+     * also need to rework a bit how the whole segment uses the flags, the most simple way is to have
+     * a ternary check for each time a tag is evaluated or stored. The tag can be also benefit from not
+     * relying on padding since is setted only once per segment lifetime. We only need one bit for encoding
+     * and both enqueue and dequeue read from the capacity counter, so we could encode it as the LSB or MSB
+     * depending on the data type, else we can use explicit encoding
+     * 
+     * @debug: Implementation 02:
+     * the reopen method has to be executed in isolation so no need to be MT-safe: 
+     * The reopen method has also to set the handle so that no successor is set, and i was
+     * fixating on the interleaving while it's not needed
      */
     bool reopen() noexcept
         requires(Link::is_linked)

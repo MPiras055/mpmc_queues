@@ -5,7 +5,7 @@
 #include <mem/detail/RingSlab.hpp>
 #include <util/bit.hpp>
 #include <util/specs.hpp>
-#include <util/threading/DynamicThreadTicket.hpp>
+#include <util/threading/ThreadRegistry.hpp>
 #include <atomic>
 #include <cassert>
 #include <cstddef>
@@ -64,18 +64,27 @@ class Pool {
                   "false: this segment cannot be reopened after being drained");
     static_assert(N >= 2, "a pool needs at least two segments to make progress");
 
-    using Ticketing = util::threading::DynamicThreadTicket;
-
     /// Limbo buckets. Three is the minimum that distinguishes current / grace / safe.
     static constexpr std::size_t kStages = 3;
     /// One more ring holds everything currently reusable.
     static constexpr std::size_t kFreeBucket = kStages;
 
     /// Per-thread published epoch. MSB set means pinned; the low bits are the epoch.
-    struct ALIGNED_CACHE Slot {
+    struct ThreadData {
         std::atomic<uint64_t> state{0};
-        CACHE_PAD_TYPES(std::atomic<uint64_t>);
     };
+
+    /**
+     * The epoch scan only ever needs to ask "is any *attached* thread pinned behind me",
+     * so the per-thread words live in a registry rather than in an array sized by
+     * max_threads. Two things follow. The scan is O(attached threads), which matters
+     * because acquire() runs it whenever the pool comes up dry. And a thread that dies
+     * while pinned no longer wedges the epoch forever: its node leaves the active list, so
+     * it stops being consulted, where a fixed slot array kept its stale pinned word
+     * visible for the lifetime of the pool.
+     */
+    using Registry = util::threading::ThreadRegistry<ThreadData>;
+    using Node = typename Registry::Node;
 
 public:
     using handle = mem::VersionedIndex;
@@ -92,21 +101,19 @@ public:
      * publish — holding the pin is what keeps every slot alive.
      */
     class guard {
-        Pool* owner_;
-        std::size_t tid_;
+        Node* node_;
 
     public:
-        guard(Pool* o, std::size_t tid) noexcept : owner_{o}, tid_{tid} {}
+        explicit guard(Node* n) noexcept : node_{n} {}
         guard(const guard&) = delete;
         guard& operator=(const guard&) = delete;
-        ~guard() { owner_->unpin(tid_); }
+        ~guard() { node_->data.state.store(0, std::memory_order_release); }
 
-        std::size_t tid() const noexcept { return tid_; }
+        std::size_t tid() const noexcept { return node_->slot; }
     };
 
     Pool(std::size_t max_threads, std::size_t segment_capacity)
-        : max_threads_{max_threads}, tickets_{max_threads}, threads_(max_threads),
-          buckets_{kStages + 1, N}, versions_(N), segments_(N) {
+        : registry_{max_threads}, buckets_{kStages + 1, N}, versions_(N), segments_(N) {
         assert(max_threads != 0);
         assert(segment_capacity != 0);
 
@@ -121,12 +128,12 @@ public:
     Pool& operator=(const Pool&) = delete;
 
     guard pin() noexcept {
-        const std::size_t tid = ticket();
+        Node* n = node();
         // Publish the epoch we are about to read under. Sequentially consistent so a
         // thread trying to advance cannot miss us while we cannot see its advance.
-        threads_[tid].state.store(bit::set_msb(epoch_.load(std::memory_order_acquire)),
-                                  std::memory_order_seq_cst);
-        return guard{this, tid};
+        n->data.state.store(bit::set_msb(epoch_.load(std::memory_order_acquire)),
+                            std::memory_order_seq_cst);
+        return guard{n};
     }
 
     /// No-op: the epoch pin already covers every slot.
@@ -168,21 +175,20 @@ public:
     }
 
     [[nodiscard]] bool register_thread() noexcept {
-        std::size_t t = 0;
-        return tickets_.acquire(t);
+        Node* n = registry_.self_or_attach();
+        if (n == nullptr) return false;
+        // A recycled node keeps its previous owner's payload. For the retire lists in
+        // source::Hazard that is exactly what is wanted; for an epoch word it is not, so
+        // start unpinned rather than inheriting whatever the last owner left.
+        n->data.state.store(0, std::memory_order_release);
+        return true;
     }
 
-    void unregister_thread() noexcept { tickets_.release(); }
+    void unregister_thread() noexcept { registry_.detach(); }
 
-    std::size_t ticket() noexcept {
-        std::size_t t = 0;
-        const bool ok = tickets_.acquire(t);
-        assert(ok && "Pool: no ticket available; did the thread call acquire()?");
-        if (!ok) std::abort();
-        return t;
-    }
+    std::size_t ticket() noexcept { return node()->slot; }
 
-    std::size_t max_threads() const noexcept { return max_threads_; }
+    std::size_t max_threads() const noexcept { return registry_.max_threads(); }
 
     static constexpr std::size_t pool_size() noexcept { return N; }
 
@@ -208,22 +214,36 @@ private:
         return handle{handle::next_version(v), static_cast<uint32_t>(idx)};
     }
 
-    void unpin(std::size_t tid) noexcept {
-        threads_[tid].state.store(0, std::memory_order_release);
+    /// This thread's registry node, attaching on first use. Aborts if the registry is
+    /// full, which means more threads reached the queue than it was constructed for.
+    Node* node() noexcept {
+        Node* n = registry_.self_or_attach();
+        assert(n && "Pool: registry full; more threads than max_threads reached the queue");
+        if (!n) std::abort();
+        return n;
     }
 
     /**
      * @brief Advance the epoch if every pinned thread has already published @p e.
      *
      * A thread pinned at an older epoch may still be reading something retired then, so
-     * the epoch must wait for it. Unpinned threads hold nothing.
+     * the epoch must wait for it. Unpinned threads hold nothing, and detached threads are
+     * not walked at all.
+     *
+     * The functor is idempotent, as ThreadRegistry requires: visiting the same node twice
+     * asks the same question and gets the same answer.
      */
     bool try_advance(uint64_t e) noexcept {
-        for (std::size_t i = 0; i < max_threads_; ++i) {
-            const uint64_t st = threads_[i].state.load(std::memory_order_seq_cst);
-            if (bit::get_msb(st) == 0) continue;             // not pinned
-            if (bit::clear_msb(st) != e) return false;       // pinned, but behind
-        }
+        bool everyone_current = true;
+        registry_.for_each_active([&](ThreadData& d) noexcept {
+            const uint64_t st = d.state.load(std::memory_order_seq_cst);
+            if (bit::get_msb(st) == 0) return true;       // not pinned
+            if (bit::clear_msb(st) == e) return true;     // pinned, and up to date
+            everyone_current = false;
+            return false;                                 // pinned but behind: stop here
+        });
+        if (!everyone_current) return false;
+
         uint64_t expected = e;
         if (!epoch_.compare_exchange_strong(expected, e + 1, std::memory_order_acq_rel,
                                             std::memory_order_acquire))
@@ -237,9 +257,7 @@ private:
         return true;
     }
 
-    std::size_t max_threads_;
-    Ticketing tickets_;
-    std::vector<Slot> threads_;
+    Registry registry_;
     mutable mem::detail::RingSlab buckets_;
     std::vector<std::atomic<uint32_t>> versions_;
     std::vector<mem::unique_block<S>> segments_;

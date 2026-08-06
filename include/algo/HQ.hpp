@@ -48,7 +48,7 @@ class HQ : public mem::SingleBlock<HQ<T, Opt, Link, Tag>> {
     using word = typename Tag::word;
 
     static constexpr bool pad_cells = Opt::template has<typename HQOpt::force_cell_padding>;
-    static constexpr std::size_t kPatience = 4 * 1024;
+    static constexpr std::size_t kPatience = 4 * 1024; 
 
 public:
     using tag_type = Tag;
@@ -123,6 +123,24 @@ public:
      * array full of `consumed`. The original open() stored 0 into head and tail and
      * returned true, which left exactly that state: every subsequent enqueue CAS failed
      * and the segment behaved as instantly full.
+     * 
+     * 
+     * @debug: Implementation Hint
+     * Each segment starts with all cells `empty` and after closure and full drain ends up
+     * with all cells as `consumed`. The segment would have to store an additional flag which
+     * simply flips the consumed cells and treats them as opened. Furthermore everytime enqueing
+     * an item each thread should check for `empty/consumed` cells based on the flag, in this way
+     * the reopen only has to flip the instance flag (can be done via CAS with no retry). This would
+     * also need to rework a bit how the whole segment uses the flags, the most simple way is to have
+     * a ternary check for each time a tag is evaluated or stored. The tag can be also benefit from not
+     * relying on padding since is setted only once per segment lifetime. We only need one bit for encoding
+     * and both enqueue and dequeue read from the capacity counter, so we could encode it as the LSB or MSB
+     * depending on the data type, else we can use explicit encoding
+     * 
+     * @debug: Implementation 02:
+     * the reopen method has to be executed in isolation so no need to be MT-safe: 
+     * The reopen method has also to set the handle so that no successor is set, and i was
+     * fixating on the interleaving while it's not needed
      */
     bool reopen() noexcept
         requires(Link::is_linked)
@@ -226,6 +244,7 @@ struct core::segment_traits<algo::HQ<T, Opt, Link, Tag>> {
     static constexpr bool recyclable = false; ///< see HQ::reopen
     static constexpr bool can_store_null = Tag::can_store_null;
 };
+
 MPMC_ASSERT_SEGMENT_TRAITS(algo::HQ<int*, meta::EmptyOptions, linkage::Node<mem::PtrHandle>>);
 
 namespace seg {

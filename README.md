@@ -120,6 +120,25 @@ observation is what collapses four proxies into one.
 list — and reuses segments, so it `static_assert`s on `segment_traits<S>::recyclable`:
 pairing it with FAAArray or HQ is a compile error, not a runtime abort.
 
+Both sources find their participating threads through `util::threading::ThreadRegistry`, a
+lock-free registry of immortal, cache-line-isolated nodes: an append-only active list that
+reclamation walks, and a Treiber free list of nodes available for reuse. Each thread's state
+— a hazard pointer and its retire list, or an epoch word — lives *in* its node rather than in
+a side array indexed by a ticket, so the thread and instance limits stop being compile-time
+constants and a scan reaches only nodes that have actually been used. Every link is
+`{version | mark | index}` in one word, so every structural change is a single 64-bit CAS and
+nothing needs `cas2`.
+
+Detach is one CAS — mark the node inactive, push it to the free list — and the node **keeps
+its place in the active list**; attach clears the mark in place. Nodes are never unlinked, so
+a walk is a pure read with no helping and no restarts. That is a deliberate retreat from
+physically splicing detached nodes out: a walk holds its predecessor as a snapshot, and once
+a node can be unlinked and immediately recycled, that snapshot can lead the walk into a
+detached node's stale successor chain, where the splice CAS succeeds and frees a node that is
+still live. Splicing safely needs reclamation for the *nodes*, which is the thing this
+registry exists to support. The cost of not splicing is that the pointer chase is bounded by
+peak rather than current concurrency; the functor still runs only on attached threads.
+
 Item admission *reserves* rather than testing-then-acting, so the bound is hard: a plain
 check followed by an enqueue let every producer that passed the check commit, overshooting
 by up to one item per producer.
@@ -171,6 +190,7 @@ including the Python tooling, which asks the binary what exists.
 | `AdmissionTest` | bounds hold, including concurrently |
 | `MemoryLayoutTest` | single-block layout arithmetic |
 | `PoolReclamationTest` | the pooled source's epoch machine, driven deterministically |
+| `ThreadRegistryTest` | attach/detach/recycle, and that a scan never misses a stable thread |
 | `ConcurrencyTest` | loss, duplication and per-producer FIFO across thread shapes |
 
 Concurrency defects here are intermittent — a lost-item bug reproduced in 3 runs of 8, a
@@ -186,3 +206,9 @@ it) and treats a stall as a failure rather than hanging.
   historical: the patterns the pre-refactor code used and what each cost
 - [`docs/notes/Abstraction Map.md`](docs/notes/Abstraction%20Map.md) — the abstraction set
   and UML; the plan rather than the outcome
+
+# Benchmarks
+- `FAAArrayQueue VS HybridQueue`: set the patience to a really small number: heuristics in an imbalanced (low prod - high cons) FAAArrayQueue should quickly waste all the cells while HybridQueue benefits a lot from the asymmetric-slow dequeue until the full segment has been published
+
+- Memory Usage For Linked Segments: hard to estimate due to allocator caching, needs meta at `LinkedProxy` level to record the number of segments (simple atomic counter incremented for each successful linkage), so with the size of the struct we can reliably estimate the number of used segment
+

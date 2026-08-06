@@ -15,6 +15,22 @@ struct SCQOpt {
     struct no_cell_padding {};
 };
 
+
+/**
+ * @debug: no need to check for inflight since in the case of linked policy
+ * each segment is protected via hazard Pointer: REMOVE THE INFLIGHT GUARD
+ * 
+ * Also no need for LFring to implement block_dequeue just revert to the old closure
+ * on enqueue. If a slot cannot be enqueued then place it back in the old ring (should be
+ * always successful due of the capacity of the ring). Moreover the threshold is not a heuristic
+ * but is a conservative upper bound on the number of empty dequeue given an enqueue. So LFring linearizes
+ * dequeues thanks to the threshold. Make sure that no slot is ever lost, so when processing reopen, there's no
+ * need in resetting both rings, just opening the one closed and resetting the threshold for for the free slots 
+ * queue
+ */
+
+
+
 /**
  * @brief Indirect queue: two index rings plus a payload buffer.
  *
@@ -86,7 +102,7 @@ public:
         free_->~Ring();
         data_->~Ring();
     }
-
+    
     FORCE_INLINE bool enqueue(T item) noexcept {
         // Inserting here is three steps -- claim a free index, write the payload, publish
         // the index -- so between the first and the last this producer is invisible: the

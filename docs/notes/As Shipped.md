@@ -15,7 +15,7 @@ and why, the second for the UML and the reasoning behind the abstraction set. Th
 
 ```
 meta/     OptionsPack (+ AcceptsOnly), TypeList, FixedString
-util/     bit, specs, atomic/cas2, threading/, timing/
+util/     bit, specs, atomic/cas2, threading/{ThreadRegistry,ThreadPinner}, timing/
 core/     Queue, Segment, SegmentTraits, Source, Admission, Proxy, Construction  (concepts only)
 mem/      Align, Layout, SingleBlock, Handle; detail/RingSlab; source/{Hazard,Pool}
 cell/     PlainCell, SequencedCell, Tagging
@@ -67,6 +67,77 @@ Strictly acyclic; `core/` names no implementation.
 
 ---
 
+## `util::threading::ThreadRegistry` — who is participating
+
+Both sources need the same thing: the set of attached threads, and what each is publishing.
+Both used to get it from `DynamicThreadTicket`, which handed out a dense integer from an
+atomic bitset and left the caller to keep its state in a *separate* array indexed by it —
+`Hazard` had `slots_` and `retired_`, `Pool` had `threads_`. Three costs followed:
+
+| | before | now |
+| --- | --- | --- |
+| thread cap | `DTT_MAX_BITS` = 1024, **compile-time** | constructor argument |
+| live instances | `DTT_MAX_INSTANCES` = 16, threw past it | unbounded |
+| reclamation scan | O(`max_threads`) | O(peak threads ever attached), functor only on active |
+| per-thread state | separate array, indexed by ticket | the registry node itself |
+
+`ThreadRegistry<ThreadData, Opt>` pre-allocates `max_threads` cache-line-isolated nodes once
+and threads two lock-free lists through them: an **active list** that reclamation walks, and
+a **free list** of recyclable nodes. Nodes are immortal — never allocated or freed while the
+registry lives — so `attach()` never calls the allocator and is genuinely lock-free, and
+`attach()` returning false when the free list is empty is exactly the old `register_thread()`
+returning false. `ticket()` is now just the node's stable `slot`, so
+`core::SegmentSource` is unchanged and `LinkedProxy` needed no edit.
+
+Detach is one CAS and no traversal: the owning thread sets the mark bit in its own link and
+pushes the node onto the free list. The node **keeps its place in the active list**; attach
+pops it and clears the mark in place. A node is appended to the active list at most once
+ever, on first use, and is never removed — so the list is append-only and acyclic, and a walk
+is a pure read with no CAS, no helping and no restarts.
+
+> **The physical splice was tried, and removed.** The first version did unlink detached nodes
+> Harris-style, to make the chase O(*currently* attached). It is not safe here. A walk holds
+> its predecessor as a *snapshot*; once a node can be unlinked and immediately recycled, that
+> snapshot can lead the walk into a detached node's stale successor chain, where the next
+> link looks perfectly consistent and the splice CAS therefore **succeeds** — unlinking and
+> freeing a node that is still live in the real list. It then sits on both lists at once, is
+> popped while still linked, and attach closes a cycle. Measured before the fix: a double
+> push to the free list within a few thousand attach/detach cycles on 8 threads, and roughly
+> half of all `NoNodeIsLostOverManyAttachDetachCycles` runs ending with nodes lost. Versioned
+> links stop ABA on an individual CAS; they cannot stop a traversal anchoring on a node that
+> has left the list. Splicing safely needs reclamation for the *nodes* — the very thing this
+> registry exists to support rather than depend on. Not unlinking removes the problem
+> outright and costs only that the chase is bounded by peak rather than current concurrency.
+
+> **Every link carries a version, and that is not optional.** Immortal nodes remove
+> use-after-free, which makes it tempting to conclude bare indices suffice. They do not.
+> On the free list, ABA is a *lost node*: T1 reads `head = A, A.free_next = B` and stalls;
+> T2 pops A; T3 pops B; T2 pushes A back; T1's `CAS(head, A -> B)` then succeeds and hands
+> out a node T3 is already using. Each link is
+> `{version:32 | mark:1 | index:31}` in one word — the same 32/32 split as
+> `mem::VersionedIndex` — so every publication produces a word no earlier reader can have
+> observed and a stale CAS always fails. One 64-bit CAS throughout; no `cas2`, no dependence
+> on `-mcx16`.
+
+Because nothing is ever unlinked and a node's successor is written exactly once, a walk
+cannot be led astray: there is no helping, no restart loop and no visit budget. It skips
+marked nodes and invokes the functor on the rest.
+
+**The one hole, and the knob for it.** A thread attaching at the head *after* the walk passed
+it is not visited; for a hazard scan that would mean freeing an object it had just protected.
+`ThreadRegistryOpt::retry_scan_on_attach` closes it — attaches bump a counter,
+`for_each_active` re-reads it and repeats if it moved. It is **off by default**, so the
+default relies instead on the argument that a thread attaching after a scan began cannot
+already hold a pointer to something unlinked before `retire()`. That argument is delicate and
+fails silently, so the flag is worth setting for stress and TSan runs; it is one token at the
+`using Registry = ...` line in `Hazard.hpp` / `Pool.hpp`.
+
+A side effect worth naming: a thread that dies while pinned no longer wedges `Pool`'s epoch
+forever. Its node leaves the active list and stops being consulted, where the old fixed slot
+array kept its stale pinned word visible for the life of the pool.
+
+---
+
 ## `mem::source::Pool` — reclamation, as built
 
 The proposal had `Pool` wrapping the existing `Recycler`. It now owns reclamation outright,
@@ -110,8 +181,12 @@ registry and work single-threaded, but their concurrent behaviour is **unverifie
 ## What is still open
 
 - **`ConcurrencyTest` has not been run** against any of this. Everything concurrency-related
-  above — the SCQ in-flight fix, reservation-based admission, the new reclamation — is
-  argued from deterministic tests and reasoning, not from a threaded run.
+  above — the SCQ in-flight fix, reservation-based admission, the new reclamation, the
+  thread registry — is argued from deterministic tests and reasoning, not from a threaded run
+  of the queues themselves.
+- **`retry_scan_on_attach` is off**, so `for_each_active` currently rests on an ordering
+  argument rather than on a counter. Turning it on is a one-token change; the first threaded
+  runs are worth doing both ways.
 - **`util/timing/TicksWait.h`** is a 687-line header used only by the benchmark's delay
   simulation; it has not been reviewed.
 - **`algo::LFring`'s `reopen()` vs `reset()`** are two similar reset paths; only `reset()`
