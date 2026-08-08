@@ -80,31 +80,31 @@ std::size_t fill_to_refusal(Q& q, std::vector<Data>& store) {
 
 TEST(BoundedProxies, ItemBoundedNeverExceedsItsCapacity) {
     using Q = proxy::ItemBounded<Item, seg::Vyukov<Item>>;
-    Q q{kSegment, 8, kChunks};
-    ASSERT_TRUE(q.acquire());
+    Q q{kSegment, kChunks};
+    auto joined = q.join();
+    ASSERT_TRUE(joined);
 
     std::vector<Data> store(kSegment * kChunks * 4);
     const std::size_t placed = fill_to_refusal(q, store);
 
     EXPECT_LE(placed, q.capacity()) << "admitted more items than the stated capacity";
     EXPECT_GT(placed, 0u);
-    q.release();
 }
 
 TEST(BoundedProxies, UnboundedKeepsGoingWellPastOneSegment) {
     using Q = proxy::Unbounded<Item, seg::Vyukov<Item>>;
-    Q q{kSegment, 8};
-    ASSERT_TRUE(q.acquire());
+    Q q{kSegment};
+    auto joined = q.join();
+    ASSERT_TRUE(joined);
 
     std::vector<Data> store(kSegment * 10);
     EXPECT_EQ(fill_to_refusal(q, store), store.size());
-    q.release();
 }
 
 TEST(BoundedProxies, ItemBoundIsRespectedConcurrently) {
     using Q = proxy::ItemBounded<Item, seg::PRQ<Item>>;
     constexpr std::size_t kProducers = 4;
-    Q q{kSegment, kProducers + 1, kChunks};
+    Q q{kSegment, kChunks};
 
     std::vector<Data> store(20000);
     std::atomic<int64_t> live{0};
@@ -116,7 +116,8 @@ TEST(BoundedProxies, ItemBoundIsRespectedConcurrently) {
     // Producers only: occupancy climbs monotonically to the ceiling and must stop there.
     for (std::size_t p = 0; p < kProducers; ++p)
         ts.emplace_back([&] {
-            ASSERT_TRUE(q.acquire());
+            auto joined = q.join();
+    ASSERT_TRUE(joined);
             sync.arrive_and_wait();
             for (;;) {
                 const std::size_t i = next.fetch_add(1);
@@ -126,7 +127,6 @@ TEST(BoundedProxies, ItemBoundIsRespectedConcurrently) {
                 int64_t seen = peak.load();
                 while (now > seen && !peak.compare_exchange_weak(seen, now)) {}
             }
-            q.release();
         });
     for (auto& t : ts) t.join();
 
@@ -136,8 +136,9 @@ TEST(BoundedProxies, ItemBoundIsRespectedConcurrently) {
 
 TEST(BoundedProxies, ChunkBoundedRefusesRatherThanGrowingForever) {
     using Q = proxy::ChunkBounded<Item, seg::Vyukov<Item>>;
-    Q q{kSegment, 8, kChunks};
-    ASSERT_TRUE(q.acquire());
+    Q q{kSegment, kChunks};
+    auto joined = q.join();
+    ASSERT_TRUE(joined);
 
     std::vector<Data> store(kSegment * kChunks * 8);
     const std::size_t placed = fill_to_refusal(q, store);
@@ -145,13 +146,13 @@ TEST(BoundedProxies, ChunkBoundedRefusesRatherThanGrowingForever) {
     EXPECT_LT(placed, store.size()) << "a segment-bounded proxy accepted an unbounded stream";
     EXPECT_LE(placed, kSegment * kChunks)
         << "accepted more than bound() segments' worth of items";
-    q.release();
 }
 
 TEST(BoundedProxies, RefusalIsRecoverableAfterDraining) {
     using Q = proxy::ItemBounded<Item, seg::Vyukov<Item>>;
-    Q q{kSegment, 8, kChunks};
-    ASSERT_TRUE(q.acquire());
+    Q q{kSegment, kChunks};
+    auto joined = q.join();
+    ASSERT_TRUE(joined);
 
     std::vector<Data> store(kSegment * kChunks * 4);
     const std::size_t placed = fill_to_refusal(q, store);
@@ -164,7 +165,6 @@ TEST(BoundedProxies, RefusalIsRecoverableAfterDraining) {
 
     // Having drained, the proxy must admit again -- a bound that latches is a deadlock.
     EXPECT_TRUE(q.enqueue(&store[0]));
-    q.release();
 }
 
 } // namespace

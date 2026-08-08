@@ -169,6 +169,7 @@ if(BUILD_TESTING_MPMC)
         PoolReclamationTest       # the pooled source's epoch machine, deterministically
         ConcurrencyTest           # MPMC loss/duplication/ordering, several thread shapes
         ThreadRegistryTest        # the lock-free thread registry both sources are built on
+        ThreadPinnerTest          # core placement rule and topology parsing
     )
 
     foreach(test_name IN LISTS UNIT_TESTS)

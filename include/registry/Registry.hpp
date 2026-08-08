@@ -11,6 +11,7 @@
 #include <algo/VyukovDCAS.hpp>
 #include <algo/VyukovNoABA.hpp>
 #include <meta/FixedString.hpp>
+#include <variant>
 #include <meta/TypeList.hpp>
 #include <proxy/Aliases.hpp>
 #include <string_view>
@@ -33,19 +34,33 @@ struct Entry {
     using type = Q;
 };
 
-// Handle-policy shorthands: a pooled source addresses segments by index, not pointer.
-template <typename T> using IdxVyukov = seg::Vyukov<T, meta::EmptyOptions, mem::IndexHandle>;
-template <typename T> using IdxPRQ = seg::PRQ<T, meta::EmptyOptions, mem::IndexHandle>;
-template <typename T> using IdxSCQ = seg::SCQ<T, meta::EmptyOptions, mem::IndexHandle>;
+/// Size of every pooled entry below. Named once because it appears twice per entry -- in
+/// the segment's handle policy and in the proxy alias -- and LinkedProxy static_asserts
+/// that the two agree.
+inline constexpr std::size_t kPoolSize = 8;
+
+// Handle-policy shorthands: a pooled source addresses segments by index, not pointer, and
+// the index is sized by the pool so the rest of the word is ABA counter.
+template <typename T, std::size_t N = kPoolSize>
+using IdxVyukov = seg::Vyukov<T, meta::EmptyOptions, mem::IndexHandle<N>>;
+template <typename T, std::size_t N = kPoolSize>
+using IdxPRQ = seg::PRQ<T, meta::EmptyOptions, mem::IndexHandle<N>>;
+template <typename T, std::size_t N = kPoolSize>
+using IdxSCQ = seg::SCQ<T, meta::EmptyOptions, mem::IndexHandle<N>>;
+template <typename T, std::size_t N = kPoolSize>
+using IdxFAAArray = seg::FAAArray<T, meta::EmptyOptions, mem::IndexHandle<N>>;
+template <typename T, std::size_t N = kPoolSize>
+using IdxHQ = seg::HQ<T, meta::EmptyOptions, mem::IndexHandle<N>>;
 
 /**
  * @brief Standalone bounded queues. Everything here models core::Queue.
  *
- * FAAArray and HQ are deliberately absent. Their cells are write-once and their indices
- * never reset, so standalone they are single-use: the first fill/drain works and every
- * later enqueue is refused (measured: cycle 0 accepts 8, cycles 1-2 accept 0). They are
- * sound only as linked segments, where the proxy discards a drained segment rather than
- * reusing it -- which is also what segment_traits<>::recyclable == false records.
+ * FAAArray and HQ are deliberately absent, and cannot even be named here: both are
+ * constrained on linkage::Linked. Their indices only advance, so a *standalone* one has no
+ * way back to the start -- the first fill/drain works and every later enqueue is refused
+ * (measured: cycle 0 accepts 8, cycles 1-2 accept 0). Reopening them is a proxy-side
+ * operation: it needs the segment to be quiescent and unlinked first, which only a source
+ * that recycles can guarantee. See FAAArray::reopen.
  *
  * PRQ is present and correct standalone (its dequeue drags an over-run tail back), but
  * expect poor throughput when producers spin on a full ring: the tail runs ahead on every
@@ -75,13 +90,17 @@ using Linked = meta::TypeList<
     Entry<"chunk-vyukov", proxy::ChunkBounded<T, seg::Vyukov<T>>>,
     Entry<"chunk-prq", proxy::ChunkBounded<T, seg::PRQ<T>>>,
     Entry<"chunk-faaarray", proxy::ChunkBounded<T, seg::FAAArray<T>>>,
+    Entry<"chunk-scq",proxy::ChunkBounded<T,seg::SCQ<T>>>,
+    Entry<"item-scq",proxy::ItemBounded<T,seg::SCQ<T>>>>;
 
-    // Pooled: the bound is the pool running dry, so the admission policy is None.
-    // FAAArray and HQ cannot appear here -- segment_traits says they are not
-    // recyclable, and mem::source::Pool static_asserts on exactly that.
-    Entry<"mem-vyukov", proxy::MemBounded<T, IdxVyukov<T>, 8>>,
-    Entry<"mem-prq", proxy::MemBounded<T, IdxPRQ<T>, 8>>,
-    Entry<"mem-scq", proxy::MemBounded<T, IdxSCQ<T>, 8>>>;
+    // Pooled: the bound is the pool running dry, so the admission policy is None. FAAArray
+    // and HQ are here now that their reopen() flips a generation flag instead of failing;
+    // before that they were not recyclable and mem::source::Pool refused them outright.
+    // Entry<"mem-vyukov", proxy::MemBounded<T, IdxVyukov<T>, kPoolSize>>,
+    // Entry<"mem-prq", proxy::MemBounded<T, IdxPRQ<T>, kPoolSize>>,
+    // Entry<"mem-scq", proxy::MemBounded<T, IdxSCQ<T>, kPoolSize>>,
+    // Entry<"mem-faa", proxy::MemBounded<T, IdxFAAArray<T>, kPoolSize>>,
+    // Entry<"mem-hq", proxy::MemBounded<T, IdxHQ<T>, kPoolSize>>>;
 
 /// Everything, for the benchmark.
 template <typename T>
@@ -91,7 +110,7 @@ using All = meta::concat<Standalone<T>, Linked<T>>;
  * @brief Owns one instance of any registered queue, however it happens to be built.
  *
  * A standalone queue is a single block and comes from Q::create(capacity); a proxy is an
- * ordinary object taking (segment_capacity, max_threads). This hides that difference so
+ * ordinary object taking (segment_capacity). This hides that difference so
  * one benchmark body can drive both -- which is what the old
  * `Benchmark<template<typename> typename>` could not express, and why no proxy was ever
  * benchmarkable.
@@ -103,19 +122,15 @@ class Instance {
     // silent wrong branch followed by a confusing constructor failure elsewhere.
     static_assert(core::BlockAllocated<Q> || core::DirectConstructed<Q>,
                   "registry entry is neither block-allocated (Q::create(capacity)) nor "
-                  "directly constructible from (segment_capacity, max_threads)");
+                  "directly constructible from (segment_capacity)");
     static_assert(core::Constructible<Q>,
                   "registry entry satisfies both construction shapes; which one applies "
                   "is ambiguous");
 
 public:
-    Instance(std::size_t capacity, std::size_t max_threads) {
-        if constexpr (core::BlockAllocated<Q>) {
-            (void)max_threads;
-            block_.reset(Q::create(capacity));
-        } else {
-            owned_ = std::make_unique<Q>(capacity, max_threads);
-        }
+    explicit Instance(std::size_t capacity) {
+        if constexpr (core::BlockAllocated<Q>) block_.reset(Q::create(capacity));
+        else owned_ = std::make_unique<Q>(capacity);
     }
 
     Q& get() noexcept {
@@ -123,12 +138,19 @@ public:
         else return *owned_;
     }
 
-    /// Proxies require a per-thread ticket; standalone queues have no such notion.
-    static void join(Q& q) noexcept {
-        if constexpr (core::Ticketed<Q>) (void)q.acquire();
-    }
-    static void leave(Q& q) noexcept {
-        if constexpr (core::Ticketed<Q>) q.release();
+    /**
+     * @brief A scope in which this thread may use @p q.
+     *
+     * Empty for standalone queues, which have no notion of participation. Hold it for as
+     * long as the thread uses the queue; there is nothing to release by hand, which is what
+     * makes an early return safe.
+     */
+    [[nodiscard]] static auto session(Q& q) {
+        if constexpr (core::Joinable<Q>) return q.join();
+        else {
+            (void)q;
+            return std::monostate{};
+        }
     }
 
 private:

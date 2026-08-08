@@ -42,7 +42,7 @@ class Benchmark {
 public:
     Benchmark(size_t producers, size_t consumers, uint64_t items, size_t capacity)
         : producers_{producers}, consumers_{consumers}, items_{items},
-          instance_{capacity, producers + consumers + 1} {
+          instance_{capacity} {
         assert(producers_ != 0 && consumers_ != 0 && items_ != 0);
     }
 
@@ -64,7 +64,7 @@ public:
             // Start at 1 so no item is ever a null pointer.
             const uint64_t first = id * batch + (id < remainder ? id : remainder) + 1;
             const uint64_t count = batch + (id < remainder ? 1 : 0);
-            registry::Instance<Queue>::join(q);
+            [[maybe_unused]] auto joined = registry::Instance<Queue>::session(q);
             all_barrier.arrive_and_wait();
             for (uint64_t i = first; i < first + count; ++i) { // NB: first + count
                 prod_delay_();
@@ -72,18 +72,16 @@ public:
             }
             producers_done_barrier.arrive_and_wait();
             all_barrier.arrive_and_wait();
-            registry::Instance<Queue>::leave(q);
-        };
+        }; // `joined` releases the thread here, on every exit path
 
         const auto consumer = [&] {
             TestItem out = nullptr;
-            registry::Instance<Queue>::join(q);
+            [[maybe_unused]] auto joined = registry::Instance<Queue>::session(q);
             all_barrier.arrive_and_wait();
             while (!producers_done.load(std::memory_order_relaxed))
                 if (q.dequeue(out)) cons_delay_();
             while (q.dequeue(out)) cons_delay_();
             all_barrier.arrive_and_wait();
-            registry::Instance<Queue>::leave(q);
         };
 
         std::vector<std::thread> prod, cons;
@@ -91,7 +89,18 @@ public:
         cons.reserve(consumers_);
         for (size_t i = 0; i < producers_; ++i) prod.emplace_back(producer, i);
         for (size_t i = 0; i < consumers_; ++i) cons.emplace_back(consumer);
-        if (pinning_) pinner_.pin_threads(prod, cons);
+        if (pinning_) {
+            // Both of these matter to the result and neither is visible in the number
+            // printed at the end, so they go to stderr: the throughput on stdout is what
+            // the Python runner parses.
+            if (pinner_.origin() != util::threading::ThreadPinner::Origin::file) {
+                std::cerr << "note: pinning by " << pinner_.origin_name()
+                          << ", not the generated topology -- the core order is ascending, "
+                             "not the requested layout\n";
+            }
+            if (!pinner_.pin(prod, cons))
+                std::cerr << "warning: could not pin threads; results are unpinned\n";
+        }
 
         const auto start = std::chrono::high_resolution_clock::now();
         all_barrier.arrive_and_wait();
@@ -113,7 +122,7 @@ private:
     size_t producers_, consumers_;
     uint64_t items_;
     registry::Instance<Queue> instance_;
-    ThreadPinner pinner_;
+    util::threading::ThreadPinner pinner_;
     bool pinning_ = false;
     Delay prod_delay_{}, cons_delay_{};
 };

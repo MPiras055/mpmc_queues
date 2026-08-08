@@ -130,7 +130,6 @@ public:
 
     FORCE_INLINE bool dequeue(size_t& out) noexcept {
         const size_t half = virtual_size(order_), n = half << 1;
-        if (deq_blocked_.load(std::memory_order_acquire)) return false;   // acquisition closed
         if (threshold_.load(std::memory_order_seq_cst) < 0) return false; // known empty
 
         for (;;) {
@@ -214,24 +213,7 @@ public:
         return bit::get_msb(tail_.load(std::memory_order_acquire)) != 0;
     }
 
-    /**
-     * @brief Stop handing values out, while still accepting values back.
-     *
-     * SCQ's free ring is consumed to acquire a slot and produced to return one, so
-     * "closed" for it means *dequeue* must stop -- enqueue must keep working or a
-     * consumer cannot give a drained slot back.
-     *
-     * close() is the wrong tool for that: it sets the MSB of the tail, which both blocks
-     * enqueue and corrupts the tail's index arithmetic. Hence a separate flag.
-     */
-    void block_dequeue() noexcept { deq_blocked_.store(true, std::memory_order_release); }
-
-    bool dequeue_blocked() const noexcept { return deq_blocked_.load(std::memory_order_acquire); }
-
-    void unblock_dequeue() noexcept { deq_blocked_.store(false, std::memory_order_release); }
-
     bool reopen() noexcept {
-        deq_blocked_.store(false, std::memory_order_release);
         threshold_.store(0, std::memory_order_release);
         tail_.store(head_.load(std::memory_order_acquire), std::memory_order_release);
         return true;
@@ -250,7 +232,6 @@ public:
      * @warning Not MT-safe. The owner must be unreachable to other threads.
      */
     void reset(bool init_full) noexcept {
-        deq_blocked_.store(false, std::memory_order_relaxed);
         init(0, init_full ? virtual_size(order_) : 0);
     }
 
@@ -280,8 +261,6 @@ private:
     CACHE_PAD_TYPES(std::atomic<uint64_t>);
     ALIGNED_CACHE std::atomic<int64_t> threshold_{0};
     CACHE_PAD_TYPES(std::atomic<int64_t>);
-    ALIGNED_CACHE std::atomic<bool> deq_blocked_{false};
-    CACHE_PAD_TYPES(std::atomic<bool>);
 };
 
 } // namespace algo

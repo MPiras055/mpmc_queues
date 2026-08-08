@@ -104,14 +104,6 @@ public:
     }
     
     FORCE_INLINE bool enqueue(T item) noexcept {
-        // Inserting here is three steps -- claim a free index, write the payload, publish
-        // the index -- so between the first and the last this producer is invisible: the
-        // data ring looks empty even though an item is on its way. A proxy that drains a
-        // segment, sees it empty and unlinks it during that window loses the item.
-        // Counting in-flight producers lets the proxy wait (see has_inflight()).
-        inflight_.fetch_add(1, std::memory_order_acq_rel);
-        const InflightGuard guard{inflight_};
-
         std::size_t slot = 0;
         if (!free_->dequeue(slot)) {
             if constexpr (Link::is_linked) close();
@@ -119,20 +111,16 @@ public:
         }
         buffer_[slot] = item;
         const bool ok = data_->enqueue(slot);
-        assert(ok && "SCQ: data ring refused an index it must have room for");
+        if (!ok) {
+            // Hand the slot back rather than losing it for the rest of this segment's life.
+            // Kept outside the assert: an assert argument disappears under NDEBUG, so putting
+            // the enqueue inside one would silently drop the slot in a release build.
+            const bool returned = free_->enqueue(slot);
+            assert(returned && "SCQ: free ring refused a slot it must have had room for");
+            (void)returned;
+        }
         return ok;
     }
-
-    /**
-     * @brief Is a producer part-way through an insert?
-     *
-     * The proxy must not unlink this segment while this is true, or the item that
-     * producer is about to publish becomes unreachable. Measured before this existed,
-     * 4P/4C over 200k items into 16-slot segments: 10 runs in 15 lost items (worst 18).
-     * The rate falls with segment size -- 6/15 at 64 slots, 0/15 at 1024 -- because it
-     * is segment turnover that opens the window.
-     */
-    bool has_inflight() const noexcept { return inflight_.load(std::memory_order_acquire) != 0; }
 
     FORCE_INLINE bool enqueue(T item, bool closed_hint) noexcept {
         if constexpr (Link::is_linked) {
@@ -163,13 +151,13 @@ public:
         requires(Link::is_linked)
     {
         // Blocks slot acquisition only; consumers must still be able to return slots.
-        free_->block_dequeue();
+        data_->close();
     }
 
     bool is_closed() const noexcept
         requires(Link::is_linked)
     {
-        return free_->dequeue_blocked();
+        return data_->is_closed();
     }
 
     bool reopen() noexcept
@@ -204,18 +192,18 @@ public:
 
 private:
     /// Decrements the in-flight count however enqueue() leaves.
-    struct InflightGuard {
-        std::atomic<uint32_t>& counter;
-        ~InflightGuard() { counter.fetch_sub(1, std::memory_order_release); }
-    };
+    // struct InflightGuard {
+    //     std::atomic<uint32_t>& counter;
+    //     ~InflightGuard() { counter.fetch_sub(1, std::memory_order_release); }
+    // };
 
     [[no_unique_address]] link_state link_{};
     const std::size_t capacity_;
     Ring* free_ = nullptr;
     Ring* data_ = nullptr;
     T* buffer_ = nullptr;
-    ALIGNED_CACHE std::atomic<uint32_t> inflight_{0};
-    CACHE_PAD_TYPES(std::atomic<uint32_t>);
+    // ALIGNED_CACHE std::atomic<uint32_t> inflight_{0};
+    // CACHE_PAD_TYPES(std::atomic<uint32_t>);
 };
 
 } // namespace algo
@@ -227,7 +215,7 @@ struct core::segment_traits<algo::SCQ<T, Opt, Link>> {
     /// See SCQ::prepare_dequeue_after_link.
     static constexpr bool needs_dequeue_prepare = true;
     /// Its insert is not atomic; see SCQ::has_inflight.
-    static constexpr bool needs_inflight_drain = true;
+    static constexpr bool needs_inflight_drain = false;
     static constexpr bool recyclable = true;
     /// The payload is ordinary memory; nothing is stolen from its value space.
     static constexpr bool can_store_null = true;

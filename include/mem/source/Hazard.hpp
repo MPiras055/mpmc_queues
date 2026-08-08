@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace mem::source {
@@ -17,52 +18,57 @@ namespace mem::source {
 #define HAZARD_RETIRE_THRESHOLD 64
 #endif
 
+/// Default payload for a source used without a proxy: costs nothing.
+struct NoPayload {};
+
 /**
  * @brief Segment source backed by hazard pointers: allocate on demand, free when unseen.
  *
- * Models core::SegmentSource. `acquire()` allocates and therefore never fails, so a
- * proxy over this source is unbounded unless an admission policy says otherwise.
+ * Models core::SegmentSource. `acquire()` allocates and therefore never fails, so a proxy
+ * over this source is unbounded unless an admission policy says otherwise.
  *
  * ## Where the per-thread state lives
  *
- * A thread participating here publishes two things: the segment it is currently reading
- * (the hazard pointer) and the segments it has retired but not yet freed. Both are its
- * own, both must survive exactly as long as the thread is registered, and both are needed
- * by whoever is scanning. So both are the payload of that thread's
- * util::threading::ThreadRegistry node, and there is no separate array indexed by a
+ * A thread participating here publishes two things of its own: the segment it is currently
+ * reading (the hazard pointer) and the segments it has retired but not yet freed. Both live
+ * in that thread's util::threading::ThreadRegistry node, alongside @p Payload -- whatever the
+ * caller needs per thread. One node, one thread-local lookup, no side arrays indexed by a
  * ticket:
  *
  * @code
- * struct ThreadData { std::atomic<S*> hp; std::vector<S*> retired; };
+ * struct ThreadData { std::atomic<S*> hp; std::vector<S*> retired; Payload user; };
  * @endcode
  *
- * That is what makes `is_protected()` cost O(attached threads) instead of
- * O(max_threads) -- it walks the registry's active list rather than a fixed slot array
- * sized for a thread count that may never materialise. The scan runs once per retired
- * object per collection pass, so the difference is not academic.
+ * That is what makes scanning cost O(attached threads) rather than O(a configured ceiling),
+ * and the scan runs once per retired object per collection pass, so the difference is not
+ * academic.
  *
- * @note One hazard slot per thread is enough: the traversal protects the head *or* the
- *       tail at any moment, never both.
+ * @note Reclaiming with `delete obj` is not an option here: a co-allocated segment is
+ *       placement-new'd into std::aligned_alloc storage and must be released through
+ *       SingleBlock::destroy. Pairing `delete` with `aligned_alloc` is undefined and breaks
+ *       outright under sized or aligned deallocation.
  *
- * @note This owns its reclamation rather than delegating it. Reclaiming with `delete obj`
- *       is not an option here: a co-allocated segment is placement-new'd into
- *       std::aligned_alloc storage and must be released through SingleBlock::destroy.
- *       Pairing `delete` with `aligned_alloc` is undefined and breaks outright under sized
- *       or aligned deallocation.
+ * @note One hazard slot per thread is enough: the traversal protects the head *or* the tail
+ *       at any moment, never both.
+ *
+ * @tparam Payload the caller's per-thread state; empty by default and elided entirely.
  */
-template <typename S>
+template <typename S, typename Payload = NoPayload>
 class Hazard {
     /**
      * @brief One thread's published state.
      *
-     * `retired` is deliberately *not* cleared when a registry node is recycled. A thread
-     * that detaches with retirements still pending has not leaked them: the next thread to
-     * inherit the node inherits the list and will collect it. Clearing here would drop
-     * segments on the floor.
+     * Cache-line aligned here rather than in the registry, so that a thread's stores to its
+     * hazard pointer do not dirty the line another thread is walking for links.
+     *
+     * `retired` is deliberately **not** cleared when a node is recycled. A thread that
+     * detaches with retirements still pending has not leaked them: the next thread to inherit
+     * the node inherits the list and will collect it. Clearing here would drop segments.
      */
-    struct ThreadData {
+    struct alignas(CACHE_LINE) ThreadData {
         std::atomic<S*> hp{nullptr};
         std::vector<S*> retired;
+        [[no_unique_address]] Payload user{};
     };
 
     /**
@@ -75,6 +81,9 @@ class Hazard {
 
 public:
     using handle = S*;
+    using thread_payload = Payload;
+    /// RAII thread registration; see join().
+    using session = typename Registry::session;
 
     /// Every acquire() allocates a fresh segment, so none ever needs reopening.
     static constexpr bool recycles = false;
@@ -84,9 +93,9 @@ public:
     /**
      * @brief RAII protection scope.
      *
-     * Replaces manual protect/clear pairing. The old proxies cleared by hand on every
-     * exit path -- three of them in dequeue alone -- so correctness depended on every
-     * future `return` remembering.
+     * Replaces manual protect/clear pairing. The old proxies cleared by hand on every exit
+     * path -- three of them in dequeue alone -- so correctness depended on every future
+     * `return` remembering.
      */
     class guard {
         Node* node_;
@@ -98,16 +107,13 @@ public:
         ~guard() { node_->data.hp.store(nullptr, std::memory_order_release); }
 
         Node* node() const noexcept { return node_; }
-        std::size_t tid() const noexcept { return node_->slot; }
+
+        /// This thread's caller-owned state. No second lookup: the pin already found it.
+        Payload& payload() const noexcept { return node_->data.user; }
     };
 
-    /**
-     * @param max_threads      concurrent participants
-     * @param segment_capacity capacity handed to each segment this source creates
-     */
-    Hazard(std::size_t max_threads, std::size_t segment_capacity)
-        : seg_capacity_{segment_capacity}, registry_{max_threads} {
-        assert(max_threads != 0);
+    /// @param segment_capacity capacity handed to each segment this source creates
+    explicit Hazard(std::size_t segment_capacity) : seg_capacity_{segment_capacity} {
         assert(segment_capacity != 0);
     }
 
@@ -149,60 +155,104 @@ public:
         if (mine.size() >= HAZARD_RETIRE_THRESHOLD) collect(mine);
     }
 
-    [[nodiscard]] bool register_thread() noexcept { return registry_.attach(); }
-
-    void unregister_thread() noexcept { registry_.detach(); }
-
-    std::size_t ticket() noexcept { return node()->slot; }
-
-    std::size_t max_threads() const noexcept { return registry_.max_threads(); }
-
-private:
-    /// This thread's registry node, attaching on first use. Aborts if the registry is full,
-    /// which means more threads reached the queue than it was constructed for.
-    Node* node() noexcept {
-        Node* n = registry_.self_or_attach();
-        assert(n && "Hazard: registry full; more threads than max_threads reached the queue");
-        if (!n) std::abort();
-        return n;
+    /**
+     * @brief Fold @p op over every attached thread's caller-owned payload.
+     *
+     * The payload lives in this source's registry, so anything that wants to aggregate it --
+     * `LinkedProxy::size()` summing per-thread operation counts -- has to come through here.
+     */
+    template <typename Acc, typename Op>
+    Acc reduce_payloads(Acc init, Op op) const noexcept {
+        return registry_.reduce(std::move(init), [&op](Acc a, const ThreadData& d) {
+            return op(std::move(a), d.user);
+        });
     }
 
     /**
-     * @brief Is any attached thread currently reading @p p?
+     * @brief Attach the calling thread for the duration of the returned scope.
      *
-     * Walks only the threads that have actually attached. The functor returns false to cut
-     * the walk short on the first match, and is idempotent, which ThreadRegistry requires
-     * because a node can be visited more than once when the list changes under the scan.
+     * The allocating path, taken once per thread; every later `pin()` is a thread-local
+     * read. Holding the session is what keeps that true, and its destructor is what returns
+     * the node -- there is no unregister to forget.
      */
-    bool is_protected(S* p) noexcept {
-        bool found = false;
-        registry_.for_each_active([&](ThreadData& d) noexcept {
-            if (d.hp.load(std::memory_order_acquire) == p) {
-                found = true;
-                return false; // stop
-            }
-            return true;
-        });
-        return found;
+    [[nodiscard]] session join() { return registry_.join(); }
+
+    /// Non-allocating join, for a caller that must not touch the allocator.
+    [[nodiscard]] session try_join() noexcept { return registry_.try_join(); }
+
+private:
+    /**
+     * @brief This thread's registry node, attaching on first use.
+     *
+     * Three tiers, cheapest first: a thread-local read; then a lock-free claim of a node that
+     * is already free; then, only if the registry has none, an allocation. The last tier can
+     * throw, and this is reached from `pin()`, which is noexcept -- so an allocation failure
+     * terminates. That is the same bargain `retire()` already makes by pushing onto a vector
+     * in a noexcept function, and it is why `join()` exists: holding a session for the life
+     * of the thread keeps every later operation on the first tier.
+     */
+    Node* node() {
+        if (Node* n = registry_.self()) return n;
+        if (registry_.try_attach()) return registry_.self();
+        registry_.attach();
+        return registry_.self();
     }
 
     /**
      * @brief Free everything in @p mine that no attached thread is protecting.
      *
-     * Swap-with-back compaction, so surviving entries stay in the list at O(1) each and
-     * the scan is proportional to the retire list, not to its square.
+     * The two collections being matched are asymmetric, and the loop nesting has to respect
+     * that. The retire list is a contiguous vector; the registry is a chain of nodes, one
+     * cache miss per hop. Asking "is this pointer protected?" once per retired pointer walked
+     * that chain R times, when the whole question can be answered in **one** walk.
+     *
+     * So the registry is reduced over once, and each node scans the vector. The vector is
+     * partitioned in place as we go, with @c k the number of entries already known to be
+     * protected:
+     *
+     * @code
+     *   [0, k)          protected -- somebody published this pointer
+     *   [k, size)       not yet matched by any node seen so far
+     * @endcode
+     *
+     * A node whose hazard pointer hits an entry in the unclassified region swaps it down to
+     * @c k and widens the prefix, so each node only ever scans the region still in question,
+     * and that region shrinks. When the walk ends, `[k, size)` is exactly the set nobody is
+     * reading: pop and destroy it. No temporary container, and every vector operation is
+     * O(1) -- `swap`, `size`, `back`, `pop_back`.
+     *
+     * @note The inner `break` relies on a pointer appearing **at most once** in the retire
+     *       list, which holds because the proxy retires a handle once, on the unlink that made
+     *       it unreachable. A duplicate would be a double free here, but it would equally have
+     *       been one before this change.
+     *
+     * @note Carrying @c k across nodes is sound because ThreadRegistry's walk visits each node
+     *       exactly once: the active list is append-only and the walk is a pure read, with no
+     *       restarts and no helping. If that ever changes, this has to become two passes.
+     *
+     * @note Reading each hazard slot once per pass is the ordinary hazard-pointer scan. A
+     *       retired object was unlinked before `retire()` was called, so no thread can newly
+     *       acquire it, and anyone still holding it has it published.
      */
     void collect(std::vector<S*>& mine) noexcept {
-        for (std::size_t i = 0; i < mine.size();) {
-            S* p = mine[i];
-            if (!is_protected(p)) {
-                std::swap(mine[i], mine.back());
-                mine.pop_back();
-                mem::SingleBlock<S>::destroy(p);
-                // do not advance: the swapped-in entry still needs checking
-            } else {
-                ++i;
-            }
+        const std::size_t k =
+            registry_.reduce(std::size_t{0}, [&mine](std::size_t k, const ThreadData& d) {
+                if (k == mine.size()) return k; // all protected: nothing left to learn
+                S* const hp = d.hp.load(std::memory_order_acquire);
+                if (hp == nullptr) return k;    // attached but reading nothing
+                for (std::size_t i = k; i < mine.size(); ++i) {
+                    if (mine[i] == hp) {
+                        std::swap(mine[i], mine[k]);
+                        return k + 1;
+                    }
+                }
+                return k;
+            });
+
+        while (mine.size() > k) {
+            S* p = mine.back();
+            mine.pop_back();
+            mem::SingleBlock<S>::destroy(p);
         }
     }
 

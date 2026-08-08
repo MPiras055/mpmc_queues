@@ -32,19 +32,25 @@ struct Data {
 };
 using Item = Data*;
 
-using Seg = seg::Vyukov<Item, meta::EmptyOptions, mem::IndexHandle>;
 constexpr std::size_t kPool = 4;
+using Seg = seg::Vyukov<Item, meta::EmptyOptions, mem::IndexHandle<kPool>>;
 using TestPool = mem::source::Pool<Seg, kPool>;
 
 /// A pool with the calling thread registered, as every user of it must be.
 struct Fixture : ::testing::Test {
-    TestPool pool{/*max_threads=*/4, /*segment_capacity=*/16};
-    void SetUp() override { ASSERT_TRUE(pool.register_thread()); }
-    void TearDown() override { pool.unregister_thread(); }
+    TestPool pool{/*segment_capacity=*/16};
+    /// Declared after `pool` so it is destroyed first: the thread detaches before the
+    /// registry that owns its node does.
+    TestPool::session joined{};
+
+    void SetUp() override {
+        joined = pool.join();
+        ASSERT_TRUE(joined);
+    }
 
     /// Drain the free list, returning the handles.
-    std::vector<mem::VersionedIndex> take_all() {
-        std::vector<mem::VersionedIndex> out;
+    std::vector<TestPool::handle> take_all() {
+        std::vector<TestPool::handle> out;
         while (auto h = pool.acquire()) out.push_back(*h);
         return out;
     }
@@ -155,9 +161,15 @@ TEST_F(Fixture, VersionChangesOnEveryReuseOfASlot) {
     // segment after the slot is recycled.
     auto first = pool.acquire();
     ASSERT_TRUE(first);
-    const uint32_t idx = first->index();
+    using Handle = TestPool::handle;
+    // The split is sized by the pool: four slots need two index bits, so the version gets
+    // the other 62 rather than the 32 a fixed split would have left it.
+    static_assert(Handle::index_bits == 2);
+    static_assert(Handle::version_bits == 62);
 
-    std::set<uint32_t> versions{first->version()};
+    const auto idx = first->index();
+
+    std::set<Handle::version_type> versions{first->version()};
     for (int cycle = 0; cycle < 8; ++cycle) {
         pool.discard(*first); // straight back to free, so we get the same slot again
         auto again = pool.acquire();
@@ -166,7 +178,7 @@ TEST_F(Fixture, VersionChangesOnEveryReuseOfASlot) {
         first = again;
     }
     EXPECT_GT(versions.size(), 1u) << "the handle version never changed across reuses";
-    EXPECT_NE(mem::VersionedIndex{}, *first) << "a live handle must not equal nil";
+    EXPECT_NE(TestPool::nil(), *first) << "a live handle must not equal nil";
 }
 
 TEST_F(Fixture, NoSlotIsLostOverManyCycles) {
@@ -197,11 +209,15 @@ TEST_F(Fixture, DerefIsStableForAGivenIndex) {
 }
 
 /// The pool only accepts segments that can actually be reset; see segment_traits.
-TEST(PoolConstraints, RejectsNonRecyclableSegmentsAtCompileTime) {
-    static_assert(!core::segment_traits<seg::FAAArray<Item>>::recyclable);
+TEST(PoolConstraints, EverySegmentOfferedToThePoolDeclaresItselfRecyclable) {
     static_assert(core::segment_traits<Seg>::recyclable);
-    // mem::source::Pool<seg::FAAArray<Item>, 4> is a static_assert failure by construction;
-    // asserting the trait it keys off is the runnable half of that guarantee.
+    // FAAArray used to be the counter-example here: its cells are write-once, so it
+    // declared recyclable == false and mem::source::Pool refused it outright. Its reopen()
+    // now flips a generation flag instead of sweeping the array, so it is pooled like
+    // anything else -- which leaves the tree with no non-recyclable segment to point the
+    // guard at. The static_assert in Pool is still there; it simply cannot be exercised
+    // positively without a negative-compilation harness.
+    static_assert(core::segment_traits<seg::FAAArray<Item>>::recyclable);
     SUCCEED();
 }
 

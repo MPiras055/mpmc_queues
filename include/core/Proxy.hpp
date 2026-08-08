@@ -17,8 +17,8 @@ namespace core {
  */
 template <typename P, typename T>
 concept Proxy = Queue<P, T> && requires(P p) {
-    { p.acquire() } noexcept -> std::same_as<bool>;
-    { p.release() } noexcept -> std::same_as<void>;
+    typename P::session; ///< a scope in which this thread may use the queue
+    { p.join() } -> std::same_as<typename P::session>;
 };
 
 } // namespace core

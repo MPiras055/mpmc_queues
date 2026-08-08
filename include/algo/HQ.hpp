@@ -30,10 +30,14 @@ struct HQOpt {
  * This is the segment the README describes as trading throughput for a better memory
  * footprint. It had been dead since the interface moved out from under it.
  *
- * @note **Linked-only.** HQ has FAAArray's write-once cells, plus a dequeue that picks its strategy from whether
- * a successor exists. Standalone it is both single-use and permanently on the slow path.
- *       The class template is constrained on linkage::Linked, so
- *       `algo::HQ<T, Opt, linkage::None>` is not a nameable type.
+ * Reuse works exactly as in FAAArray: a life ends with every cell `consumed`, and a
+ * generation flag swaps which sentinel word means empty, so reopen() is O(1) rather than a
+ * sweep of the array. See reopen().
+ *
+ * @note **Linked-only.** HQ has FAAArray's write-once cells, plus a dequeue that picks its
+ *       strategy from whether a successor exists, so standalone it is both single-use and
+ *       permanently on the slow path. The class template is constrained on linkage::Linked,
+ *       so `algo::HQ<T, Opt, linkage::None>` is not a nameable type.
  *
  * @tparam Tag cell::Tagging policy. LowTag by default, matching the original encoding
  *             (0 = empty, 1 = consumed) -- which means null payloads are unstorable.
@@ -69,7 +73,7 @@ public:
         : capacity_{n}, cells_{blk.template at<cell_type>(plan(n).regions[0])} {
         assert(n != 0 && "HQ: capacity must be non-null");
         for (std::size_t i = 0; i < n; ++i)
-            cells_[i].val.store(Tag::empty(), std::memory_order_relaxed);
+            cells_[i].val.store(empty_w(), std::memory_order_relaxed);
     }
 
     FORCE_INLINE bool enqueue(T item) noexcept {
@@ -81,7 +85,7 @@ public:
             // NB: `expected` is reloaded every iteration. The original hoisted it out of
             // the loop, so one failed CAS left it holding the observed word and every
             // later attempt compared against that stale value instead of `empty`.
-            word expected = Tag::empty();
+            word expected = empty_w();
             if (cells_[t].val.compare_exchange_strong(expected, Tag::encode(item),
                                                       std::memory_order_acq_rel,
                                                       std::memory_order_acquire))
@@ -117,14 +121,39 @@ public:
     }
 
     /**
-     * @brief Cannot be reopened. @return false, always.
+     * @brief Reopen a drained segment in O(1) by flipping the generation flag.
+     * @return true, always.
      *
-     * Cells are never returned to `empty`, so resetting the indices would present an
-     * array full of `consumed`. The original open() stored 0 into head and tail and
-     * returned true, which left exactly that state: every subsequent enqueue CAS failed
-     * and the segment behaved as instantly full.
-     * 
-     * 
+     * A life ends with every cell holding `consumed`. The flag swaps which sentinel word
+     * *means* empty, so the array the previous life left behind already reads as fresh --
+     * no sweep. The original open() stored 0 into head and tail and returned true without
+     * touching the cells, which left the segment behaving as instantly full: every
+     * subsequent enqueue CAS compared against `empty` and found `consumed`.
+     *
+     * @pre The segment is quiescent. The proxy guarantees it -- reopen only happens on a
+     *      segment just acquired from a recycling source and not yet published, and such a
+     *      source does not hand one back while any thread can still be inside it. That
+     *      matters rather than being tidy: a producer that had already fetch-added an
+     *      index holds a CAS whose `expected` is the old generation's empty, which is the
+     *      new generation's `consumed`, so it would succeed and write a payload into the
+     *      reopened segment.
+     *
+     * The flip alone is not enough, because the proxy reopens every segment it acquires
+     * and only one of the three states it can be in is uniformly `consumed`:
+     *
+     * | state                       | how it arises                          | cost |
+     * |-----------------------------|----------------------------------------|------|
+     * | pristine (head = tail = 0)  | first hand-out of a pool slot          | O(1), nothing to do |
+     * | fully drained (head >= cap) | the ordinary recycle                   | O(1), flip |
+     * | partially used              | acquired, filled, lost the link race, `discard`ed | O(capacity) sweep |
+     *
+     * `head_ >= capacity_` is an exact test for "every cell is consumed" on both dequeue
+     * paths: each only advances past an index after exchanging `consumed` into it.
+     *
+     * @note `gen_` is a plain bool: reopen is single-threaded by that precondition, and
+     *       the segment is published afterwards by a release CAS (`link_next`) that every
+     *       reader reaches through an acquire load.
+     *
      * @debug: Implementation Hint
      * Each segment starts with all cells `empty` and after closure and full drain ends up
      * with all cells as `consumed`. The segment would have to store an additional flag which
@@ -145,7 +174,27 @@ public:
     bool reopen() noexcept
         requires(Link::is_linked)
     {
-        return false;
+        link_.unlink(); // a recycled segment must not carry a stale successor
+
+        const uint64_t h = head_.exchange(0,std::memory_order_relaxed);
+        const uint64_t t = tail_.exchange(0,std::memory_order_relaxed);
+
+
+        if (h == 0 && t == 0);  //no cell used
+        else if (h >= capacity_) {  //all cells used
+#ifndef NDEBUG
+            for (std::size_t i = 0; i < capacity_; ++i)
+                assert(is_consumed_w(cells_[i].val.load(std::memory_order_relaxed)) &&
+                       "FAAArray::reopen: head ran past capacity but a cell is not consumed");
+#endif
+            gen_ = !gen_;   //every cell was used so we flip the generation
+        } else {
+            //hard reset of all the cells
+            for (std::size_t i = 0; i < capacity_; ++i)
+                cells_[i].val.store(empty_w(), std::memory_order_relaxed);
+        }
+        
+        return true;
     }
 
     handle_type next() const noexcept
@@ -161,6 +210,25 @@ public:
     }
 
 private:
+    /**
+     * @name Generation-relative sentinels
+     *
+     * The two reserved words swap roles on every life. `is_payload` is untouched by the
+     * swap -- both words are non-payload either way -- so decoding is unaffected. Going
+     * through the Tag predicates rather than comparing words keeps this inside the
+     * cell::Tagging contract instead of assuming the sentinels are equality tested.
+     * @{
+     */
+    word empty_w() const noexcept { return gen_ ? Tag::consumed() : Tag::empty(); }
+    word consumed_w() const noexcept { return gen_ ? Tag::empty() : Tag::consumed(); }
+    bool is_empty_w(word w) const noexcept {
+        return gen_ ? Tag::is_consumed(w) : Tag::is_empty(w);
+    }
+    bool is_consumed_w(word w) const noexcept {
+        return gen_ ? Tag::is_empty(w) : Tag::is_consumed(w);
+    }
+    /// @}
+
     bool has_successor() const noexcept {
         if constexpr (Link::is_linked) return link_.next() != link_state::nil();
         else return false;
@@ -173,8 +241,8 @@ private:
             if (h >= capacity_) return false;
             cell_type& c = cells_[h];
             for (std::size_t i = 0; i < kPatience; ++i)
-                if (!Tag::is_empty(c.val.load(std::memory_order_acquire))) break;
-            const word w = c.val.exchange(Tag::consumed(), std::memory_order_acq_rel);
+                if (!is_empty_w(c.val.load(std::memory_order_acquire))) break;
+            const word w = c.val.exchange(consumed_w(), std::memory_order_acq_rel);
             if (Tag::is_payload(w)) {
                 out = Tag::decode(w);
                 return true;
@@ -195,19 +263,19 @@ private:
             if (h != head_.load(std::memory_order_acquire)) continue; // someone moved head
             if (h == t) return false;                                 // genuinely empty
 
-            if (Tag::is_consumed(w)) { // already taken; help head along
+            if (is_consumed_w(w)) { // already taken; help head along
                 (void)head_.compare_exchange_weak(h, h + 1, std::memory_order_relaxed);
                 continue;
             }
 
-            if (Tag::is_empty(w)) { // producer has not published yet
+            if (is_empty_w(w)) { // producer has not published yet
                 bool resolved = false;
                 for (std::size_t i = 0; i < kPatience; ++i) {
                     w = c.val.load(std::memory_order_acquire);
-                    if (Tag::is_consumed(w)) break;
-                    if (!Tag::is_empty(w)) { resolved = true; break; }
+                    if (is_consumed_w(w)) break;
+                    if (!is_empty_w(w)) { resolved = true; break; }
                 }
-                if (!resolved && Tag::is_consumed(w)) {
+                if (!resolved && is_consumed_w(w)) {
                     (void)head_.compare_exchange_weak(h, h + 1, std::memory_order_relaxed);
                     continue;
                 }
@@ -215,7 +283,7 @@ private:
 
             // Patience exhausted or a payload is present: claim the cell. This races
             // with the producer and may invalidate the slot -- the obstruction-free part.
-            w = c.val.exchange(Tag::consumed(), std::memory_order_acq_rel);
+            w = c.val.exchange(consumed_w(), std::memory_order_acq_rel);
             (void)head_.compare_exchange_weak(h, h + 1, std::memory_order_relaxed);
             if (Tag::is_payload(w)) {
                 out = Tag::decode(w);
@@ -231,6 +299,9 @@ private:
     [[no_unique_address]] link_state link_{};
     const std::size_t capacity_;
     cell_type* const cells_;
+    /// Which sentinel currently means empty. Written only by reopen(), read on every
+    /// operation -- so it shares the read-mostly line rather than getting a padded one.
+    bool gen_ = false;
 };
 
 } // namespace algo
@@ -241,7 +312,7 @@ struct core::segment_traits<algo::HQ<T, Opt, Link, Tag>> {
     static constexpr bool needs_dequeue_prepare = false;
     /// A single atomic step publishes the item; nothing can be mid-insert.
     static constexpr bool needs_inflight_drain = false;
-    static constexpr bool recyclable = false; ///< see HQ::reopen
+    static constexpr bool recyclable = true; ///< see HQ::reopen -- O(1) generation flip
     static constexpr bool can_store_null = Tag::can_store_null;
 };
 

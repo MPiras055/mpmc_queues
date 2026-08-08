@@ -143,8 +143,14 @@ TYPED_TEST(SegmentLifecycle, ReopenedSegmentIsEmptyAndReusable) {
             ASSERT_TRUE(s->reopen()) << "life " << life;
             EXPECT_FALSE(s->is_closed()) << "life " << life << ": still closed after reopen";
 
-            Item stale = nullptr;
-            EXPECT_FALSE(s->dequeue(stale))
+            // Emptiness is checked with size(), not with a probing dequeue. For FAAArray
+            // and HQ a dequeue on an open empty segment is *destructive*: it fetch-adds
+            // the head and exchanges `consumed` into every cell it passes, so probing here
+            // would consume the whole segment and the next life would accept nothing. That
+            // is inherent to a write-once array, not something reopen introduced -- it is
+            // why HQ has a slow path at all. Survivors are still caught, by the
+            // fill/drain count equality at the top of the next iteration.
+            EXPECT_EQ(s->size(), 0u)
                 << "life " << life << ": reopened segment is not empty -- items from the "
                    "previous life survived, which duplicates them under a pooled source";
         }

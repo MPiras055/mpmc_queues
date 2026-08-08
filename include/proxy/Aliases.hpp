@@ -14,17 +14,28 @@ namespace proxy {
  * predicate and a reclamation scheme; everything else was the same traversal.
  */
 
+/**
+ * @brief The source a hazard-reclaimed proxy is built on.
+ *
+ * Spelled once here rather than at each alias: the source carries the proxy's per-thread
+ * state, so every alias has to hand it `ThreadMeta<handle>` and the handle of a hazard source
+ * is just `Seg*`. LinkedProxy static_asserts the two agree, so getting this wrong is a
+ * diagnosable error rather than a silent layout mismatch.
+ */
+template <typename Seg>
+using HazardSource = mem::source::Hazard<Seg, ThreadMeta<Seg*>>;
+
 /// Grows without limit. Was UnboundedProxy.
 template <typename T, typename Seg>
-using Unbounded = LinkedProxy<T, Seg, admit::None, mem::source::Hazard<Seg>>;
+using Unbounded = LinkedProxy<T, Seg, admit::None, HazardSource<Seg>>;
 
 /// Bounded by live item count. Was BoundedCounterProxy.
 template <typename T, typename Seg>
-using ItemBounded = LinkedProxy<T, Seg, admit::ItemCount, mem::source::Hazard<Seg>>;
+using ItemBounded = LinkedProxy<T, Seg, admit::ItemCount, HazardSource<Seg>>;
 
 /// Bounded by live segment count. Was BoundedChunkProxy.
 template <typename T, typename Seg>
-using ChunkBounded = LinkedProxy<T, Seg, admit::SegmentCount, mem::source::Hazard<Seg>>;
+using ChunkBounded = LinkedProxy<T, Seg, admit::SegmentCount, HazardSource<Seg>>;
 
 /**
  * @brief Bounded by a fixed pool of recycled segments. Was BoundedMemProxy.
@@ -34,6 +45,8 @@ using ChunkBounded = LinkedProxy<T, Seg, admit::SegmentCount, mem::source::Hazar
  * whole 288-line proxy collapses into an alias.
  */
 template <typename T, typename Seg, std::size_t N = 4>
-using MemBounded = LinkedProxy<T, Seg, admit::None, mem::source::Pool<Seg, N>>;
+using MemBounded =
+    LinkedProxy<T, Seg, admit::None,
+                mem::source::Pool<Seg, N, ThreadMeta<mem::VersionedIndex<N>>>>;
 
 } // namespace proxy

@@ -78,10 +78,10 @@ seg::Vyukov<Item*>     s = ...;   // the same algorithm, as a linked segment
 
 PRQ, FAAArray and HQ are only correct as linked segments:
 
-- **FAAArray** and **HQ** write each cell once and never return it to `empty`, and their
-  indices only advance. Standalone they are single-use — the first fill/drain works and
-  every later enqueue is refused. A proxy discards a drained segment instead of reusing it,
-  which is the only arrangement that makes sense.
+- **FAAArray** and **HQ** write each cell once and their indices only advance. Standalone
+  they are single-use — the first fill/drain works and every later enqueue is refused.
+  Recovering capacity means reopening, and reopening is only sound on a segment that is
+  quiescent and unlinked, which only a proxy over a recycling source can arrange.
 - **PRQ** closes itself when producers overshoot and then depends on a proxy linking a
   successor. Standalone there is nobody to link one.
 
@@ -117,27 +117,41 @@ dry, which is a *source that runs out* rather than a rule the proxy enforces. Th
 observation is what collapses four proxies into one.
 
 `source::Pool` owns its epoch-based reclamation — three limbo buckets and a separate free
-list — and reuses segments, so it `static_assert`s on `segment_traits<S>::recyclable`:
-pairing it with FAAArray or HQ is a compile error, not a runtime abort.
+list — and reuses segments, so it `static_assert`s on `segment_traits<S>::recyclable`. Its
+handles are `mem::VersionedIndex<N>`, sized by the pool: the index gets the `log2(N)` bits it
+actually needs and the version gets the rest, so a pool of 8 has a 61-bit ABA counter rather
+than the 32 a fixed split left it. `N` therefore appears both in the segment's
+`IndexHandle<N>` and in the proxy alias, and `LinkedProxy` static_asserts that the two agree.
 
-Both sources find their participating threads through `util::threading::ThreadRegistry`, a
-lock-free registry of immortal, cache-line-isolated nodes: an append-only active list that
-reclamation walks, and a Treiber free list of nodes available for reuse. Each thread's state
-— a hazard pointer and its retire list, or an epoch word — lives *in* its node rather than in
-a side array indexed by a ticket, so the thread and instance limits stop being compile-time
-constants and a scan reaches only nodes that have actually been used. Every link is
-`{version | mark | index}` in one word, so every structural change is a single 64-bit CAS and
-nothing needs `cas2`.
+Both sources find their participating threads through `util::threading::ThreadRegistry`, an
+unbounded lock-free registry. Each thread's state — a hazard pointer and its retire list, or an
+epoch word, **plus the proxy's own per-thread counters** — lives in one node, so `pin()`'s
+thread-local lookup serves both and an operation never does a second one. There is no thread
+cap and no index handed out: a thread gets a reference to its `ThreadData`. Nothing takes a
+thread count any more — the registry sizes itself, so a participant limit would be a number
+the queue does not need and could only get wrong.
 
-Detach is one CAS — mark the node inactive, push it to the free list — and the node **keeps
-its place in the active list**; attach clears the mark in place. Nodes are never unlinked, so
-a walk is a pure read with no helping and no restarts. That is a deliberate retreat from
-physically splicing detached nodes out: a walk holds its predecessor as a snapshot, and once
-a node can be unlinked and immediately recycled, that snapshot can lead the walk into a
-detached node's stale successor chain, where the splice CAS succeeds and frees a node that is
-still live. Splicing safely needs reclamation for the *nodes*, which is the thing this
-registry exists to support. The cost of not splicing is that the pointer chase is bounded by
-peak rather than current concurrency; the functor still runs only on attached threads.
+Threads join for a scope rather than pairing calls: `q.join()` returns a move-only session
+whose destructor detaches. That replaced an `acquire()`/`release()` pair which had already
+grown an early-return path that skipped the release — the same reason `pin()` is a guard. A
+nested `join()` reports the thread as attached while owing no detach, so the outermost scope
+stays in charge.
+
+The active list is append-only. Detach marks the node inactive and pushes it to a free list;
+the node keeps its place, and attach clears the mark. Nothing is ever unlinked, so a walk is a
+pure read — no CAS, no helping, no restarts. That is a deliberate retreat from physically
+splicing detached nodes out: a walk holds its predecessor as a snapshot, and once a node can be
+unlinked and immediately reused, that snapshot can lead the walk into a detached node's stale
+successor chain, where the splice CAS succeeds and frees a node that is still live. Splicing
+safely needs reclamation for the *nodes*, which is the thing this registry exists to support.
+
+Only `reduce`, `any_of`, `all_of` and the two `for_each` forms traverse anything; `self()` is a
+thread-local read. The free list is a Michael–Scott queue — head, tail and a dummy — over
+**counted pointers**: a `{Node*, generation}` pair compared as a unit, which is what stops a
+stalled `CAS(head, A, B)` from succeeding when the head is A *again* rather than still A and
+publishing a node another thread owns. Immortal nodes rule out use-after-free but not that.
+On x86-64 with `-mcx16` the pair is one `cmpxchg16b`, so attach and detach are both lock-free
+CAS loops; `ThreadRegistry::free_list_is_lock_free` reports whether that held on the target.
 
 Item admission *reserves* rather than testing-then-acting, so the bound is hard: a plain
 check followed by an enqueue let every producer that passed the check commit, overshooting
@@ -149,6 +163,8 @@ by up to one item per producer.
 | --- | --- |
 | a linked-only algorithm used standalone | `linkage::Linked` constraint |
 | a pooled source over a non-recyclable segment | `segment_traits<S>::recyclable` assert |
+| a segment whose handle is sized for a different pool | `Segment::handle_type` vs `Source::handle` assert |
+| a source not given the proxy's per-thread payload | `Source::thread_payload` vs `ThreadMeta<H>` assert |
 | a `segment_traits` specialization missing a flag | `core::CompleteSegmentTraits` |
 | an option tag that is misspelled or belongs to another algorithm | `meta::AcceptsOnly` |
 | a registry entry with an ambiguous construction shape | `core::Constructible` |
@@ -156,6 +172,19 @@ by up to one item per producer.
 Each of these used to be silent: an unrecognised option read as "not requested", an
 incomplete traits block failed at some unrelated use site, and a queue that lost its
 `create()` simply took the other branch.
+
+### Write-once segments are still recyclable
+
+FAAArray and HQ write each cell once and never return it to `empty`, so a life ends with the
+whole array uniformly `consumed`. Rather than sweep it, each segment carries a generation flag
+that **swaps which sentinel word means empty** — `consumed` in generation *g* is a perfectly
+good `empty` in generation *g+1* — so `reopen()` is a flag flip and two index stores instead
+of O(capacity). That is what lets them be pooled (`mem-faa`, `mem-hq`).
+
+The flip is only valid from the fully-drained state, and the proxy reopens *every* segment it
+acquires, so `reopen()` dispatches on which of three states the segment is in: pristine
+(nothing to do), fully drained (flip), or partially used from the `discard` path (sweep). Only
+the last is O(capacity), and only the link-race loser reaches it.
 
 ### Adding an implementation
 
@@ -177,7 +206,7 @@ including the Python tooling, which asks the binary what exists.
 | PSCQ | ✅ | — | PRQ's cell protocol plus SCQ's threshold; comparator |
 | Mutex | ✅ | — | lock-based baseline |
 | PRQ | — | ✅ | fetch-add ring with an unsafe bit; obstruction-free |
-| FAAArray | — | ✅ | linear write-once array |
+| FAAArray | — | ✅ | linear write-once array; reopened by a generation flip |
 | HQ | — | ✅ | FAAArray with a non-destructive slow path |
 
 ## Tests

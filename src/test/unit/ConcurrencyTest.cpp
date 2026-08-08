@@ -70,7 +70,7 @@ struct Outcome {
  */
 template <typename Q>
 Outcome run_shape(uint64_t total, size_t producers, size_t consumers, size_t capacity = 1024) {
-    registry::Instance<Q> inst{capacity, producers + consumers + 1};
+    registry::Instance<Q> inst{capacity};
     Q& q = inst.get();
 
     std::vector<Data> items(total);
@@ -82,7 +82,9 @@ Outcome run_shape(uint64_t total, size_t producers, size_t consumers, size_t cap
 
     for (size_t p = 0; p < producers; ++p) {
         threads.emplace_back([&, p] {
-            registry::Instance<Q>::join(q);
+            // Held for the whole lambda: the early return below used to need its own
+            // `leave()`, which is precisely the pairing this replaces.
+            [[maybe_unused]] auto joined = registry::Instance<Q>::session(q);
             sync.arrive_and_wait();
             uint64_t mine = 0;
             for (uint64_t i = p; i < total; i += producers) {
@@ -94,7 +96,6 @@ Outcome run_shape(uint64_t total, size_t producers, size_t consumers, size_t cap
                         const uint64_t now = produced.load(std::memory_order_relaxed);
                         if (now == progress_mark) { // nobody advanced: a real livelock
                             stalled.store(true, std::memory_order_relaxed);
-                            registry::Instance<Q>::leave(q);
                             return;
                         }
                         progress_mark = now;
@@ -102,14 +103,13 @@ Outcome run_shape(uint64_t total, size_t producers, size_t consumers, size_t cap
                 }
                 produced.fetch_add(1, std::memory_order_relaxed);
             }
-            registry::Instance<Q>::leave(q);
         });
     }
 
     for (size_t c = 0; c < consumers; ++c) {
         threads.emplace_back([&] {
             std::vector<uint64_t> last(producers, 0);
-            registry::Instance<Q>::join(q);
+            [[maybe_unused]] auto joined = registry::Instance<Q>::session(q);
             sync.arrive_and_wait();
             Item out = nullptr;
             const auto take = [&] {
@@ -123,7 +123,6 @@ Outcome run_shape(uint64_t total, size_t producers, size_t consumers, size_t cap
                 if (q.dequeue(out)) take();
             // Producers are finished: whatever remains must still come out.
             while (q.dequeue(out)) take();
-            registry::Instance<Q>::leave(q);
         });
     }
 

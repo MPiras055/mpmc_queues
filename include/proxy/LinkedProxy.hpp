@@ -8,10 +8,30 @@
 #include <util/specs.hpp>
 #include <atomic>
 #include <cassert>
+#include <concepts>
 #include <cstdint>
-#include <vector>
 
 namespace proxy {
+
+/**
+ * @brief The proxy's per-thread bookkeeping, stored in the source's registry node.
+ *
+ * At namespace scope rather than nested in LinkedProxy, because the alias has to name it to
+ * build the source, and the source is one of LinkedProxy's own template parameters -- nesting
+ * it would be circular.
+ *
+ * Not over-aligned: it lives inside the source's `ThreadData`, which already carries the
+ * cache-line alignment. Aligning it again would make each node two lines wider for nothing.
+ *
+ * @tparam H the source's handle type.
+ */
+template <typename H>
+struct ThreadMeta {
+    /// Signed: a thread may dequeue more than it enqueued. The sum across threads is the size.
+    std::atomic<int64_t> ops{0};
+    /// Last tail this thread found closed; feeds the close hint.
+    H last_seen{};
+};
 
 /**
  * @brief A queue built from linked bounded segments. One traversal, three policies.
@@ -38,6 +58,14 @@ class LinkedProxy {
     using Tr = core::segment_traits<Segment>;
     using H = typename Source::handle;
 
+    /// The segment stores its successor as `handle_type`; the source hands out `handle`.
+    /// Under a pooled source both are mem::VersionedIndex<N>, and N appears twice -- once
+    /// in the segment's IndexHandle<N>, once in the proxy alias -- so a mismatch would
+    /// otherwise mean the segment reading the index out of the wrong bits.
+    static_assert(std::same_as<typename Segment::handle_type, H>,
+                  "the segment's handle_type is not the source's handle: a pooled proxy "
+                  "must be given a segment built for the same pool size, e.g. "
+                  "MemBounded<T, seg::Vyukov<T, Opt, mem::IndexHandle<N>>, N>");
     static_assert(!Source::recycles || Tr::recyclable,
                   "this source reuses segments, but this segment type cannot be reopened "
                   "(see segment_traits<Segment>::recyclable)");
@@ -45,43 +73,46 @@ class LinkedProxy {
                   "segment_traits says this segment needs the close hint, but it has no "
                   "enqueue(T, bool) overload");
 
-    /// Per-thread proxy bookkeeping, indexed by the source's ticket.
-    struct alignas(CACHE_LINE) Meta {
-        /// Signed: a thread may dequeue more than it enqueued. The sum is the size.
-        std::atomic<int64_t> ops{0};
-        /// Last tail this thread found closed; feeds the close hint.
-        H last_seen{};
-    };
+    using Meta = ThreadMeta<H>;
+
+    /// The proxy's per-thread state rides in the source's registry node, so `pin()`'s
+    /// thread-local lookup serves both and the operation path does only one.
+    static_assert(std::same_as<typename Source::thread_payload, Meta>,
+                  "the source was not given this proxy's ThreadMeta as its payload: build it "
+                  "as e.g. mem::source::Hazard<Segment, proxy::ThreadMeta<Segment*>>");
 
 public:
+    /// A scope in which the calling thread may use this queue; see join().
+    using session = typename Source::session;
+
     /**
      * @param segment_capacity capacity of each segment
-     * @param max_threads      concurrent participants
      * @param chunks           bound, in segments, for a bounded Admit; ignored by None
+     *
+     * @note There is no thread count. The source's registry sizes itself, so a participant
+     *       limit would be a number the queue does not need and could only get wrong.
      */
-    LinkedProxy(std::size_t segment_capacity, std::size_t max_threads, std::size_t chunks = 4)
+    explicit LinkedProxy(std::size_t segment_capacity, std::size_t chunks = 4)
         : seg_capacity_{segment_capacity},
-          source_{max_threads, segment_capacity},
-          admit_{Admit::config(segment_capacity, chunks)}, meta_(max_threads) {
+          source_{segment_capacity},
+          admit_{Admit::config(segment_capacity, chunks)} {
         assert(segment_capacity != 0 && "LinkedProxy: segment capacity must be non-null");
-        assert(max_threads != 0 && "LinkedProxy: max_threads must be non-null");
 
-        // The sentinel. Registering is required because acquire() takes a ticket.
-        const bool reg = source_.register_thread();
-        assert(reg && "LinkedProxy: could not register the constructing thread");
-        (void)reg;
+        // The sentinel. Joining is required because the source hands out segments per thread.
+        auto s = source_.join();
+        assert(s && "LinkedProxy: could not register the constructing thread");
         auto sentinel = source_.acquire();
         assert(sentinel && "LinkedProxy: could not obtain a sentinel segment");
         head_.store(*sentinel, std::memory_order_relaxed);
         tail_.store(*sentinel, std::memory_order_relaxed);
-        source_.unregister_thread();
     }
 
     LinkedProxy(const LinkedProxy&) = delete;
     LinkedProxy& operator=(const LinkedProxy&) = delete;
 
     ~LinkedProxy() {
-        (void)source_.register_thread();
+        // Destroyed before `source_`, since it is a local in this body and members go after.
+        auto s = source_.join();
         T ignore{};
         while (dequeue(ignore)) {}
         // Whatever the traversal left linked is now unreachable; hand it back.
@@ -92,12 +123,11 @@ public:
             source_.discard(h);
             h = nx;
         }
-        source_.unregister_thread();
     }
 
     bool enqueue(T item) noexcept {
         auto g = source_.pin(); // RAII: protection drops on every exit path below
-        const std::size_t tid = g.tid();
+        Meta& me = g.payload(); // same lookup the pin already did
 
         if constexpr (Admit::bounded) {
             // Reserves where the policy can, so concurrent producers cannot each pass a
@@ -123,7 +153,7 @@ public:
                 continue;
             }
 
-            if (try_enqueue(s, tail, tid, item)) break;
+            if (try_enqueue(s, tail, me, item)) break;
 
             // This segment is full or closed. Get another.
             auto fresh = source_.acquire();
@@ -159,13 +189,13 @@ public:
         }
 
         admit_.on_enqueue();
-        meta_[tid].ops.fetch_add(1, std::memory_order_relaxed);
+        me.ops.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 
     bool dequeue(T& out) noexcept {
         auto g = source_.pin();
-        const std::size_t tid = g.tid();
+        Meta& me = g.payload();
 
         H head = source_.protect(g, head_.load(std::memory_order_relaxed));
         for (;;) {
@@ -177,7 +207,7 @@ public:
 
             Segment* s = source_.deref(head);
             if (s->dequeue(out)) {
-                took_one(tid);
+                took_one(me);
                 return true;
             }
 
@@ -193,7 +223,7 @@ public:
                 s->prepare_dequeue_after_link();
             }
             if (s->dequeue(out)) {
-                took_one(tid);
+                took_one(me);
                 return true;
             }
 
@@ -219,23 +249,36 @@ public:
         }
     }
 
-    /// Approximate under concurrency; exact when quiescent.
+    /**
+     * @brief Approximate under concurrency; exact when quiescent.
+     *
+     * Folds over the threads that have actually attached rather than over a fixed array
+     * sized for the worst case, so the cost tracks real concurrency.
+     */
     std::size_t size() const noexcept {
-        int64_t total = 0;
-        for (const Meta& m : meta_) total += m.ops.load(std::memory_order_relaxed);
+        const int64_t total = source_.reduce_payloads(
+            int64_t{0}, [](int64_t acc, const Meta& m) {
+                return acc + m.ops.load(std::memory_order_relaxed);
+            });
         return total > 0 ? static_cast<std::size_t>(total) : 0;
     }
 
     /// Item ceiling. What that means is the policy's business, not the traversal's.
     std::size_t capacity() const noexcept { return admit_.capacity(seg_capacity_); }
 
-    [[nodiscard]] bool acquire() noexcept { return source_.register_thread(); }
-    void release() noexcept { source_.unregister_thread(); }
+    /**
+     * @brief Attach the calling thread for the duration of the returned scope.
+     *
+     * Replaces a manual acquire/release pair, which had already grown an early-return path
+     * that skipped the release. It also un-collides two names: the source's `acquire()`
+     * hands out a *segment*, which is a different thing entirely.
+     */
+    [[nodiscard]] session join() { return source_.join(); }
 
 private:
-    void took_one(std::size_t tid) noexcept {
+    void took_one(Meta& me) noexcept {
         admit_.on_dequeue();
-        meta_[tid].ops.fetch_sub(1, std::memory_order_relaxed);
+        me.ops.fetch_sub(1, std::memory_order_relaxed);
     }
 
     /**
@@ -247,9 +290,9 @@ private:
      * time and the tail has not moved since", which is exactly what the per-thread
      * last_seen records.
      */
-    FORCE_INLINE bool try_enqueue(Segment* s, H h, std::size_t tid, T item) noexcept {
+    FORCE_INLINE bool try_enqueue(Segment* s, H h, Meta& me, T item) noexcept {
         if constexpr (Tr::needs_close_hint) {
-            H& last = meta_[tid].last_seen;
+            H& last = me.last_seen;
             const bool hint = (last == h);
             const bool ok = s->enqueue(item, hint);
             last = ok ? Source::nil() : h;
@@ -267,7 +310,6 @@ private:
     const std::size_t seg_capacity_;
     Source source_;
     [[no_unique_address]] Admit admit_;
-    std::vector<Meta> meta_;
 };
 
 } // namespace proxy

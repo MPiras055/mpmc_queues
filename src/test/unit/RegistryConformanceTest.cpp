@@ -41,8 +41,8 @@ static_assert(all_model_proxy(registry::Linked<Item>{}),
 
 // A pooled source may only hold segments that can be reopened; verify the trait that
 // enforces it is actually set the way each algorithm behaves.
-static_assert(!core::segment_traits<seg::FAAArray<Item>>::recyclable);
-static_assert(!core::segment_traits<seg::HQ<Item>>::recyclable);
+static_assert(core::segment_traits<seg::FAAArray<Item>>::recyclable);
+static_assert(core::segment_traits<seg::HQ<Item>>::recyclable);
 static_assert(core::segment_traits<seg::Vyukov<Item>>::recyclable);
 static_assert(core::segment_traits<seg::PRQ<Item>>::needs_close_hint,
               "PRQ needs the close hint; without it the bounded proxies livelock");
@@ -56,10 +56,12 @@ class QueueBehaviour : public ::testing::Test {
 protected:
     static constexpr size_t kCapacity = 64;
     static constexpr size_t kThreads = 8;
-    registry::Instance<Q> inst{kCapacity, kThreads};
+    registry::Instance<Q> inst{kCapacity};
     Q& q() { return inst.get(); }
-    void SetUp() override { registry::Instance<Q>::join(q()); }
-    void TearDown() override { registry::Instance<Q>::leave(q()); }
+    /// Declared after `inst` so it is released before the queue is destroyed.
+    decltype(registry::Instance<Q>::session(std::declval<Q&>())) joined{};
+
+    void SetUp() override { joined = registry::Instance<Q>::session(q()); }
 };
 
 using AllTypes = registry::AsTypes<registry::All<Item>>::apply<::testing::Types>;

@@ -3,6 +3,7 @@
 #include <mem/Handle.hpp>
 #include <mem/SingleBlock.hpp>
 #include <mem/detail/RingSlab.hpp>
+#include <mem/source/Hazard.hpp>  // NoPayload
 #include <util/bit.hpp>
 #include <util/specs.hpp>
 #include <util/threading/ThreadRegistry.hpp>
@@ -10,6 +11,7 @@
 #include <cassert>
 #include <cstddef>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace mem::source {
@@ -46,12 +48,11 @@ namespace mem::source {
  *
  * @note This owns its reclamation outright. It used to delegate to a `Recycler` that
  *       carried its own ticketing, per-thread metadata, a reuse cache and a lookup-table
- *       template parameter, of which the proxy used almost nothing — the proxy keeps its
- *       own per-thread array, so the metadata plumbing was dead weight. The one part
+ *       template parameter, of which the proxy used almost nothing. The one part
  *       worth keeping was the lock-free index container, and that is `algo::LFring` via
  *       mem::detail::RingSlab, reused here rather than rewritten.
  */
-template <typename S, std::size_t N>
+template <typename S, std::size_t N, typename Payload = NoPayload>
 class Pool {
     /**
      * A pooled segment is handed back out after it has held items, so it must be
@@ -69,15 +70,18 @@ class Pool {
     /// One more ring holds everything currently reusable.
     static constexpr std::size_t kFreeBucket = kStages;
 
-    /// Per-thread published epoch. MSB set means pinned; the low bits are the epoch.
-    struct ThreadData {
+    /// Per-thread published epoch, plus whatever the caller keeps per thread. MSB set means
+    /// pinned; the low bits are the epoch. Aligned here rather than in the registry, so a
+    /// thread's stores do not dirty the line another thread walks for links.
+    struct alignas(CACHE_LINE) ThreadData {
         std::atomic<uint64_t> state{0};
+        [[no_unique_address]] Payload user{};
     };
 
     /**
      * The epoch scan only ever needs to ask "is any *attached* thread pinned behind me",
-     * so the per-thread words live in a registry rather than in an array sized by
-     * max_threads. Two things follow. The scan is O(attached threads), which matters
+     * so the per-thread words live in a registry rather than in a fixed array. Two things
+     * follow. The scan is O(attached threads), which matters
      * because acquire() runs it whenever the pool comes up dry. And a thread that dies
      * while pinned no longer wedges the epoch forever: its node leaves the active list, so
      * it stops being consulted, where a fixed slot array kept its stale pinned word
@@ -87,7 +91,11 @@ class Pool {
     using Node = typename Registry::Node;
 
 public:
-    using handle = mem::VersionedIndex;
+    /// Sized by the pool, so all but log2(N) bits of the word are ABA counter.
+    using handle = mem::VersionedIndex<N>;
+    using thread_payload = Payload;
+    /// RAII thread registration; see join().
+    using session = typename Registry::session;
 
     /// Segments come back from the pool dirty; the proxy must reopen() before reuse.
     static constexpr bool recycles = true;
@@ -109,12 +117,13 @@ public:
         guard& operator=(const guard&) = delete;
         ~guard() { node_->data.state.store(0, std::memory_order_release); }
 
-        std::size_t tid() const noexcept { return node_->slot; }
+        /// This thread's caller-owned state. No second lookup: the pin already found it.
+        Payload& payload() const noexcept { return node_->data.user; }
     };
 
-    Pool(std::size_t max_threads, std::size_t segment_capacity)
-        : registry_{max_threads}, buckets_{kStages + 1, N}, versions_(N), segments_(N) {
-        assert(max_threads != 0);
+    /// @param segment_capacity capacity handed to each of the N pooled segments
+    explicit Pool(std::size_t segment_capacity)
+        : buckets_{kStages + 1, N}, versions_(N), segments_(N) {
         assert(segment_capacity != 0);
 
         for (std::size_t i = 0; i < N; ++i) {
@@ -174,21 +183,33 @@ public:
         limbo(epoch_.load(std::memory_order_acquire)).enqueue(h.index());
     }
 
-    [[nodiscard]] bool register_thread() noexcept {
-        Node* n = registry_.self_or_attach();
-        if (n == nullptr) return false;
-        // A recycled node keeps its previous owner's payload. For the retire lists in
-        // source::Hazard that is exactly what is wanted; for an epoch word it is not, so
-        // start unpinned rather than inheriting whatever the last owner left.
-        n->data.state.store(0, std::memory_order_release);
-        return true;
+    /// Fold @p op over every attached thread's caller-owned payload. See Hazard's copy.
+    template <typename Acc, typename Op>
+    Acc reduce_payloads(Acc init, Op op) const noexcept {
+        return registry_.reduce(std::move(init), [&op](Acc a, const ThreadData& d) {
+            return op(std::move(a), d.user);
+        });
     }
 
-    void unregister_thread() noexcept { registry_.detach(); }
+    /**
+     * @brief Attach the calling thread for the duration of the returned scope.
+     *
+     * A recycled node keeps its previous owner's payload. For the retire lists in
+     * source::Hazard that is exactly what is wanted; for an epoch word it is not, so this
+     * starts unpinned rather than inheriting whatever the last owner left.
+     */
+    [[nodiscard]] session join() {
+        session s = registry_.join();
+        registry_.self()->data.state.store(0, std::memory_order_release);
+        return s;
+    }
 
-    std::size_t ticket() noexcept { return node()->slot; }
-
-    std::size_t max_threads() const noexcept { return registry_.max_threads(); }
+    /// Non-allocating join, for a caller that must not touch the allocator.
+    [[nodiscard]] session try_join() noexcept {
+        session s = registry_.try_join();
+        if (s) registry_.self()->data.state.store(0, std::memory_order_release);
+        return s;
+    }
 
     static constexpr std::size_t pool_size() noexcept { return N; }
 
@@ -209,18 +230,28 @@ private:
     Ring& limbo(uint64_t e) const noexcept { return *buckets_.get(e % kStages); }
     Ring& free_list() const noexcept { return *buckets_.get(kFreeBucket); }
 
+    /// Stamp a fresh version onto @p idx. The counter is free-running; the handle folds it
+    /// into the bits it has and skips 0, which is reserved for nil.
     handle make_handle(std::size_t idx) noexcept {
-        const uint32_t v = versions_[idx].fetch_add(1, std::memory_order_relaxed) + 1;
-        return handle{handle::next_version(v), static_cast<uint32_t>(idx)};
+        const uint64_t n = versions_[idx].fetch_add(1, std::memory_order_relaxed) + 1;
+        return handle{handle::to_version(n), static_cast<typename handle::index_type>(idx)};
     }
 
-    /// This thread's registry node, attaching on first use. Aborts if the registry is
-    /// full, which means more threads reached the queue than it was constructed for.
-    Node* node() noexcept {
-        Node* n = registry_.self_or_attach();
-        assert(n && "Pool: registry full; more threads than max_threads reached the queue");
-        if (!n) std::abort();
-        return n;
+    /**
+     * @brief This thread's registry node, attaching on first use.
+     *
+     * Three tiers, cheapest first: a thread-local read; then a lock-free claim of a node that
+     * is already free; then, only if the registry has none, an allocation. The last tier can
+     * throw, and this is reached from `pin()`, which is noexcept -- so an allocation failure
+     * terminates. That is the same bargain `retire()` already makes by pushing onto a vector
+     * in a noexcept function, and it is why `join()` exists: holding a session for the life
+     * of the thread keeps every later operation on the first tier.
+     */
+    Node* node() {
+        if (Node* n = registry_.self()) return n;
+        if (registry_.try_attach()) return registry_.self();
+        registry_.attach();
+        return registry_.self();
     }
 
     /**
@@ -234,13 +265,12 @@ private:
      * asks the same question and gets the same answer.
      */
     bool try_advance(uint64_t e) noexcept {
-        bool everyone_current = true;
-        registry_.for_each_active([&](ThreadData& d) noexcept {
+        // Short-circuits on the first thread that is behind, which is the common reason to
+        // refuse: no point asking the rest.
+        const bool everyone_current = registry_.all_of([e](const ThreadData& d) noexcept {
             const uint64_t st = d.state.load(std::memory_order_seq_cst);
-            if (bit::get_msb(st) == 0) return true;       // not pinned
-            if (bit::clear_msb(st) == e) return true;     // pinned, and up to date
-            everyone_current = false;
-            return false;                                 // pinned but behind: stop here
+            if (bit::get_msb(st) == 0) return true;   // not pinned: holds nothing
+            return bit::clear_msb(st) == e;           // pinned: must be up to date
         });
         if (!everyone_current) return false;
 
@@ -259,7 +289,7 @@ private:
 
     Registry registry_;
     mutable mem::detail::RingSlab buckets_;
-    std::vector<std::atomic<uint32_t>> versions_;
+    std::vector<std::atomic<uint64_t>> versions_;
     std::vector<mem::unique_block<S>> segments_;
 
     ALIGNED_CACHE std::atomic<uint64_t> epoch_{0};

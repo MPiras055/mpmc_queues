@@ -1,157 +1,81 @@
 #pragma once
 #include <meta/OptionsPack.hpp>
-#include <util/bit.hpp>
 #include <util/specs.hpp>
 #include <atomic>
-#include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <type_traits>
 #include <utility>
-#include <vector>
 
 namespace util::threading {
 
 /// Option tags accepted by ThreadRegistry.
 struct ThreadRegistryOpt {
     /**
-     * @brief Make for_each_active retry when a thread attaches during the walk.
+     * @brief Make a scan retry when a thread attaches during the walk.
      *
-     * Off by default. See "Threads that attach mid-scan" in the ThreadRegistry docs for
-     * what this buys and what the default relies on instead.
+     * Off by default. See "Threads that attach mid-scan" in the ThreadRegistry docs for what
+     * this buys and what the default relies on instead.
      */
     struct retry_scan_on_attach {};
 };
 
-namespace detail {
-
 /**
- * @brief A node index, an activity mark and a reuse version in one CAS-able word.
+ * @brief An unbounded, lock-free registry of participating threads, each carrying a payload.
  *
- * Both list heads and both per-node link fields are one of these, so every structural
- * change is a single 64-bit compare-exchange. Nothing here needs a double-width CAS, so
- * none of it depends on `-mcx16`.
- *
- * ```
- *  63                    32 31   30                     0
- * +------------------------+-----+-----------------------+
- * |        version         | mark|         index         |
- * +------------------------+-----+-----------------------+
- * ```
- *
- * @note The version is what stops a stale compare-exchange from *succeeding* against a
- *       node that has been detached and re-attached in the meantime. Immortal nodes rule
- *       out use-after-free, but they do not rule out ABA, and on the free list ABA is a
- *       lost node rather than a crash: T1 reads `head = A, A.free_next = B` and stalls;
- *       T2 pops A; T3 pops B; T2 pushes A back; T1's `CAS(head, A -> B)` then succeeds and
- *       hands out a node T3 is already using. Same 32/32 split as mem::VersionedIndex.
- *
- * @note Wraparound needs 2^32 updates to one node's link. Links change only on attach and
- *       detach -- thread-lifecycle events -- so it is not reachable in practice.
- */
-struct Link {
-    /// No successor. Also the largest representable index, so it doubles as the cap.
-    static constexpr uint32_t kNil = 0x7FFF'FFFFu;
-    /// Set while the node is *not* attached. Cleared by attach, set by detach.
-    static constexpr uint32_t kMark = 0x8000'0000u;
-
-    uint64_t raw = bit::merge<uint64_t, uint32_t>(0u, kNil);
-
-    constexpr Link() noexcept = default;
-    explicit constexpr Link(uint64_t r) noexcept : raw{r} {}
-
-    uint32_t version() const noexcept { return bit::keep_high<uint32_t>(raw); }
-    uint32_t index() const noexcept { return bit::keep_low<uint32_t>(raw) & ~kMark; }
-    bool marked() const noexcept { return (bit::keep_low<uint32_t>(raw) & kMark) != 0u; }
-    bool nil() const noexcept { return index() == kNil; }
-
-    /// The value to publish next: one version on, so no earlier reader's word can match.
-    Link next_gen(uint32_t idx, bool mark = false) const noexcept {
-        return Link{bit::merge<uint64_t, uint32_t>(version() + 1u, idx | (mark ? kMark : 0u))};
-    }
-
-    /// Same successor, mark flipped to @p mark, one version on.
-    Link remark(bool mark) const noexcept { return next_gen(index(), mark); }
-
-    bool operator==(const Link&) const noexcept = default;
-};
-
-static_assert(sizeof(Link) == sizeof(uint64_t));
-static_assert(std::is_trivially_copyable_v<Link>);
-
-} // namespace detail
-
-/**
- * @brief A dynamic, lock-free registry of participating threads, each carrying a payload.
- *
- * Replaces util::threading::DynamicThreadTicket. That handed out a dense integer from an
- * atomic bitset and left the caller to keep its per-thread state in a separate array
- * indexed by it, which had three consequences:
- *
- *  - the caps were compile-time (`DTT_MAX_BITS` threads, `DTT_MAX_INSTANCES` live
- *    instances), because the per-thread cache was a fixed `thread_local std::array`;
- *  - every reclamation scan was O(max_threads) whether or not those threads existed --
- *    and `Hazard::is_protected` runs that scan once per retired object per pass;
- *  - identity and state were separate, so detaching a thread could not also release
- *    whatever the thread had been publishing.
- *
- * Here the payload lives *in* the node that represents the thread, the scan only reaches
- * nodes that have actually been used, and detaching is O(1).
+ * Answers one question -- "which threads are participating, and what is each publishing?" --
+ * for both reclamation sources. Each thread's state lives *in* the node that represents it, so
+ * there is no side array and therefore no index to hand out.
  *
  * ## Structure
  *
- * One immortal node array and two lock-free singly linked lists threaded through it:
+ * Two intrusive singly linked lists over the same nodes:
  *
- *  - the **active list** (`active_head_`), walked by reclamation;
- *  - the **free list** (`free_head_`), a Treiber stack of nodes available for reuse.
+ *  - the **active list**, which reclamation walks. Append-only: a node is linked exactly once,
+ *    when it is created, and **is never unlinked**. A node that detaches is marked inactive
+ *    and stays where it is.
+ *  - the **free list**, holding the nodes currently marked inactive, so a later attach can
+ *    take one in O(1) instead of hunting for it.
  *
- * `max_threads` nodes are allocated once in the constructor and never allocated or freed
- * again. Attach therefore never calls the allocator -- it pops an index -- and `attach()`
- * failing when the free list is empty is exactly the old `register_thread()` returning
- * false. What was a *compile-time* cap is now purely a runtime argument.
+ * The registry owns every node it links, whether it allocated it or adopted it from a caller,
+ * and deletes them in its destructor by walking the active list. There is no separate
+ * owned-list to keep in step, because the active list already contains every node that has
+ * ever existed.
  *
- * ## Detaching, and why nothing is ever unlinked
+ * ## Nothing is scanned on the hot path
  *
- * Detach is one CAS: the owning thread sets the mark bit in its own link, and pushes the
- * node onto the free list. The node **stays where it is in the active list**; attach pops
- * it and clears the mark in place. A node is appended to the active list at most once
- * ever, on its first use, and is never removed.
+ * `self()` -- called from `pin()` on every enqueue and dequeue -- is a thread-local read and
+ * nothing else. Attach pops the free list; detach pushes onto it. The only members that
+ * traverse anything are `reduce`, `any_of`, `all_of` and the two `for_each` forms, which is
+ * exactly where a traversal is the point.
  *
- * The consequence is that the active list is **append-only and acyclic**, and its nodes
- * never move. A walk is therefore a pure read -- no CAS, no helping, no restarts, and no
- * possibility of wandering. `for_each_active` invokes the functor only on unmarked nodes,
- * so the functor still runs O(attached threads) times, while the pointer chase is bounded
- * by the *peak* number of threads that have ever attached rather than by `max_threads`.
- * For a queue built for 128 threads and used by 4, that is a 4-node walk.
+ * ## Why nothing is ever unlinked
  *
- * @note An earlier version of this did physically splice detached nodes out, Harris-style,
- *       to make the chase O(currently attached). **It is not safe here and was removed.**
- *       A walk holds `prev` as a *snapshot*; once a node can be unlinked and immediately
- *       recycled, that snapshot can lead the walk into a detached node's stale successor
- *       chain, where the next link looks perfectly consistent and the splice CAS succeeds
- *       -- unlinking and freeing a node that is still live in the real list. It then sits
- *       on both lists at once, gets popped while still linked, and attach closes a cycle.
- *       Measured before the fix: a double push to the free list within a few thousand
- *       attach/detach cycles on 8 threads, and roughly half of all runs ending with nodes
- *       lost. Splicing safely needs reclamation for the *nodes*, which is the thing this
- *       registry exists to support rather than to depend on. Not unlinking removes the
- *       problem outright, and costs only that the chase is bounded by peak rather than
- *       current concurrency.
+ * A walk holds its predecessor as a *snapshot*. Once a node can be unlinked and immediately
+ * reused, that snapshot can lead the walk into a detached node's stale successor chain, where
+ * the next link looks perfectly consistent and an unlink CAS through it therefore **succeeds**
+ * -- removing and freeing a node that is still live in the real list. An earlier version of
+ * this file did splice, Harris-style, and it produced a double push to the free list within a
+ * few thousand attach/detach cycles on eight threads.
+ *
+ * Splicing safely needs reclamation for the *nodes*, which is the thing this registry exists
+ * to support rather than to depend on. Not unlinking removes the problem outright, and it is
+ * what makes a walk a pure read: no CAS, no helping, no restarts, no possibility of being led
+ * astray. The cost is that the chase is bounded by the peak number of threads that have ever
+ * attached rather than by the number attached now; the functor still only runs on the latter.
  *
  * ## Threads that attach mid-scan
  *
- * A thread attaching at the head after the walk has passed it is not visited. For a hazard
- * scan that would mean reclaiming an object the new thread had just protected.
- * `ThreadRegistryOpt::retry_scan_on_attach` closes this outright: attaches bump a counter,
- * and `for_each_active` re-reads it after the walk and repeats if it moved. Attaches happen
- * at thread-lifetime scale, so in practice it never retries.
+ * A thread attaching at the head after a walk has passed it is not visited. For a hazard scan
+ * that would mean reclaiming an object the new thread had just protected.
+ * `ThreadRegistryOpt::retry_scan_on_attach` closes it: attaches bump a counter, and a scan
+ * re-reads it afterwards and repeats if it moved. Attaches happen at thread-lifetime scale, so
+ * in practice it never retries.
  *
  * It is **off by default**, and the default instead relies on the argument that a thread
- * attaching after a scan began cannot already hold a pointer to an object that was
- * unlinked before `retire()` was called on it. That argument is delicate and its failure
- * mode is silent, so turning the flag on is worth doing for any stress or TSan run: it is a
- * one-token change at the source alias, e.g.
+ * attaching after a scan began cannot already hold a pointer to an object that was unlinked
+ * before `retire()` was called on it. That argument is delicate and its failure mode is
+ * silent, so turning the flag on is worth doing for any stress or TSan run:
  *
  * @code
  * using Registry = util::threading::ThreadRegistry<
@@ -160,346 +84,540 @@ static_assert(std::is_trivially_copyable_v<Link>);
  *
  * ## Payload lifetime
  *
- * `ThreadData` is default-constructed once, with the node, and is **not** reset when a node
- * is reused. A thread that inherits a node inherits its payload. That is deliberate:
- * mem::source::Hazard keeps its retire list there, and a detaching thread's undestroyed
- * retirements must not be dropped on the floor. A caller that needs a clean slate (Pool
- * does, for its epoch word) resets it after `attach()`.
+ * `ThreadData` is default-constructed once, with the node, and is **not** reset when a node is
+ * reused. A thread that inherits a node inherits its payload -- deliberately, because
+ * mem::source::Hazard keeps its retire list there and a detaching thread's undestroyed
+ * retirements must not be dropped. A caller needing a clean slate (Pool does, for its epoch
+ * word) resets it after attaching.
  *
- * @tparam ThreadData per-thread payload; stored inline in the node, cache-line isolated.
+ * @pre Every thread that attaches must `detach()` before the registry is destroyed. The
+ *      destructor deletes the nodes, and a thread that never detached is left holding a
+ *      dangling entry in its thread-local chain.
+ *
+ * @tparam ThreadData per-thread payload. **Align it**: the registry deliberately does not
+ *                    over-align `Node`, so that the link words and the payload land on
+ *                    different cache lines.
  * @tparam Opt        meta::OptionsPack of ThreadRegistryOpt tags.
  */
 template <typename ThreadData, typename Opt = meta::EmptyOptions>
     requires meta::AcceptsOnly<Opt, typename ThreadRegistryOpt::retry_scan_on_attach>
 class ThreadRegistry {
-    using Link = detail::Link;
-
     static constexpr bool kRetryOnAttach =
         Opt::template has<typename ThreadRegistryOpt::retry_scan_on_attach>;
 
 public:
+    struct Node;
+
+    /**
+     * @brief A node pointer paired with a generation, compared as one unit.
+     *
+     * This is what makes the free queue's compare-and-swaps safe. Nodes here are immortal,
+     * which rules out use-after-free but **not** ABA: a stalled `CAS(head, A, B)` succeeds when
+     * the head is A *again* rather than still A, publishing a node another thread already owns.
+     * Bumping the generation on every successful link makes a stale expected value impossible
+     * to match. It is Michael & Scott's counted pointer, for the reason they introduced it.
+     *
+     * @note `alignas(16)` is required: the double-width compare-exchange this lowers to needs
+     *       the operand aligned. Where the instruction is unavailable the standard library
+     *       falls back to an internal lock, which is correct and is only ever reached on
+     *       attach and detach -- see @ref free_list_is_lock_free.
+     */
+    struct alignas(16) TaggedPtr {
+        Node* ptr = nullptr;
+        uint64_t gen = 0;
+
+        bool operator==(const TaggedPtr&) const noexcept = default;
+
+        /// The same slot one generation on, so no earlier reader's value can compare equal.
+        TaggedPtr with(Node* p) const noexcept { return TaggedPtr{p, gen + 1}; }
+    };
+
+    static_assert(std::is_trivially_copyable_v<TaggedPtr>);
+
+    /**
+     * @brief Does the free queue compile to a real double-width CAS on this target?
+     *
+     * Reported rather than asserted: a target without the instruction still behaves correctly,
+     * it just takes a lock inside `std::atomic`. Asserting would break those builds for no
+     * gain, but a silent fallback on a target that *should* have it -- `-mcx16` not reaching
+     * the translation unit, say -- is worth being able to see, so the test suite prints it.
+     */
+    static constexpr bool free_list_is_lock_free = std::atomic<TaggedPtr>::is_always_lock_free;
+
     /**
      * @brief One thread's registration.
      *
-     * Cache-line isolated: `next` is read by every reclamation scan while `data` is written
-     * by its owner, and both live here, so without the alignment one thread publishing a
-     * hazard pointer would invalidate the line another thread is walking.
+     * Deliberately **not** `alignas(CACHE_LINE)`. `ThreadData` carries the alignment instead,
+     * which puts the link words and the payload on separate lines: after linking, `next` is
+     * immutable apart from its mark bit, so a scan reads link lines that are essentially never
+     * written, while payload lines are written only by their owner. Aligning the node as a
+     * whole put both in one line, so every hazard-pointer store dirtied the line every scan
+     * was reading. `sizeof(Node)` is larger this way; it is one allocation per participating
+     * thread, so the sharing is what matters and the size is not.
+     *
+     * The two link fields are both needed and mean different things. A node lives in the
+     * active list **for its whole life**, marked inactive when nobody holds it, and is
+     * *simultaneously* queued on the free list when it is available. Collapsing them into one
+     * pointer would mean a detached node leaving the active list, and a scan sitting on that
+     * node would follow it into the free queue and terminate there -- silently skipping every
+     * still-active thread behind it.
      */
-    struct ALIGNED_CACHE Node {
-        /// Active-list successor, plus the mark meaning "nobody is using this node".
-        /// The successor half is written exactly once, when the node is first linked.
-        std::atomic<Link> next{};
-        /// Free-list successor. Meaningful only while the node is on the free list.
-        std::atomic<Link> free_next{};
-        /// Stable index of this node, and the value `ticket()` hands back. Never changes.
-        uint32_t slot = 0;
-        /// Has this node been appended to the active list? Only ever touched by the thread
-        /// that popped it, which holds it exclusively, and set once for the node's life.
-        std::atomic<bool> linked{false};
+    struct Node {
+        /// Active-list successor, written exactly once when the node is linked, plus a mark in
+        /// bit 0 meaning "nobody is using this node". The mark is the only mutable part.
+        std::atomic<Node*> next{nullptr};
+        /// Free-queue successor. Meaningful only while the node is queued.
+        std::atomic<TaggedPtr> free_next{};
+        /// Which registry this node belongs to; identifies it in a thread's chain.
+        const void* owner{nullptr};
+        /// This thread's chain across registry instances. Touched only by the owning thread.
+        Node* tls_next{nullptr};
+
         ThreadData data{};
     };
 
-    /// Largest addressable thread count. Runtime, unlike DTT_MAX_BITS.
-    static constexpr std::size_t max_capacity = Link::kNil - 1;
-
     /**
-     * @param max_threads number of concurrently attached threads this registry can hold
+     * @param expected_threads how many nodes to pre-create. A **hint**, not a cap: attaching
+     *                         past it simply allocates more.
      */
-    explicit ThreadRegistry(std::size_t max_threads)
-        : id_{next_id_.fetch_add(1, std::memory_order_relaxed)},
-          capacity_{max_threads},
-          nodes_{std::make_unique<Node[]>(max_threads)} {
-        assert(max_threads != 0 && "ThreadRegistry: max_threads must be non-null");
-        assert(max_threads <= max_capacity && "ThreadRegistry: max_threads not representable");
-
-        // Every node starts free and unlinked, chained in index order so the first
-        // attachers get ascending slots -- which keeps the old "smallest ticket" feel.
-        for (std::size_t i = 0; i < max_threads; ++i) {
-            nodes_[i].slot = static_cast<uint32_t>(i);
-            const uint32_t succ =
-                (i + 1 == max_threads) ? Link::kNil : static_cast<uint32_t>(i + 1);
-            nodes_[i].free_next.store(Link{}.next_gen(succ), std::memory_order_relaxed);
-            // Marked: "not attached" is what for_each_active filters on.
-            nodes_[i].next.store(Link{}.next_gen(Link::kNil, true), std::memory_order_relaxed);
-        }
-        free_head_.store(Link{}.next_gen(0), std::memory_order_relaxed);
+    explicit ThreadRegistry(std::size_t expected_threads = 0) {
+        // The free queue is never empty: it always holds a dummy, whose successor is the
+        // first real element. `node_count()` therefore reports one more than the hint.
+        Node* dummy = link_new_node();
+        free_head_.store(TaggedPtr{dummy, 0}, std::memory_order_relaxed);
+        free_tail_.store(TaggedPtr{dummy, 0}, std::memory_order_relaxed);
+        for (std::size_t i = 0; i < expected_threads; ++i) enqueue_free(*link_new_node());
     }
 
     ThreadRegistry(const ThreadRegistry&) = delete;
     ThreadRegistry& operator=(const ThreadRegistry&) = delete;
 
-    /**
-     * @brief Destructor.
-     *
-     * Only the destroying thread's TLS association can be purged from here. A thread that
-     * attached and never detached leaves a dead entry behind, which is harmless: registry
-     * ids are monotonic and never reused, so no future registry can match it.
-     */
-    ~ThreadRegistry() { tls_erase(id_); }
-
-    /**
-     * @brief Attach the calling thread, if it is not attached already.
-     * @return false only when every node is already handed out.
-     */
-    [[nodiscard]] bool attach() noexcept { return self_or_attach() != nullptr; }
-
-    /**
-     * @brief Detach the calling thread, releasing its node for reuse.
-     *
-     * Two writes and no traversal: mark the node inactive, then push it onto the free
-     * list. The node keeps its place in the active list, so scans in flight are entirely
-     * undisturbed -- they simply stop invoking the functor on it.
-     *
-     * Safe to call when not attached, and safe to call repeatedly.
-     */
-    void detach() noexcept {
-        Node* n = tls_lookup(id_);
-        if (n == nullptr) return;
-        tls_erase(id_);
-
-        // Only the owner marks, so this contends with nothing and settles immediately.
-        Link cur = n->next.load(std::memory_order_acquire);
-        while (!cur.marked()) {
-            if (n->next.compare_exchange_weak(cur, cur.remark(true), std::memory_order_acq_rel,
-                                              std::memory_order_acquire))
-                break;
+    /// Deletes every node. All threads must have detached; see the class precondition.
+    ~ThreadRegistry() {
+        detach(); // whoever is destroying it may still be attached
+        Node* n = unmarked(active_head_.load(std::memory_order_acquire));
+        while (n) {
+            Node* next = unmarked(n->next.load(std::memory_order_relaxed));
+            delete n;
+            n = next;
         }
-        push_free(*n);
     }
 
-    /// @return this thread's node, or nullptr if it is not attached. No side effects.
-    Node* self() noexcept { return tls_lookup(id_); }
+    // ===== attach / detach =====
 
     /**
-     * @brief This thread's node, attaching it on first use.
-     * @return nullptr if the registry is full.
+     * @brief A scope in which the calling thread is attached. Detaches on destruction.
+     *
+     * The same reasoning as the `pin()` guard in the sources: a manual
+     * register/unregister pair is only correct if every future `return` remembers, and one
+     * had already grown an early exit that skipped it.
+     *
+     * @note The two members answer different questions, and keeping them apart is what makes
+     *       a **nested** join safe. `attached_` is "this thread is attached", which an inner
+     *       join must report truthfully; `owner_` is "this session owes the detach", which
+     *       only the join that actually attached may hold. An inner session therefore
+     *       converts to `true` and does nothing on destruction, leaving the outer scope in
+     *       charge.
      */
-    Node* self_or_attach() noexcept {
-        if (Node* n = tls_lookup(id_)) return n;
+    class session {
+        ThreadRegistry* owner_ = nullptr;
+        bool attached_ = false;
 
-        Node* n = pop_free();
-        if (n == nullptr) return nullptr;
+    public:
+        session() noexcept = default;
+        session(ThreadRegistry* owner, bool attached) noexcept
+            : owner_{owner}, attached_{attached} {}
 
-        // We hold this node exclusively -- it came off the free list -- so the only
-        // concurrency here is with scans reading `next`.
-        if (!n->linked.load(std::memory_order_relaxed)) {
-            // First use: append at the head, unmarked, so it becomes visible already
-            // active. This is the only time a node's successor is ever written.
-            Link head = active_head_.load(std::memory_order_acquire);
-            for (;;) {
-                n->next.store(n->next.load(std::memory_order_relaxed).next_gen(head.index()),
-                              std::memory_order_release);
-                if (active_head_.compare_exchange_weak(head, head.next_gen(n->slot),
-                                                       std::memory_order_acq_rel,
-                                                       std::memory_order_acquire))
-                    break;
+        session(const session&) = delete;
+        session& operator=(const session&) = delete;
+
+        session(session&& o) noexcept
+            : owner_{std::exchange(o.owner_, nullptr)}, attached_{std::exchange(o.attached_, false)} {}
+
+        session& operator=(session&& o) noexcept {
+            if (this != &o) {
+                reset();
+                owner_ = std::exchange(o.owner_, nullptr);
+                attached_ = std::exchange(o.attached_, false);
             }
-            n->linked.store(true, std::memory_order_relaxed);
-        } else {
-            // Already in the list: just clear the mark, in place.
-            Link cur = n->next.load(std::memory_order_acquire);
-            while (cur.marked()) {
-                if (n->next.compare_exchange_weak(cur, cur.remark(false),
-                                                  std::memory_order_acq_rel,
-                                                  std::memory_order_acquire))
-                    break;
-            }
+            return *this;
         }
 
-        if constexpr (kRetryOnAttach)
-            attaches_.v.fetch_add(1, std::memory_order_release);
+        ~session() { reset(); }
 
-        tls_insert(id_, n);
-        return n;
+        /// Detach now, if this session owes it. Idempotent.
+        void reset() noexcept {
+            if (owner_) {
+                owner_->detach();
+                owner_ = nullptr;
+            }
+            attached_ = false;
+        }
+
+        /// @return whether the calling thread is attached -- not whether this session owns it.
+        explicit operator bool() const noexcept { return attached_; }
+    };
+
+    /**
+     * @brief Attach for the duration of the returned scope.
+     * @throws whatever `operator new` throws, if no node is free.
+     */
+    [[nodiscard]] session join() {
+        if (self() != nullptr) return session{nullptr, true}; // nested: do not own the detach
+        attach();
+        return session{this, true};
+    }
+
+    /// Non-allocating join. The session reports false if no node was free.
+    [[nodiscard]] session try_join() noexcept {
+        if (self() != nullptr) return session{nullptr, true};
+        if (!try_attach()) return session{};
+        return session{this, true};
     }
 
     /**
-     * @brief Visit the payload of every attached thread.
+     * @brief Attach using a node that is already free. Never allocates.
+     * @return false if no node is free, in which case nothing happened.
      *
-     * @param fn invoked as `fn(ThreadData&)`. Returning `bool` stops the walk on `false`;
-     *           returning `void` always continues.
+     * The lock-free half of attaching: pair it with `attach(Node*)` on a path that must not
+     * call the allocator.
      */
-    template <typename Fn>
-    void for_each_active(Fn&& fn) noexcept {
-        if constexpr (kRetryOnAttach) {
-            for (;;) {
-                const uint64_t before = attaches_.v.load(std::memory_order_acquire);
-                if (!walk(fn)) return; // stopped early: fn already has its answer
-                if (attaches_.v.load(std::memory_order_acquire) == before) return;
-                // Somebody attached behind us and may have been missed. Go again.
-            }
-        } else {
-            (void)walk(fn);
-        }
-    }
-
-    /// Maximum concurrently attached threads.
-    std::size_t max_threads() const noexcept { return capacity_; }
-
-    /// Attached threads right now. For tests and diagnostics.
-    std::size_t active_count() noexcept {
-        std::size_t n = 0;
-        for_each_active([&](ThreadData&) noexcept { ++n; });
-        return n;
-    }
-
-    /// Every node, attached or not, in index order. For teardown -- only meaningful when
-    /// no other thread is using the registry.
-    template <typename Fn>
-    void for_each_node(Fn&& fn) {
-        for (std::size_t i = 0; i < capacity_; ++i) fn(nodes_[i].data);
-    }
-
-private:
-    // ===== traversal =====
-
-    /**
-     * @brief Read-only walk of the active list.
-     *
-     * Nodes are never unlinked and a node's successor is written exactly once, so this
-     * chases a chain that is append-only and acyclic. There is nothing to help with, no
-     * CAS, and no restart: the walk simply cannot be led astray, which is the whole reason
-     * detach marks instead of splicing.
-     *
-     * @return false if @p fn asked to stop, true if the walk reached the end.
-     */
-    template <typename Fn>
-    bool walk(Fn& fn) noexcept {
-        Link cur = active_head_.load(std::memory_order_acquire);
-        while (!cur.nil()) {
-            Node& n = nodes_[cur.index()];
-            const Link nx = n.next.load(std::memory_order_acquire);
-            if (!nx.marked() && !invoke(fn, n.data)) return false;
-            cur = nx;
-        }
+    [[nodiscard]] bool try_attach() noexcept {
+        if (self() != nullptr) return true; // already attached; idempotent
+        Node* n = dequeue_free();
+        if (n == nullptr) return false;
+        activate(*n);
         return true;
     }
 
-    /// Accept both `bool(ThreadData&)` and `void(ThreadData&)` functors.
+    /**
+     * @brief Attach the calling thread, allocating a node if none is free.
+     * @throws whatever `operator new` throws. Not lock-free -- see `attach(Node*)`.
+     */
+    void attach() {
+        if (try_attach()) return;
+        // The queue had nothing: this is the only path that allocates.
+        activate(*link_new_node());
+    }
+
+    /**
+     * @brief Attach using a caller-supplied node.
+     *
+     * Always adopts @p n rather than checking the free list first, so this is branch-free,
+     * allocation-free and genuinely lock-free, and the caller never has a node left over to
+     * manage. The registry owns @p n from here and will delete it.
+     *
+     * @param n a fresh, heap-allocated node. Must not already belong to a registry.
+     * @return true if @p n was adopted. **False means the calling thread was already
+     *         attached and @p n is still the caller's to free** -- it is not silently leaked.
+     */
+    bool attach(Node* n) noexcept {
+        if (self() != nullptr) return false;
+        link(*n);
+        activate(*n);
+        return true;
+    }
+
+    /**
+     * @brief Detach the calling thread.
+     *
+     * Marks the node inactive and pushes it onto the free list. The node keeps its place in
+     * the active list, so scans in flight are entirely undisturbed -- they simply stop
+     * invoking the functor on it. Safe when not attached, and safe to repeat.
+     */
+    void detach() noexcept {
+        Node* n = self();
+        if (n == nullptr) return;
+        tls_unlink(*n);
+        // Release, so the payload this thread wrote is visible to whoever takes the node next.
+        n->next.store(marked(unmarked(n->next.load(std::memory_order_relaxed))),
+                      std::memory_order_release);
+        enqueue_free(*n);
+    }
+
+    /// @return this thread's node, or nullptr if it is not attached. A TLS read; never walks.
+    Node* self() noexcept {
+        for (Node* n = tls_head_; n != nullptr; n = n->tls_next)
+            if (n->owner == this) return n;
+        return nullptr;
+    }
+
+    /// @return this thread's payload, attaching first if necessary.
+    ThreadData& payload() {
+        if (Node* n = self()) return n->data;
+        attach();
+        return self()->data;
+    }
+
+    // ===== traversal: the only members that walk anything =====
+
+    /**
+     * @brief Fold @p op over the payload of every attached thread.
+     *
+     * @param op invoked as `op(Acc, const ThreadData&) -> Acc`.
+     *
+     * @note @p op may keep external state (`Hazard::collect` accumulates an index this way).
+     *       That is sound because the walk visits each node exactly once -- the active list is
+     *       append-only and the walk is a pure read, with no restarts and no helping.
+     */
+    template <typename Acc, typename Op>
+    Acc reduce(Acc init, Op op) const noexcept {
+        for (;;) {
+            const uint64_t before = attach_generation();
+            Acc acc = init;
+            for (const Node* n = first(); n != nullptr; n = advance(n))
+                if (is_active(n)) acc = op(std::move(acc), std::as_const(n->data));
+            if (!scan_was_disturbed(before)) return acc;
+        }
+    }
+
+    /// True if any attached thread satisfies @p p. Stops at the first one.
+    template <typename Pred>
+    bool any_of(Pred p) const noexcept {
+        return short_circuit(/*stop_on=*/true, p);
+    }
+
+    /// True if every attached thread satisfies @p p. Stops at the first that does not.
+    template <typename Pred>
+    bool all_of(Pred p) const noexcept {
+        return !short_circuit(/*stop_on=*/false, p);
+    }
+
+    /// Mutable visit of every attached thread's payload -- for resetting published state.
     template <typename Fn>
-    static bool invoke(Fn& fn, ThreadData& d) noexcept {
-        if constexpr (std::is_invocable_r_v<bool, Fn&, ThreadData&>) return fn(d);
-        else {
-            fn(d);
-            return true;
-        }
+    void for_each_active(Fn fn) {
+        for (Node* n = first(); n != nullptr; n = advance(n))
+            if (is_active(n)) fn(n->data);
     }
 
-    // ===== free list (Treiber stack over versioned indices) =====
-
-    Node* pop_free() noexcept {
-        Link head = free_head_.load(std::memory_order_acquire);
-        for (;;) {
-            if (head.nil()) return nullptr; // every node is handed out
-            Node& n = nodes_[head.index()];
-            const Link succ = n.free_next.load(std::memory_order_acquire);
-            if (free_head_.compare_exchange_weak(head, head.next_gen(succ.index()),
-                                                 std::memory_order_acq_rel,
-                                                 std::memory_order_acquire))
-                return &n;
-        }
+    /// Every node, attached or not. Detached nodes keep their payload, so teardown needs this.
+    template <typename Fn>
+    void for_each_node(Fn fn) {
+        for (Node* n = first(); n != nullptr; n = advance(n)) fn(n->data);
     }
 
-    void push_free(Node& n) noexcept {
-        Link head = free_head_.load(std::memory_order_acquire);
+    /// Attached threads right now. For tests and diagnostics.
+    std::size_t active_count() const noexcept {
+        return reduce(std::size_t{0}, [](std::size_t n, const ThreadData&) { return n + 1; });
+    }
+
+    /// Nodes ever created. For tests: a registry that leaks nodes grows without bound.
+    std::size_t node_count() const noexcept {
+        std::size_t n = 0;
+        for (const Node* p = first(); p != nullptr; p = advance(p)) ++n;
+        return n;
+    }
+
+private:
+    // ===== mark encoding =====
+    //
+    // Bit 0 of `next` means "this node is not in use". Nodes come from `new`, so the low bits
+    // are always free.
+
+    static Node* marked(Node* p) noexcept {
+        return reinterpret_cast<Node*>(reinterpret_cast<uintptr_t>(p) | uintptr_t{1});
+    }
+    static Node* unmarked(Node* p) noexcept {
+        return reinterpret_cast<Node*>(reinterpret_cast<uintptr_t>(p) & ~uintptr_t{1});
+    }
+    static bool is_marked(Node* p) noexcept {
+        return (reinterpret_cast<uintptr_t>(p) & uintptr_t{1}) != 0;
+    }
+    static bool is_active(const Node* n) noexcept {
+        return !is_marked(n->next.load(std::memory_order_acquire));
+    }
+
+    const Node* first() const noexcept {
+        return unmarked(active_head_.load(std::memory_order_acquire));
+    }
+    Node* first() noexcept { return unmarked(active_head_.load(std::memory_order_acquire)); }
+
+    static const Node* advance(const Node* n) noexcept {
+        return unmarked(n->next.load(std::memory_order_acquire));
+    }
+    static Node* advance(Node* n) noexcept {
+        return unmarked(n->next.load(std::memory_order_acquire));
+    }
+
+    // ===== list construction =====
+
+    /// Allocate a node and append it to the active list, marked inactive.
+    Node* link_new_node() {
+        Node* n = new Node();
+        link(*n);
+        return n;
+    }
+
+    /// Publish @p n at the head of the active list, inactive. Its successor never changes again.
+    void link(Node& n) noexcept {
+        n.owner = this;
+        Node* head = active_head_.load(std::memory_order_acquire);
         for (;;) {
-            n.free_next.store(n.free_next.load(std::memory_order_relaxed).next_gen(head.index()),
-                              std::memory_order_release);
-            if (free_head_.compare_exchange_weak(head, head.next_gen(n.slot),
-                                                 std::memory_order_acq_rel,
-                                                 std::memory_order_acquire))
+            n.next.store(marked(unmarked(head)), std::memory_order_relaxed);
+            if (active_head_.compare_exchange_weak(head, &n, std::memory_order_release,
+                                                   std::memory_order_acquire))
                 return;
+        }
+    }
+
+    /// Claim an inactive node for this thread: clear the mark and record it in the TLS chain.
+    /// A plain store, not a CAS: the queue already handed this node to exactly one thread.
+    void activate(Node& n) noexcept {
+        n.next.store(unmarked(n.next.load(std::memory_order_relaxed)),
+                     std::memory_order_release);
+        tls_link(n);
+        if constexpr (kRetryOnAttach)
+            attaches_.v.fetch_add(1, std::memory_order_release);
+    }
+
+    // ===== free list =====
+
+    // ===== free queue: Michael-Scott, over counted pointers =====
+    //
+    // A FIFO rather than a stack, with head, tail and a permanent dummy. Both ends are
+    // ordinary CAS loops -- a failed CAS means some other thread made progress, which is
+    // exactly lock-freedom -- and the generation in TaggedPtr is what stops a stalled thread's
+    // compare from matching a head that has come back round to the same node.
+    //
+    // The node a dequeue hands out is the **old dummy**, and its successor becomes the new
+    // dummy. That is what carries payloads round the queue intact: every node holds the data
+    // of whichever thread last owned it, so a detaching thread's pending retirements travel
+    // with the node and are inherited rather than dropped.
+
+    /// Append @p n to the tail. Called by detach.
+    void enqueue_free(Node& n) noexcept {
+        n.free_next.store(TaggedPtr{}, std::memory_order_relaxed);
+
+        TaggedPtr tail;
+        for (;;) {
+            tail = free_tail_.load(std::memory_order_acquire);
+            const TaggedPtr next = tail.ptr->free_next.load(std::memory_order_acquire);
+            if (tail != free_tail_.load(std::memory_order_acquire)) continue; // tail moved
+
+            if (next.ptr == nullptr) {
+                TaggedPtr expect = next;
+                if (tail.ptr->free_next.compare_exchange_weak(expect, next.with(&n),
+                                                              std::memory_order_release,
+                                                              std::memory_order_relaxed))
+                    break;
+            } else {
+                // The tail is lagging behind a completed link; help it along rather than wait.
+                TaggedPtr expect = tail;
+                (void)free_tail_.compare_exchange_weak(expect, tail.with(next.ptr),
+                                                       std::memory_order_release,
+                                                       std::memory_order_relaxed);
+            }
+        }
+        // Swing the tail to the node we linked. Failing is fine: somebody helped.
+        TaggedPtr expect = tail;
+        (void)free_tail_.compare_exchange_strong(expect, tail.with(&n),
+                                                 std::memory_order_release,
+                                                 std::memory_order_relaxed);
+    }
+
+    /// Take a node from the head, or nullptr if only the dummy is left. Called by attach.
+    Node* dequeue_free() noexcept {
+        for (;;) {
+            const TaggedPtr head = free_head_.load(std::memory_order_acquire);
+            const TaggedPtr tail = free_tail_.load(std::memory_order_acquire);
+            const TaggedPtr next = head.ptr->free_next.load(std::memory_order_acquire);
+            if (head != free_head_.load(std::memory_order_acquire)) continue; // head moved
+
+            if (head.ptr == tail.ptr) {
+                if (next.ptr == nullptr) return nullptr; // genuinely empty
+                // Tail lagging: help, then retry.
+                TaggedPtr expect = tail;
+                (void)free_tail_.compare_exchange_weak(expect, tail.with(next.ptr),
+                                                       std::memory_order_release,
+                                                       std::memory_order_relaxed);
+                continue;
+            }
+
+            TaggedPtr expect = head;
+            if (free_head_.compare_exchange_weak(expect, head.with(next.ptr),
+                                                 std::memory_order_acq_rel,
+                                                 std::memory_order_relaxed))
+                return head.ptr; // the old dummy is ours; next.ptr is the new dummy
         }
     }
 
     // ===== per-thread association =====
+    //
+    // One thread_local head per ThreadRegistry<ThreadData, Opt> instantiation, and the nodes
+    // chain themselves. A thread using several instances of the same registry type has several
+    // entries, told apart by `owner` -- so "a thread can hold one node per instance" is a
+    // property of the nodes rather than of a side map keyed by an id. `tls_next` and `owner`
+    // are read and written only by the thread that currently owns the node, and ownership is
+    // exclusive, so neither needs to be atomic.
 
-    /**
-     * @brief This thread's registry associations.
-     *
-     * Keyed by a monotonic registry id rather than by the registry's address: an address
-     * can be reused by a later registry allocated in the same storage, which would make a
-     * stale entry match and hand a thread a node belonging to a destroyed instance.
-     *
-     * One inline entry covers the overwhelmingly common case of a thread using a single
-     * registry -- the fast path is one 64-bit compare, cheaper than the array index it
-     * replaces -- and `others` absorbs the rest with no cap, which is what removes
-     * DTT_MAX_INSTANCES.
-     */
-    struct Tls {
-        uint64_t cached_id = 0; ///< 0 means empty; ids start at 1
-        Node* cached_node = nullptr;
-        std::vector<std::pair<uint64_t, Node*>> others;
-    };
+    static inline thread_local Node* tls_head_ = nullptr;
 
-    static Tls& tls() noexcept {
-        static thread_local Tls t;
-        return t;
+    static void tls_link(Node& n) noexcept {
+        n.tls_next = tls_head_;
+        tls_head_ = &n;
     }
 
-    static Node* tls_lookup(uint64_t id) noexcept {
-        Tls& t = tls();
-        if (t.cached_id == id) return t.cached_node;
-        for (const auto& e : t.others)
-            if (e.first == id) return e.second;
-        return nullptr;
-    }
-
-    /// @note Allocates when a thread uses more than one registry. Declared noexcept to
-    ///       satisfy core::SegmentSource; an allocation failure here terminates, as it
-    ///       already does in Hazard::retire.
-    static void tls_insert(uint64_t id, Node* n) noexcept {
-        Tls& t = tls();
-        if (t.cached_id == 0) {
-            t.cached_id = id;
-            t.cached_node = n;
-            return;
-        }
-        t.others.emplace_back(id, n);
-    }
-
-    static void tls_erase(uint64_t id) noexcept {
-        Tls& t = tls();
-        if (t.cached_id == id) {
-            if (t.others.empty()) {
-                t.cached_id = 0;
-                t.cached_node = nullptr;
-            } else { // promote one, so the inline slot stays occupied
-                t.cached_id = t.others.back().first;
-                t.cached_node = t.others.back().second;
-                t.others.pop_back();
-            }
-            return;
-        }
-        for (std::size_t i = 0; i < t.others.size(); ++i) {
-            if (t.others[i].first == id) {
-                t.others[i] = t.others.back();
-                t.others.pop_back();
+    static void tls_unlink(Node& n) noexcept {
+        Node** link = &tls_head_;
+        while (*link != nullptr) {
+            if (*link == &n) {
+                *link = n.tls_next;
+                n.tls_next = nullptr;
                 return;
             }
+            link = &(*link)->tls_next;
+        }
+    }
+
+    // ===== scan helpers =====
+
+    /// @param stop_on stop and report as soon as @p p returns this.
+    template <typename Pred>
+    bool short_circuit(bool stop_on, Pred& p) const noexcept {
+        for (;;) {
+            const uint64_t before = attach_generation();
+            bool hit = false;
+            for (const Node* n = first(); n != nullptr; n = advance(n)) {
+                if (!is_active(n)) continue;
+                if (static_cast<bool>(p(std::as_const(n->data))) == stop_on) {
+                    hit = true;
+                    break;
+                }
+            }
+            // A hit is already decisive: a thread attaching behind us cannot unmake it.
+            if (hit || !scan_was_disturbed(before)) return hit;
+        }
+    }
+
+    uint64_t attach_generation() const noexcept {
+        if constexpr (kRetryOnAttach) return attaches_.v.load(std::memory_order_acquire);
+        else return 0;
+    }
+
+    bool scan_was_disturbed(uint64_t before) const noexcept {
+        if constexpr (kRetryOnAttach) return attaches_.v.load(std::memory_order_acquire) != before;
+        else {
+            (void)before;
+            return false;
         }
     }
 
     // ===== data =====
 
-    /// Present only when retry_scan_on_attach is set, so the default configuration pays
-    /// neither the counter's cache line nor its increment.
+    /// Present only when retry_scan_on_attach is set, so the default pays neither the counter's
+    /// cache line nor its increment.
     struct AttachCounter {
         ALIGNED_CACHE std::atomic<uint64_t> v{0};
         CACHE_PAD_TYPES(std::atomic<uint64_t>);
     };
     struct NoCounter {};
 
-    static inline std::atomic<uint64_t> next_id_{1};
-
-    const uint64_t id_;
-    const std::size_t capacity_;
-    std::unique_ptr<Node[]> nodes_;
-
-    ALIGNED_CACHE std::atomic<Link> active_head_{};
-    CACHE_PAD_TYPES(std::atomic<Link>);
-    ALIGNED_CACHE std::atomic<Link> free_head_{};
-    CACHE_PAD_TYPES(std::atomic<Link>);
+    ALIGNED_CACHE std::atomic<Node*> active_head_{nullptr};
+    CACHE_PAD_TYPES(std::atomic<Node*>);
+    ALIGNED_CACHE std::atomic<TaggedPtr> free_head_{};
+    CACHE_PAD_TYPES(std::atomic<TaggedPtr>);
+    ALIGNED_CACHE std::atomic<TaggedPtr> free_tail_{};
+    CACHE_PAD_TYPES(std::atomic<TaggedPtr>);
 
     [[no_unique_address]] std::conditional_t<kRetryOnAttach, AttachCounter, NoCounter> attaches_{};
 };

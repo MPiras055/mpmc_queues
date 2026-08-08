@@ -13,7 +13,7 @@ namespace core {
  *
  * @code
  * static constexpr bool single_block = requires(std::size_t n) { Q::create(n); };
- * if constexpr (requires { q.acquire(); }) (void)q.acquire();
+ * if constexpr (requires { q.join(); }) (void)q.join();
  * @endcode
  *
  * which is the capability-detection-by-guessing this project spent a refactor removing.
@@ -30,15 +30,24 @@ concept BlockAllocated = requires(std::size_t n) {
     { Q::create(n) } -> std::same_as<Q*>;
 };
 
-/// Built directly: `Q(segment_capacity, max_threads)`. Every proxy.
+/**
+ * @brief Built directly from a segment capacity alone. Every proxy.
+ *
+ * @note One argument, deliberately. A proxy's second constructor parameter is now `chunks`
+ *       with a default, so a two-argument form would still match here and generic code would
+ *       quietly bind a thread count to a bound-in-segments. Narrowing this makes a stale
+ *       two-argument construction a compile error instead of a change of meaning. Standalone
+ *       queues take `(capacity, mem::Blocks)` and so still fail it, which is what keeps
+ *       Constructible discriminating.
+ */
 template <typename Q>
-concept DirectConstructed = std::constructible_from<Q, std::size_t, std::size_t>;
+concept DirectConstructed = std::constructible_from<Q, std::size_t>;
 
-/// Requires a per-thread ticket before use, and releases it after.
+/// Threads must join before use; the returned scope releases them.
 template <typename Q>
-concept Ticketed = requires(Q q) {
-    { q.acquire() } noexcept -> std::same_as<bool>;
-    { q.release() } noexcept -> std::same_as<void>;
+concept Joinable = requires(Q q) {
+    typename Q::session;
+    { q.join() } -> std::same_as<typename Q::session>;
 };
 
 /**
