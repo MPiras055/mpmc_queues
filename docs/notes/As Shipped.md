@@ -17,10 +17,11 @@ and why, the second for the UML and the reasoning behind the abstraction set. Th
 meta/     OptionsPack (+ AcceptsOnly), TypeList, FixedString
 util/     bit, specs, atomic/cas2, threading/{ThreadRegistry,ThreadPinner}, timing/
 core/     Queue, Segment, SegmentTraits, Source, Admission, Proxy, Construction  (concepts only)
-mem/      Align, Layout, SingleBlock, Handle; detail/RingSlab; source/{Hazard,Pool}
+mem/      Align, Layout, SingleBlock, Handle; source/{Hazard,Pool,Payload}
 cell/     PlainCell, SequencedCell, Tagging
 linkage/  None, Node<HandlePolicy>
-algo/     Vyukov, VyukovNoABA, VyukovDCAS, PRQ, FAAArray, HQ, LFring, SCQ, PSCQ, Mutex
+algo/     Vyukov, VyukovNoABA, VyukovDCAS, PRQ, FAAArray, HQ, LFring, SCQ, PSCQ, Mutex,
+          PhasedBucket, CacheRing   (index buckets, not segments)
 proxy/    LinkedProxy, Admission, Aliases
 registry/ Registry
 ```
@@ -167,40 +168,60 @@ for it under `[[no_unique_address]]`.
 
 ## `mem::source::Pool` — reclamation, as built
 
-The proposal had `Pool` wrapping the existing `Recycler`. It now owns reclamation outright,
-and `util/hazard/` is gone. `Recycler` carried its own ticketing, per-thread metadata, a
-reuse cache and a lookup-table template parameter, almost none of which the proxy used —
-the proxy keeps its own per-thread array. `HazardVector` and `HazardCell` were dead library
-code (only their own test included them, because `source::Hazard` reimplements the
-mechanism); `StaticThreadTicket` was referenced by nothing.
+Four buckets in a rotation, with the role of each taken from the stage modulo four:
 
-What was *kept*: the lock-free index container. `algo::LFring` via `mem::detail::RingSlab`
-is reused rather than rewritten, so the genuinely risky component is one that already
-existed and is tested.
+```
+  current(e) = e       retirements land here
+  grace(e)   = e - 1   late retirements, from a thread a stage behind
+  free(e)    = e - 2   acquire pops here
+  next(e)    = e + 1   about to become current
 
-`Pool<S, N>` hands out `mem::VersionedIndex<N>`. The split is sized by the pool rather than
-fixed at 32/32: the index takes the `log2(N)` bits it needs and the version takes the other
-61-or-so, because every bit not spent addressing eight slots is ABA margin. The index is
-capped at 32 bits, which is what puts a floor of 32 under the version. `N` consequently
-appears twice per pooled entry — in the segment's `mem::IndexHandle<N>` and in the
-`MemBounded` alias — and `LinkedProxy` static_asserts that `Segment::handle_type` is
-`Source::handle`, so a mismatch is a diagnosable error rather than an index read out of the
-wrong bits.
+  next <-- free <-- grace <-- current <--+
+    |                                    |
+    +------------------------------------+
+```
 
-Three limbo buckets and **one separate free list**:
+Four rather than three is what lets the buckets be `algo::PhasedBucket`: a single `fetch_add` at
+each end, no per-cell sequence word, no padding, because a bucket is never filled and drained at
+the same time. `sizeof(PhasedBucket<8>)` is 256 bytes against 1280 for a padded ring of the same
+capacity.
 
-- `retire(h)` → `limbo[e]` for the epoch current at the time
-- advancing to `e'` drains `limbo[e' + 1]` (retired two epochs ago) into the free list
-- `discard(h)` → straight to the free list; a never-published segment has no observers
-- `acquire()` pops the free list, and attempts one advance if it is empty
+> **Every role comes from the stage a thread *pinned* at, never the global stage.** Pins span two
+> stages, so fills target `bucket(p)` for `p in {g-1, g}` and pops target `bucket(p+2)`, i.e.
+> `{g+1, g+2}` — disjoint, which is the whole reason there are four. Deriving roles from the
+> global stage instead looks equivalent and is not: a thread pinned at `g` would pop
+> `bucket(g+1)`, and the instant the rotation moves that bucket becomes `current` and is filled.
+> That trips PhasedBucket's own assertion within a few hundred milliseconds of stress.
 
-The epoch advances only when every pinned thread published the current one.
+### Three things the stress found that reasoning had not
 
-> **The free list is separate on purpose.** Using the oldest limbo bucket as the free list
-> looks equivalent and is not: if the epoch moves past the moment that bucket is the free
-> one — which happens readily, since `acquire()` advances the epoch itself when it finds
-> nothing — its contents are stranded for a whole rotation. The first version did exactly
-> that, and `PoolReclamationTest` caught a slot that never came back.
+- **The pin had a publication race.** `pin()` loaded the stage and then stored it, and in that
+  window the thread is invisible to the advance scan — its state word still reads unpinned — so
+  the rotation could move *twice* and the thread would publish a stage two behind. Pins then span
+  three stages and the disjointness above collapses. `pin()` now publishes and re-reads, retrying
+  until the stage it published is still current; the seq_cst store and the seq_cst scan are
+  totally ordered, so either the scan sees the pin or the pin sees the advance.
+- **The rotation had to be exclusive.** The bucket flipping from draining to filling must be
+  emptied *before* the new stage is visible, or threads pinning at the new stage fill it while a
+  straggling drainer is still popping. A second CAS claims the rotation; the drain and the publish
+  both happen under it.
+- **Without that drain the pool could starve holding free slots.** Whatever sits in `next` is
+  reachable only by a thread a stage behind, and a rotation is refused while any such thread
+  exists — so those slots would be stranded until the rotation came round, which was itself
+  waiting on them. The rotation now sweeps them into the cache on the way past.
+
+`discard()` does not enter the rotation. A segment that was never published has no observers, so
+it goes straight to an `algo::CacheRing` and `acquire()` looks there first. The cache is genuinely
+MPMC with no phase discipline, which is why it is a ring and not a fifth bucket — its single-word
+ABA-safe CAS, with the lap folded into every cell, is what makes that cheap.
+
+`ThreadData::state` is a single byte: bit 7 pinned, bits 0-1 the stage. The scan only ever asks
+"pinned, and at my stage?", and the pin bounds the shift to one stage, so the 64-bit epoch it used
+to carry was never read. The stage itself wraps — EBR has no ABA to guard against here, because a
+thread is either at the current stage or it blocks the rotation outright.
+
+`mem::detail::RingSlab` is deleted; the buckets are compile-time-sized members, so there is no
+slab and no runtime allocation for them.
 
 ### Verification status
 
@@ -297,6 +318,52 @@ and `registry::Instance::join`/`leave` collapse into one `session(q)` that retur
 > bound the old thread count to `chunks`. Narrowing the concept turns a stale two-argument
 > construction into a compile error instead of a change of meaning. Standalone queues take
 > `(capacity, mem::Blocks)` and still fail it, so `Constructible` keeps discriminating.
+
+---
+
+## Accounting across threads that come and go
+
+`LinkedProxy::size()` folds per-thread counters that live in the source's registry nodes, and a
+scan visits only *attached* threads. A producer that enqueued and then detached therefore took
+its count with it, and the queue under-reported permanently. Invisible in every other suite,
+because they hold one session for the whole test and ask the thread that pushed.
+
+`size()` is now a departed-thread total plus a fold over the attached. The wrapper session
+returned by `LinkedProxy::join()` folds a thread's `ops` into that total on the way out and
+clears its `last_seen`, so the node goes back for reuse already clean — the alternative,
+inheriting the previous owner's tally, double-counts, and inheriting its close hint makes the
+next thread skip a segment it never saw closed. The reset happens at **detach** rather than at
+attach, so it is done by the only thread that can still name the payload and needs no
+source-side hook. `Hazard`'s retire list is deliberately left alone; that inheritance is
+load-bearing.
+
+`ProxyAccountingTest` is the regression suite, and it fails on the old code in four places.
+
+## Reopening belongs to the source
+
+`mem::source::Pool::acquire()` reopens the segment before handing it out, and `LinkedProxy`
+lost its `if constexpr (Source::recycles)` branch. A source that returns a segment which has
+already held items is the one that knows it needs resetting; making the caller ask first put
+that knowledge in the wrong place. `recycles` stays, because the proxy still static_asserts on
+it against `segment_traits<>::recyclable`.
+
+`acquire()` and `discard()` now assert the caller holds a pin — reclamation there is
+epoch-based, so doing either outside one is meaningless. `LinkedProxy`'s constructor and
+destructor were adjusted to satisfy it rather than the assertion being weakened.
+
+> **`Pool::pin()` is not re-entrant.** The guard's destructor stores 0 unconditionally, so an
+> inner guard ending clears the epoch the outer one published and leaves it running unpinned,
+> with nothing to report it. The proxy's destructor is written around this: its pin covers the
+> discard loop only, after the drain, because `dequeue()` pins internally.
+
+## Still open, and left as notes in the source
+
+`Pool` carries `@debug` notes for a larger rework that wants measurement rather than a
+refactor: four stages with `next <- free <- grace <- current`, `PhasedBucket`
+(`docs/legacy/Buckets.hpp.txt`) in place of `LFring` for the limbo rings, `ThreadData::state`
+narrowed to a `uint8_t` stage, the epoch kept modulo `kStages`, `segments_` on a slab, and a
+`VyukovNoABA` reuse cache. `RingSlab` and `Pool` are now parameterised on the bucket ring, so
+that swap can happen without touching the epoch machine.
 
 ---
 

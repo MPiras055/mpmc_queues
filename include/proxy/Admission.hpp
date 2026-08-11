@@ -85,6 +85,7 @@ public:
     void on_segment_retired() noexcept {}
 
 private:
+    //Two separate counters because of the frequency of the ops
     ALIGNED_CACHE std::atomic<uint64_t> pushed_{0};
     CACHE_PAD_TYPES(std::atomic<uint64_t>);
     ALIGNED_CACHE std::atomic<uint64_t> popped_{0};
@@ -124,8 +125,7 @@ public:
      */
     bool try_admit() noexcept {
         const uint64_t linked = linked_.load(std::memory_order_relaxed);
-        const uint64_t retired = retired_.load(std::memory_order_acquire);
-        return ((linked - retired) + 1) < bound_;
+        return (linked + 1) < bound_;
     }
 
     void cancel_admit() noexcept {}
@@ -136,14 +136,13 @@ public:
     void on_enqueue() noexcept {}
     void on_dequeue() noexcept {}
     void on_segment_linked() noexcept { linked_.fetch_add(1, std::memory_order_release); }
-    void on_segment_retired() noexcept { retired_.fetch_add(1, std::memory_order_release); }
+    void on_segment_retired() noexcept { linked_.fetch_sub(1, std::memory_order_release); }
 
 private:
+    const std::size_t bound_;
+    //single counter due to the low frequency of updates
     ALIGNED_CACHE std::atomic<uint64_t> linked_{0};
     CACHE_PAD_TYPES(std::atomic<uint64_t>);
-    ALIGNED_CACHE std::atomic<uint64_t> retired_{0};
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
-    const std::size_t bound_;
 };
 
 static_assert(core::AdmissionPolicy<None>);

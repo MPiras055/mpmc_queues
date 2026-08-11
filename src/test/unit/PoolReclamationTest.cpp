@@ -22,6 +22,7 @@
 #include <algo/Vyukov.hpp>
 #include <mem/source/Pool.hpp>
 
+#include <optional>
 #include <set>
 #include <vector>
 
@@ -48,10 +49,28 @@ struct Fixture : ::testing::Test {
         ASSERT_TRUE(joined);
     }
 
+    /// acquire() and discard() require a pin, because reclamation here is epoch-based.
+    /// The pin is scoped to the call rather than held: most of what follows asserts on
+    /// try_advance_epoch(), which is refused while anything is pinned behind the epoch.
+    std::optional<TestPool::handle> take_one() {
+        auto g = pool.pin();
+        return pool.acquire();
+    }
+
+    void give_back(TestPool::handle h) {
+        auto g = pool.pin();
+        pool.discard(h);
+    }
+
+    void give_up(TestPool::handle h) {
+        auto g = pool.pin();
+        pool.retire(h);
+    }
+
     /// Drain the free list, returning the handles.
     std::vector<TestPool::handle> take_all() {
         std::vector<TestPool::handle> out;
-        while (auto h = pool.acquire()) out.push_back(*h);
+        while (auto h = take_one()) out.push_back(*h);
         return out;
     }
 };
@@ -69,79 +88,86 @@ TEST_F(Fixture, ExhaustionIsReportedNotFabricated) {
     const auto all = take_all();
     ASSERT_EQ(all.size(), kPool);
     // The bound of a pooled proxy *is* this nullopt.
-    EXPECT_FALSE(pool.acquire().has_value());
+    EXPECT_FALSE(take_one().has_value());
 }
 
 TEST_F(Fixture, DiscardReturnsASlotImmediately) {
-    auto h = pool.acquire();
+    auto h = take_one();
     ASSERT_TRUE(h);
     const auto before = pool.free_count();
-    pool.discard(*h); // never published, so nothing can be observing it
+    const auto cached = pool.cache_count();
+    give_back(*h); // never published, so nothing can be observing it
+    // Straight to the reuse cache rather than into the rotation -- a segment nobody ever saw
+    // owes no grace period, and making it wait two advances would be latency for nothing.
     EXPECT_EQ(pool.free_count(), before + 1);
+    EXPECT_EQ(pool.cache_count(), cached + 1) << "a discarded slot entered the rotation";
 }
 
 TEST_F(Fixture, RetireDoesNotReturnASlotImmediately) {
-    auto h = pool.acquire();
+    auto h = take_one();
     ASSERT_TRUE(h);
     const auto before = pool.free_count();
-    pool.retire(*h);
-    // It went to the staging bucket, not the free one: a reader pinned before the retire
-    // may still be looking at it.
+    give_up(*h);
+    // It went into `current`, two rotations away from being handed out: a reader pinned
+    // before the retire may still be looking at it.
     EXPECT_EQ(pool.free_count(), before) << "a retired slot became available at once";
 }
 
 TEST_F(Fixture, RetiredSlotBecomesAvailableAfterEnoughAdvances) {
-    auto h = pool.acquire();
+    auto h = take_one();
     ASSERT_TRUE(h);
     const auto drained = take_all(); // exhaust the rest
     ASSERT_EQ(pool.free_count(), 0u);
 
-    pool.retire(*h);
+    give_up(*h);
     // free_count() is used throughout rather than acquire(): acquire() advances the epoch
     // itself when it finds nothing free, which would move the very state under test.
     EXPECT_EQ(pool.free_count(), 0u) << "a retirement was reusable immediately";
 
-    // One advance moves it from the current bucket to grace -- still not reusable.
+    // One advance moves it from current to grace -- still not reusable, because a thread
+    // pinned one epoch back could have been reading it.
     ASSERT_TRUE(pool.try_advance_epoch());
     EXPECT_EQ(pool.free_count(), 0u)
         << "released after a single advance; a reader one epoch behind could still hold it";
 
-    // The second advance drains it into the free list.
+    // The second rotates it into `free`, which is where acquire() looks.
     ASSERT_TRUE(pool.try_advance_epoch());
     ASSERT_EQ(pool.free_count(), 1u) << "never became reusable";
 
-    auto again = pool.acquire();
+    auto again = take_one();
     ASSERT_TRUE(again);
     EXPECT_EQ(again->index(), h->index());
 }
 
 TEST_F(Fixture, EpochCannotAdvancePastALivePin) {
     // This is the property everything else rests on.
+    // Stages wrap, so every expectation below is modulo the stage count.
     const auto e0 = pool.epoch();
+    const auto next = [](uint8_t s) { return static_cast<uint8_t>((s + 1) % 4); };
     {
         auto g = pool.pin();
         // The pin published e0, so the first advance is legal: everyone active is current.
         ASSERT_TRUE(pool.try_advance_epoch());
-        EXPECT_EQ(pool.epoch(), e0 + 1);
+        EXPECT_EQ(pool.epoch(), next(e0));
         // A second would strand this pin one epoch behind, so it must be refused.
         EXPECT_FALSE(pool.try_advance_epoch())
             << "advanced past a thread still pinned at an older epoch";
-        EXPECT_EQ(pool.epoch(), e0 + 1);
+        EXPECT_EQ(pool.epoch(), next(e0));
     }
     // Once the pin is released nothing is holding the epoch back.
     EXPECT_TRUE(pool.try_advance_epoch());
-    EXPECT_EQ(pool.epoch(), e0 + 2);
+    EXPECT_EQ(pool.epoch(), next(next(e0)));
 }
 
 TEST_F(Fixture, SlotRetiredUnderAPinIsNotReusedWhileThatPinLives) {
-    auto h = pool.acquire();
+    auto h = take_one();
     ASSERT_TRUE(h);
     const auto rest = take_all();
-    ASSERT_FALSE(pool.acquire().has_value());
+    ASSERT_FALSE(take_one().has_value());
 
     {
         auto g = pool.pin();
-        pool.retire(*h);
+        pool.retire(*h); // already pinned: must NOT take another, pin() is not re-entrant
         // Our own pin blocks the second advance, so the slot cannot complete the two hops
         // it needs while we are still able to be looking at it.
         pool.try_advance_epoch();
@@ -156,10 +182,87 @@ TEST_F(Fixture, SlotRetiredUnderAPinIsNotReusedWhileThatPinLives) {
     EXPECT_GT(pool.free_count(), 0u) << "never recovered after the pin was dropped";
 }
 
+TEST_F(Fixture, TheRotationSurvivesManyFullCycles) {
+    // The case the four-bucket rewrite is most likely to fail, and it fails silently.
+    //
+    // Each bucket plays every role in turn, and algo::PhasedBucket resets itself lazily: a
+    // drain phase clears its tail only on a dequeue that *fails*, and a fill phase clears its
+    // head on the first enqueue. Take every slot, retire every slot, rotate twice, repeat --
+    // and if a bucket ever enters a fill phase with its tail where the last drain left it, it
+    // starts writing past the end of its array. In a debug build that trips PhasedBucket's own
+    // assertion; in a release build the pool just quietly stops handing slots back.
+    for (int cycle = 0; cycle < 64; ++cycle) {
+        auto held = take_all();
+        ASSERT_EQ(held.size(), kPool) << "the pool shrank by cycle " << cycle;
+
+        for (auto h : held) give_up(h);
+        ASSERT_TRUE(pool.try_advance_epoch()) << "cycle " << cycle;
+        ASSERT_TRUE(pool.try_advance_epoch()) << "cycle " << cycle;
+        ASSERT_EQ(pool.free_count(), kPool) << "slots lost on cycle " << cycle;
+    }
+}
+
+TEST_F(Fixture, MixingDiscardsAndRetiresKeepsEverySlot) {
+    // The two return paths are different -- the cache and the rotation -- and a slot must end
+    // up on exactly one of them. Alternating is what catches a slot going to both, or neither.
+    for (int cycle = 0; cycle < 32; ++cycle) {
+        auto held = take_all();
+        ASSERT_EQ(held.size(), kPool) << "cycle " << cycle;
+
+        for (std::size_t i = 0; i < held.size(); ++i) {
+            if (i % 2 == 0) give_back(held[i]); // cache
+            else give_up(held[i]);              // rotation
+        }
+        pool.try_advance_epoch();
+        pool.try_advance_epoch();
+        ASSERT_EQ(pool.free_count(), kPool) << "cycle " << cycle;
+    }
+}
+
+TEST_F(Fixture, RotatingSweepsTheFlippingBucketRatherThanStrandingIt) {
+    // `next -> current` is the one transition that flips a bucket from draining to filling,
+    // and whatever is still in it at that moment is free slots that only a thread a stage
+    // behind could reach. Since a rotation is refused while any such thread exists, leaving
+    // them there would strand them until the rotation came round again -- which is itself
+    // waiting on that bucket. The rotation therefore sweeps them into the cache on the way
+    // past, exclusively and before publishing the new stage.
+    const auto all = take_all();
+    ASSERT_EQ(all.size(), kPool);
+    for (auto h : all) give_up(h); // all four land in `current`
+
+    // current -> grace -> free: now they are where acquire() looks.
+    ASSERT_TRUE(pool.try_advance_epoch());
+    ASSERT_TRUE(pool.try_advance_epoch());
+    ASSERT_EQ(pool.free_count(), kPool) << "two rotations should have made them reusable";
+
+    // free -> next: still reachable, but only via the sweep from here on.
+    ASSERT_TRUE(pool.try_advance_epoch());
+
+    // The rotation past `next` must not lose them.
+    ASSERT_TRUE(pool.try_advance_epoch()) << "refused to rotate, stranding the free slots";
+    EXPECT_EQ(pool.cache_count(), kPool) << "the flipping bucket was not swept";
+    EXPECT_EQ(take_all().size(), kPool) << "slots were lost crossing next -> current";
+}
+
+TEST_F(Fixture, TheRotationNeverStallsWithSlotsInHand) {
+    // The liveness property behind the sweep: however many times the rotation turns, a slot
+    // that has been retired always becomes acquirable again. Without the sweep this deadlocks
+    // -- the slots sit in `next`, no thread is behind enough to pop them, and the rotation
+    // that would free them is refused because they are there.
+    for (int cycle = 0; cycle < 40; ++cycle) {
+        auto held = take_all();
+        ASSERT_EQ(held.size(), kPool) << "the pool stalled on cycle " << cycle;
+        for (auto h : held) give_up(h);
+        // However far it turns, everything comes back.
+        for (int k = 0; k < 4; ++k) pool.try_advance_epoch();
+    }
+}
+
+
 TEST_F(Fixture, VersionChangesOnEveryReuseOfASlot) {
     // The version half of the handle is what stops a stale `next` aliasing a live
     // segment after the slot is recycled.
-    auto first = pool.acquire();
+    auto first = take_one();
     ASSERT_TRUE(first);
     using Handle = TestPool::handle;
     // The split is sized by the pool: four slots need two index bits, so the version gets
@@ -171,8 +274,8 @@ TEST_F(Fixture, VersionChangesOnEveryReuseOfASlot) {
 
     std::set<Handle::version_type> versions{first->version()};
     for (int cycle = 0; cycle < 8; ++cycle) {
-        pool.discard(*first); // straight back to free, so we get the same slot again
-        auto again = pool.acquire();
+        give_back(*first); // straight back to free, so we get the same slot again
+        auto again = take_one();
         ASSERT_TRUE(again);
         if (again->index() == idx) versions.insert(again->version());
         first = again;
@@ -187,7 +290,7 @@ TEST_F(Fixture, NoSlotIsLostOverManyCycles) {
     for (int cycle = 0; cycle < 50; ++cycle) {
         auto held = take_all();
         ASSERT_EQ(held.size(), kPool) << "pool shrank by cycle " << cycle;
-        for (auto h : held) pool.retire(h);
+        for (auto h : held) give_up(h);
         // Two advances with nothing pinned returns the whole generation.
         ASSERT_TRUE(pool.try_advance_epoch());
         ASSERT_TRUE(pool.try_advance_epoch());
@@ -196,13 +299,13 @@ TEST_F(Fixture, NoSlotIsLostOverManyCycles) {
 }
 
 TEST_F(Fixture, DerefIsStableForAGivenIndex) {
-    auto a = pool.acquire();
+    auto a = take_one();
     ASSERT_TRUE(a);
     Seg* first = pool.deref(*a);
     ASSERT_NE(first, nullptr);
-    pool.discard(*a);
+    give_back(*a);
 
-    auto b = pool.acquire();
+    auto b = take_one();
     ASSERT_TRUE(b);
     if (b->index() == a->index())
         EXPECT_EQ(pool.deref(*b), first) << "the same index resolved to a different segment";

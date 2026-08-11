@@ -1,0 +1,593 @@
+Start testing: Aug 10 20:10 CEST
+----------------------------------------------------------
+1/10 Testing: RegistryConformanceTest
+1/10 Test: RegistryConformanceTest
+Command: "/home/matti/Projects/mpmc_queues/build-asan/RegistryConformanceTest"
+Directory: /home/matti/Projects/mpmc_queues/build-asan
+"RegistryConformanceTest" start time: Aug 10 20:10 CEST
+Output:
+----------------------------------------------------------
+Running main() from /home/matti/Projects/mpmc_queues/cmake/extern/googletest/googletest/src/gtest_main.cc
+[==========] Running 12 tests from 3 test suites.
+[----------] Global test environment set-up.
+[----------] 4 tests from QueueBehaviour/0, where TypeParam = proxy::LinkedProxy<(anonymous namespace)::Data*,algo::PRQ<(anonymous namespace)::Data*,meta::OptionsPack<>,linkage::Node<mem::PtrHandle>,cell::MsbTag<(anonymous namespace)::Data*> >,proxy::admit::None,mem::source::Hazard<algo::PRQ<(anonymous namespace)::Data*,meta::OptionsPack<>,linkage::Node<mem::PtrHandle>,cell::MsbTag<(anonymous namespace)::Data*> >,proxy::ThreadMeta<algo::PRQ<(anonymous namespace)::Data*,meta::OptionsPack<>,linkage::Node<mem::PtrHandle>,cell::MsbTag<(anonymous namespace)::Data*> >*> > >
+[ RUN      ] QueueBehaviour/0.EmptyOnCreation
+[       OK ] QueueBehaviour/0.EmptyOnCreation (0 ms)
+[ RUN      ] QueueBehaviour/0.FifoOrderSingleThreaded
+[       OK ] QueueBehaviour/0.FifoOrderSingleThreaded (0 ms)
+[ RUN      ] QueueBehaviour/0.RefusesBeyondCapacityThenDrainsExactly
+[       OK ] QueueBehaviour/0.RefusesBeyondCapacityThenDrainsExactly (0 ms)
+[ RUN      ] QueueBehaviour/0.SizeTracksOccupancy
+[       OK ] QueueBehaviour/0.SizeTracksOccupancy (0 ms)
+[----------] 4 tests from QueueBehaviour/0 (1 ms total)
+
+[----------] 4 tests from QueueBehaviour/1, where TypeParam = proxy::LinkedProxy<(anonymous namespace)::Data*,algo::PRQ<(anonymous namespace)::Data*,meta::OptionsPack<>,linkage::Node<mem::PtrHandle>,cell::MsbTag<(anonymous namespace)::Data*> >,proxy::admit::SegmentCount,mem::source::Hazard<algo::PRQ<(anonymous namespace)::Data*,meta::OptionsPack<>,linkage::Node<mem::PtrHandle>,cell::MsbTag<(anonymous namespace)::Data*> >,proxy::ThreadMeta<algo::PRQ<(anonymous namespace)::Data*,meta::OptionsPack<>,linkage::Node<mem::PtrHandle>,cell::MsbTag<(anonymous namespace)::Data*> >*> > >
+[ RUN      ] QueueBehaviour/1.EmptyOnCreation
+[       OK ] QueueBehaviour/1.EmptyOnCreation (0 ms)
+[ RUN      ] QueueBehaviour/1.FifoOrderSingleThreaded
+[       OK ] QueueBehaviour/1.FifoOrderSingleThreaded (0 ms)
+[ RUN      ] QueueBehaviour/1.RefusesBeyondCapacityThenDrainsExactly
+[       OK ] QueueBehaviour/1.RefusesBeyondCapacityThenDrainsExactly (0 ms)
+[ RUN      ] QueueBehaviour/1.SizeTracksOccupancy
+[       OK ] QueueBehaviour/1.SizeTracksOccupancy (0 ms)
+[----------] 4 tests from QueueBehaviour/1 (0 ms total)
+
+[----------] 4 tests from QueueBehaviour/2, where TypeParam = proxy::LinkedProxy<(anonymous namespace)::Data*,algo::PRQ<(anonymous namespace)::Data*,meta::OptionsPack<>,linkage::Node<mem::IndexHandle<8ul> >,cell::MsbTag<(anonymous namespace)::Data*> >,proxy::admit::None,mem::source::Pool<algo::PRQ<(anonymous namespace)::Data*,meta::OptionsPack<>,linkage::Node<mem::IndexHandle<8ul> >,cell::MsbTag<(anonymous namespace)::Data*> >,8ul,proxy::ThreadMeta<mem::VersionedIndex<8ul> > > >
+[ RUN      ] QueueBehaviour/2.EmptyOnCreation
+[       OK ] QueueBehaviour/2.EmptyOnCreation (0 ms)
+[ RUN      ] QueueBehaviour/2.FifoOrderSingleThreaded
+[       OK ] QueueBehaviour/2.FifoOrderSingleThreaded (0 ms)
+[ RUN      ] QueueBehaviour/2.RefusesBeyondCapacityThenDrainsExactly
+[       OK ] QueueBehaviour/2.RefusesBeyondCapacityThenDrainsExactly (0 ms)
+[ RUN      ] QueueBehaviour/2.SizeTracksOccupancy
+[       OK ] QueueBehaviour/2.SizeTracksOccupancy (0 ms)
+[----------] 4 tests from QueueBehaviour/2 (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 12 tests from 3 test suites ran. (2 ms total)
+[  PASSED  ] 12 tests.
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"RegistryConformanceTest" end time: Aug 10 20:10 CEST
+"RegistryConformanceTest" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/10 Testing: SegmentLifecycleTest
+2/10 Test: SegmentLifecycleTest
+Command: "/home/matti/Projects/mpmc_queues/build-asan/SegmentLifecycleTest"
+Directory: /home/matti/Projects/mpmc_queues/build-asan
+"SegmentLifecycleTest" start time: Aug 10 20:10 CEST
+Output:
+----------------------------------------------------------
+Running main() from /home/matti/Projects/mpmc_queues/cmake/extern/googletest/googletest/src/gtest_main.cc
+[==========] Running 36 tests from 6 test suites.
+[----------] Global test environment set-up.
+[----------] 7 tests from SegmentLifecycle/0, where TypeParam = algo::Vyukov<(anonymous namespace)::Data*,meta::OptionsPack<>,linkage::Node<mem::PtrHandle> >
+[ RUN      ] SegmentLifecycle/0.StartsOpenWithNoSuccessor
+[       OK ] SegmentLifecycle/0.StartsOpenWithNoSuccessor (0 ms)
+[ RUN      ] SegmentLifecycle/0.CloseRefusesEnqueueButPermitsDrain
+[       OK ] SegmentLifecycle/0.CloseRefusesEnqueueButPermitsDrain (0 ms)
+[ RUN      ] SegmentLifecycle/0.FillingToCapacityClosesTheSegment
+[       OK ] SegmentLifecycle/0.FillingToCapacityClosesTheSegment (0 ms)
+[ RUN      ] SegmentLifecycle/0.LinkNextSucceedsExactlyOnce
+[       OK ] SegmentLifecycle/0.LinkNextSucceedsExactlyOnce (0 ms)
+[ RUN      ] SegmentLifecycle/0.ReopenAgreesWithTheRecyclableTrait
+[       OK ] SegmentLifecycle/0.ReopenAgreesWithTheRecyclableTrait (0 ms)
+[ RUN      ] SegmentLifecycle/0.ReopenedSegmentIsEmptyAndReusable
+[       OK ] SegmentLifecycle/0.ReopenedSegmentIsEmptyAndReusable (0 ms)
+[ RUN      ] SegmentLifecycle/0.ReopenClearsTheSuccessor
+[       OK ] SegmentLifecycle/0.ReopenClearsTheSuccessor (0 ms)
+[----------] 7 tests from SegmentLifecycle/0 (0 ms total)
+
+[----------] 7 tests from SegmentLifecycle/1, where TypeParam = algo::PRQ<(anonymous namespace)::Data*,meta::OptionsPack<>,linkage::Node<mem::PtrHandle>,cell::MsbTag<(anonymous namespace)::Data*> >
+[ RUN      ] SegmentLifecycle/1.StartsOpenWithNoSuccessor
+[       OK ] SegmentLifecycle/1.StartsOpenWithNoSuccessor (0 ms)
+[ RUN      ] SegmentLifecycle/1.CloseRefusesEnqueueButPermitsDrain
+[       OK ] SegmentLifecycle/1.CloseRefusesEnqueueButPermitsDrain (0 ms)
+[ RUN      ] SegmentLifecycle/1.FillingToCapacityClosesTheSegment
+[       OK ] SegmentLifecycle/1.FillingToCapacityClosesTheSegment (0 ms)
+[ RUN      ] SegmentLifecycle/1.LinkNextSucceedsExactlyOnce
+[       OK ] SegmentLifecycle/1.LinkNextSucceedsExactlyOnce (0 ms)
+[ RUN      ] SegmentLifecycle/1.ReopenAgreesWithTheRecyclableTrait
+[       OK ] SegmentLifecycle/1.ReopenAgreesWithTheRecyclableTrait (0 ms)
+[ RUN      ] SegmentLifecycle/1.ReopenedSegmentIsEmptyAndReusable
+[       OK ] SegmentLifecycle/1.ReopenedSegmentIsEmptyAndReusable (0 ms)
+[ RUN      ] SegmentLifecycle/1.ReopenClearsTheSuccessor
+[       OK ] SegmentLifecycle/1.ReopenClearsTheSuccessor (0 ms)
+[----------] 7 tests from SegmentLifecycle/1 (0 ms total)
+
+[----------] 7 tests from SegmentLifecycle/2, where TypeParam = algo::FAAArray<(anonymous namespace)::Data*,meta::OptionsPack<>,linkage::Node<mem::PtrHandle>,cell::LowTag<(anonymous namespace)::Data*> >
+[ RUN      ] SegmentLifecycle/2.StartsOpenWithNoSuccessor
+[       OK ] SegmentLifecycle/2.StartsOpenWithNoSuccessor (0 ms)
+[ RUN      ] SegmentLifecycle/2.CloseRefusesEnqueueButPermitsDrain
+[       OK ] SegmentLifecycle/2.CloseRefusesEnqueueButPermitsDrain (0 ms)
+[ RUN      ] SegmentLifecycle/2.FillingToCapacityClosesTheSegment
+[       OK ] SegmentLifecycle/2.FillingToCapacityClosesTheSegment (0 ms)
+[ RUN      ] SegmentLifecycle/2.LinkNextSucceedsExactlyOnce
+[       OK ] SegmentLifecycle/2.LinkNextSucceedsExactlyOnce (0 ms)
+[ RUN      ] SegmentLifecycle/2.ReopenAgreesWithTheRecyclableTrait
+[       OK ] SegmentLifecycle/2.ReopenAgreesWithTheRecyclableTrait (0 ms)
+[ RUN      ] SegmentLifecycle/2.ReopenedSegmentIsEmptyAndReusable
+[       OK ] SegmentLifecycle/2.ReopenedSegmentIsEmptyAndReusable (0 ms)
+[ RUN      ] SegmentLifecycle/2.ReopenClearsTheSuccessor
+[       OK ] SegmentLifecycle/2.ReopenClearsTheSuccessor (0 ms)
+[----------] 7 tests from SegmentLifecycle/2 (0 ms total)
+
+[----------] 7 tests from SegmentLifecycle/3, where TypeParam = algo::HQ<(anonymous namespace)::Data*,meta::OptionsPack<>,linkage::Node<mem::PtrHandle>,cell::LowTag<(anonymous namespace)::Data*> >
+[ RUN      ] SegmentLifecycle/3.StartsOpenWithNoSuccessor
+[       OK ] SegmentLifecycle/3.StartsOpenWithNoSuccessor (0 ms)
+[ RUN      ] SegmentLifecycle/3.CloseRefusesEnqueueButPermitsDrain
+[       OK ] SegmentLifecycle/3.CloseRefusesEnqueueButPermitsDrain (0 ms)
+[ RUN      ] SegmentLifecycle/3.FillingToCapacityClosesTheSegment
+[       OK ] SegmentLifecycle/3.FillingToCapacityClosesTheSegment (0 ms)
+[ RUN      ] SegmentLifecycle/3.LinkNextSucceedsExactlyOnce
+[       OK ] SegmentLifecycle/3.LinkNextSucceedsExactlyOnce (0 ms)
+[ RUN      ] SegmentLifecycle/3.ReopenAgreesWithTheRecyclableTrait
+[       OK ] SegmentLifecycle/3.ReopenAgreesWithTheRecyclableTrait (0 ms)
+[ RUN      ] SegmentLifecycle/3.ReopenedSegmentIsEmptyAndReusable
+[       OK ] SegmentLifecycle/3.ReopenedSegmentIsEmptyAndReusable (0 ms)
+[ RUN      ] SegmentLifecycle/3.ReopenClearsTheSuccessor
+[       OK ] SegmentLifecycle/3.ReopenClearsTheSuccessor (0 ms)
+[----------] 7 tests from SegmentLifecycle/3 (0 ms total)
+
+[----------] 7 tests from SegmentLifecycle/4, where TypeParam = algo::SCQ<(anonymous namespace)::Data*,meta::OptionsPack<>,linkage::Node<mem::PtrHandle> >
+[ RUN      ] SegmentLifecycle/4.StartsOpenWithNoSuccessor
+[       OK ] SegmentLifecycle/4.StartsOpenWithNoSuccessor (0 ms)
+[ RUN      ] SegmentLifecycle/4.CloseRefusesEnqueueButPermitsDrain
+[       OK ] SegmentLifecycle/4.CloseRefusesEnqueueButPermitsDrain (0 ms)
+[ RUN      ] SegmentLifecycle/4.FillingToCapacityClosesTheSegment
+[       OK ] SegmentLifecycle/4.FillingToCapacityClosesTheSegment (0 ms)
+[ RUN      ] SegmentLifecycle/4.LinkNextSucceedsExactlyOnce
+[       OK ] SegmentLifecycle/4.LinkNextSucceedsExactlyOnce (0 ms)
+[ RUN      ] SegmentLifecycle/4.ReopenAgreesWithTheRecyclableTrait
+[       OK ] SegmentLifecycle/4.ReopenAgreesWithTheRecyclableTrait (0 ms)
+[ RUN      ] SegmentLifecycle/4.ReopenedSegmentIsEmptyAndReusable
+[       OK ] SegmentLifecycle/4.ReopenedSegmentIsEmptyAndReusable (0 ms)
+[ RUN      ] SegmentLifecycle/4.ReopenClearsTheSuccessor
+[       OK ] SegmentLifecycle/4.ReopenClearsTheSuccessor (0 ms)
+[----------] 7 tests from SegmentLifecycle/4 (0 ms total)
+
+[----------] 1 test from LinkedOnly
+[ RUN      ] LinkedOnly.TheConstraintIsWhatForbidsIt
+[       OK ] LinkedOnly.TheConstraintIsWhatForbidsIt (0 ms)
+[----------] 1 test from LinkedOnly (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 36 tests from 6 test suites ran. (2 ms total)
+[  PASSED  ] 36 tests.
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"SegmentLifecycleTest" end time: Aug 10 20:10 CEST
+"SegmentLifecycleTest" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/10 Testing: TaggingTest
+3/10 Test: TaggingTest
+Command: "/home/matti/Projects/mpmc_queues/build-asan/TaggingTest"
+Directory: /home/matti/Projects/mpmc_queues/build-asan
+"TaggingTest" start time: Aug 10 20:10 CEST
+Output:
+----------------------------------------------------------
+Running main() from /home/matti/Projects/mpmc_queues/cmake/extern/googletest/googletest/src/gtest_main.cc
+[==========] Running 12 tests from 4 test suites.
+[----------] Global test environment set-up.
+[----------] 4 tests from Tagging/0, where TypeParam = cell::MsbTag<(anonymous namespace)::Data*>
+[ RUN      ] Tagging/0.PayloadRoundTrips
+[       OK ] Tagging/0.PayloadRoundTrips (0 ms)
+[ RUN      ] Tagging/0.SentinelsAreDistinctAndNotPayloads
+[       OK ] Tagging/0.SentinelsAreDistinctAndNotPayloads (0 ms)
+[ RUN      ] Tagging/0.StatesAreMutuallyExclusive
+[       OK ] Tagging/0.StatesAreMutuallyExclusive (0 ms)
+[ RUN      ] Tagging/0.CanStoreNullIsHonest
+[       OK ] Tagging/0.CanStoreNullIsHonest (0 ms)
+[----------] 4 tests from Tagging/0 (0 ms total)
+
+[----------] 4 tests from Tagging/1, where TypeParam = cell::LowTag<(anonymous namespace)::Data*>
+[ RUN      ] Tagging/1.PayloadRoundTrips
+[       OK ] Tagging/1.PayloadRoundTrips (0 ms)
+[ RUN      ] Tagging/1.SentinelsAreDistinctAndNotPayloads
+[       OK ] Tagging/1.SentinelsAreDistinctAndNotPayloads (0 ms)
+[ RUN      ] Tagging/1.StatesAreMutuallyExclusive
+[       OK ] Tagging/1.StatesAreMutuallyExclusive (0 ms)
+[ RUN      ] Tagging/1.CanStoreNullIsHonest
+[       OK ] Tagging/1.CanStoreNullIsHonest (0 ms)
+[----------] 4 tests from Tagging/1 (0 ms total)
+
+[----------] 2 tests from MsbTagClaims
+[ RUN      ] MsbTagClaims.TokensAreUniquePerThreadAndNotSentinels
+[       OK ] MsbTagClaims.TokensAreUniquePerThreadAndNotSentinels (1 ms)
+[ RUN      ] MsbTagClaims.ClaimIsStableWithinAThread
+[       OK ] MsbTagClaims.ClaimIsStableWithinAThread (0 ms)
+[----------] 2 tests from MsbTagClaims (1 ms total)
+
+[----------] 2 tests from TaggingIntegration
+[ RUN      ] TaggingIntegration.NullPayloadRoundTripsWhenTheTraitSaysItCan
+[       OK ] TaggingIntegration.NullPayloadRoundTripsWhenTheTraitSaysItCan (0 ms)
+[ RUN      ] TaggingIntegration.HqDeclaresItCannotStoreNull
+[       OK ] TaggingIntegration.HqDeclaresItCannotStoreNull (0 ms)
+[----------] 2 tests from TaggingIntegration (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 12 tests from 4 test suites ran. (1 ms total)
+[  PASSED  ] 12 tests.
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"TaggingTest" end time: Aug 10 20:10 CEST
+"TaggingTest" time elapsed: 00:00:00
+----------------------------------------------------------
+
+4/10 Testing: AdmissionTest
+4/10 Test: AdmissionTest
+Command: "/home/matti/Projects/mpmc_queues/build-asan/AdmissionTest"
+Directory: /home/matti/Projects/mpmc_queues/build-asan
+"AdmissionTest" start time: Aug 10 20:10 CEST
+Output:
+----------------------------------------------------------
+Running main() from /home/matti/Projects/mpmc_queues/cmake/extern/googletest/googletest/src/gtest_main.cc
+[==========] Running 8 tests from 4 test suites.
+[----------] Global test environment set-up.
+[----------] 1 test from AdmitNone
+[ RUN      ] AdmitNone.AdmitsEverythingAndCostsNothing
+[       OK ] AdmitNone.AdmitsEverythingAndCostsNothing (0 ms)
+[----------] 1 test from AdmitNone (0 ms total)
+
+[----------] 1 test from AdmitItemCount
+[ RUN      ] AdmitItemCount.StopsAdmittingAtTheBound
+[       OK ] AdmitItemCount.StopsAdmittingAtTheBound (0 ms)
+[----------] 1 test from AdmitItemCount (0 ms total)
+
+[----------] 1 test from AdmitSegmentCount
+[ RUN      ] AdmitSegmentCount.CountsSegmentsNotItems
+[       OK ] AdmitSegmentCount.CountsSegmentsNotItems (0 ms)
+[----------] 1 test from AdmitSegmentCount (0 ms total)
+
+[----------] 5 tests from BoundedProxies
+[ RUN      ] BoundedProxies.ItemBoundedNeverExceedsItsCapacity
+[       OK ] BoundedProxies.ItemBoundedNeverExceedsItsCapacity (0 ms)
+[ RUN      ] BoundedProxies.UnboundedKeepsGoingWellPastOneSegment
+[       OK ] BoundedProxies.UnboundedKeepsGoingWellPastOneSegment (0 ms)
+[ RUN      ] BoundedProxies.ItemBoundIsRespectedConcurrently
+[       OK ] BoundedProxies.ItemBoundIsRespectedConcurrently (1 ms)
+[ RUN      ] BoundedProxies.ChunkBoundedRefusesRatherThanGrowingForever
+[       OK ] BoundedProxies.ChunkBoundedRefusesRatherThanGrowingForever (0 ms)
+[ RUN      ] BoundedProxies.RefusalIsRecoverableAfterDraining
+[       OK ] BoundedProxies.RefusalIsRecoverableAfterDraining (0 ms)
+[----------] 5 tests from BoundedProxies (2 ms total)
+
+[----------] Global test environment tear-down
+[==========] 8 tests from 4 test suites ran. (2 ms total)
+[  PASSED  ] 8 tests.
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"AdmissionTest" end time: Aug 10 20:10 CEST
+"AdmissionTest" time elapsed: 00:00:00
+----------------------------------------------------------
+
+5/10 Testing: MemoryLayoutTest
+5/10 Test: MemoryLayoutTest
+Command: "/home/matti/Projects/mpmc_queues/build-asan/MemoryLayoutTest"
+Directory: /home/matti/Projects/mpmc_queues/build-asan
+"MemoryLayoutTest" start time: Aug 10 20:10 CEST
+Output:
+----------------------------------------------------------
+Running main() from /home/matti/Projects/mpmc_queues/cmake/extern/googletest/googletest/src/gtest_main.cc
+[==========] Running 6 tests from 4 test suites.
+[----------] Global test environment set-up.
+[----------] 2 tests from Align
+[ RUN      ] Align.RoundsUpAndIsIdempotent
+[       OK ] Align.RoundsUpAndIsIdempotent (0 ms)
+[ RUN      ] Align.RejectsTheHistoricalMistake
+[       OK ] Align.RejectsTheHistoricalMistake (0 ms)
+[----------] 2 tests from Align (0 ms total)
+
+[----------] 2 tests from SingleBlockLayout
+[ RUN      ] SingleBlockLayout.RegionsAreWellFormed
+[       OK ] SingleBlockLayout.RegionsAreWellFormed (0 ms)
+[ RUN      ] SingleBlockLayout.ScqUsesFiveDisjointRegions
+[       OK ] SingleBlockLayout.ScqUsesFiveDisjointRegions (0 ms)
+[----------] 2 tests from SingleBlockLayout (0 ms total)
+
+[----------] 1 test from SingleBlockAllocation
+[ RUN      ] SingleBlockAllocation.ObjectAndRegionsDoNotOverlap
+[       OK ] SingleBlockAllocation.ObjectAndRegionsDoNotOverlap (0 ms)
+[----------] 1 test from SingleBlockAllocation (0 ms total)
+
+[----------] 1 test from Linkage
+[ RUN      ] Linkage.StandaloneCostsNothingExtra
+[       OK ] Linkage.StandaloneCostsNothingExtra (0 ms)
+[----------] 1 test from Linkage (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 6 tests from 4 test suites ran. (0 ms total)
+[  PASSED  ] 6 tests.
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"MemoryLayoutTest" end time: Aug 10 20:10 CEST
+"MemoryLayoutTest" time elapsed: 00:00:00
+----------------------------------------------------------
+
+6/10 Testing: PoolReclamationTest
+6/10 Test: PoolReclamationTest
+Command: "/home/matti/Projects/mpmc_queues/build-asan/PoolReclamationTest"
+Directory: /home/matti/Projects/mpmc_queues/build-asan
+"PoolReclamationTest" start time: Aug 10 20:10 CEST
+Output:
+----------------------------------------------------------
+Running main() from /home/matti/Projects/mpmc_queues/cmake/extern/googletest/googletest/src/gtest_main.cc
+[==========] Running 15 tests from 2 test suites.
+[----------] Global test environment set-up.
+[----------] 14 tests from Fixture
+[ RUN      ] Fixture.StartsWithEverySlotAvailable
+[       OK ] Fixture.StartsWithEverySlotAvailable (0 ms)
+[ RUN      ] Fixture.ExhaustionIsReportedNotFabricated
+[       OK ] Fixture.ExhaustionIsReportedNotFabricated (0 ms)
+[ RUN      ] Fixture.DiscardReturnsASlotImmediately
+[       OK ] Fixture.DiscardReturnsASlotImmediately (0 ms)
+[ RUN      ] Fixture.RetireDoesNotReturnASlotImmediately
+[       OK ] Fixture.RetireDoesNotReturnASlotImmediately (0 ms)
+[ RUN      ] Fixture.RetiredSlotBecomesAvailableAfterEnoughAdvances
+[       OK ] Fixture.RetiredSlotBecomesAvailableAfterEnoughAdvances (0 ms)
+[ RUN      ] Fixture.EpochCannotAdvancePastALivePin
+[       OK ] Fixture.EpochCannotAdvancePastALivePin (0 ms)
+[ RUN      ] Fixture.SlotRetiredUnderAPinIsNotReusedWhileThatPinLives
+[       OK ] Fixture.SlotRetiredUnderAPinIsNotReusedWhileThatPinLives (0 ms)
+[ RUN      ] Fixture.TheRotationSurvivesManyFullCycles
+[       OK ] Fixture.TheRotationSurvivesManyFullCycles (0 ms)
+[ RUN      ] Fixture.MixingDiscardsAndRetiresKeepsEverySlot
+[       OK ] Fixture.MixingDiscardsAndRetiresKeepsEverySlot (0 ms)
+[ RUN      ] Fixture.RotatingSweepsTheFlippingBucketRatherThanStrandingIt
+[       OK ] Fixture.RotatingSweepsTheFlippingBucketRatherThanStrandingIt (0 ms)
+[ RUN      ] Fixture.TheRotationNeverStallsWithSlotsInHand
+[       OK ] Fixture.TheRotationNeverStallsWithSlotsInHand (0 ms)
+[ RUN      ] Fixture.VersionChangesOnEveryReuseOfASlot
+[       OK ] Fixture.VersionChangesOnEveryReuseOfASlot (0 ms)
+[ RUN      ] Fixture.NoSlotIsLostOverManyCycles
+[       OK ] Fixture.NoSlotIsLostOverManyCycles (0 ms)
+[ RUN      ] Fixture.DerefIsStableForAGivenIndex
+[       OK ] Fixture.DerefIsStableForAGivenIndex (0 ms)
+[----------] 14 tests from Fixture (0 ms total)
+
+[----------] 1 test from PoolConstraints
+[ RUN      ] PoolConstraints.EverySegmentOfferedToThePoolDeclaresItselfRecyclable
+[       OK ] PoolConstraints.EverySegmentOfferedToThePoolDeclaresItselfRecyclable (0 ms)
+[----------] 1 test from PoolConstraints (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 15 tests from 2 test suites ran. (1 ms total)
+[  PASSED  ] 15 tests.
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"PoolReclamationTest" end time: Aug 10 20:10 CEST
+"PoolReclamationTest" time elapsed: 00:00:00
+----------------------------------------------------------
+
+7/10 Testing: ThreadRegistryTest
+7/10 Test: ThreadRegistryTest
+Command: "/home/matti/Projects/mpmc_queues/build-asan/ThreadRegistryTest"
+Directory: /home/matti/Projects/mpmc_queues/build-asan
+"ThreadRegistryTest" start time: Aug 10 20:10 CEST
+Output:
+----------------------------------------------------------
+Running main() from /home/matti/Projects/mpmc_queues/cmake/extern/googletest/googletest/src/gtest_main.cc
+[==========] Running 25 tests from 2 test suites.
+[----------] Global test environment set-up.
+[----------] 12 tests from ThreadRegistryStandalone
+[ RUN      ] ThreadRegistryStandalone.TheFreeQueueIsLockFreeOnThisTarget
+[          ] free_list_is_lock_free = true, sizeof(TaggedPtr) = 16
+[       OK ] ThreadRegistryStandalone.TheFreeQueueIsLockFreeOnThisTarget (0 ms)
+[ RUN      ] ThreadRegistryStandalone.ThereIsNoCapAndTheHintIsOnlyAHint
+[       OK ] ThreadRegistryStandalone.ThereIsNoCapAndTheHintIsOnlyAHint (80 ms)
+[ RUN      ] ThreadRegistryStandalone.EveryAttachedThreadGetsADistinctPayload
+[       OK ] ThreadRegistryStandalone.EveryAttachedThreadGetsADistinctPayload (14 ms)
+[ RUN      ] ThreadRegistryStandalone.TryAttachNeverAllocates
+[       OK ] ThreadRegistryStandalone.TryAttachNeverAllocates (0 ms)
+[ RUN      ] ThreadRegistryStandalone.AttachWithACallerNodeAdoptsItAndNeverAllocates
+[       OK ] ThreadRegistryStandalone.AttachWithACallerNodeAdoptsItAndNeverAllocates (0 ms)
+[ RUN      ] ThreadRegistryStandalone.TryJoinReportsFailureWithoutAllocating
+[       OK ] ThreadRegistryStandalone.TryJoinReportsFailureWithoutAllocating (0 ms)
+[ RUN      ] ThreadRegistryStandalone.InstancesOfTheSameTypeDoNotShareThreadLocalState
+[       OK ] ThreadRegistryStandalone.InstancesOfTheSameTypeDoNotShareThreadLocalState (0 ms)
+[ RUN      ] ThreadRegistryStandalone.ManyInstancesCoexist
+[       OK ] ThreadRegistryStandalone.ManyInstancesCoexist (0 ms)
+[ RUN      ] ThreadRegistryStandalone.ARebuiltRegistryDoesNotInheritAStaleAssociation
+[       OK ] ThreadRegistryStandalone.ARebuiltRegistryDoesNotInheritAStaleAssociation (0 ms)
+[ RUN      ] ThreadRegistryStandalone.SustainedChurnDoesNotGrowTheRegistry
+[       OK ] ThreadRegistryStandalone.SustainedChurnDoesNotGrowTheRegistry (9 ms)
+[ RUN      ] ThreadRegistryStandalone.ScanningConcurrentlyWithChurnNeverMissesAStableThread
+[       OK ] ThreadRegistryStandalone.ScanningConcurrentlyWithChurnNeverMissesAStableThread (1 ms)
+[ RUN      ] ThreadRegistryStandalone.RetryOnAttachIsAvailableAndBehavesIdentically
+[       OK ] ThreadRegistryStandalone.RetryOnAttachIsAvailableAndBehavesIdentically (0 ms)
+[----------] 12 tests from ThreadRegistryStandalone (107 ms total)
+
+[----------] 13 tests from Fixture
+[ RUN      ] Fixture.AttachIsIdempotentAndSoIsDetach
+[       OK ] Fixture.AttachIsIdempotentAndSoIsDetach (0 ms)
+[ RUN      ] Fixture.ThePayloadReferenceIsStableWhileAttached
+[       OK ] Fixture.ThePayloadReferenceIsStableWhileAttached (0 ms)
+[ RUN      ] Fixture.ADetachedNodeIsHandedOutAgain
+[       OK ] Fixture.ADetachedNodeIsHandedOutAgain (0 ms)
+[ RUN      ] Fixture.ReuseIsFirstInFirstOut
+[       OK ] Fixture.ReuseIsFirstInFirstOut (0 ms)
+[ RUN      ] Fixture.ASessionDetachesWhenItLeavesScope
+[       OK ] Fixture.ASessionDetachesWhenItLeavesScope (0 ms)
+[ RUN      ] Fixture.ANestedJoinDoesNotDetachEarly
+[       OK ] Fixture.ANestedJoinDoesNotDetachEarly (0 ms)
+[ RUN      ] Fixture.AMovedFromSessionDoesNotDetachTwice
+[       OK ] Fixture.AMovedFromSessionDoesNotDetachTwice (0 ms)
+[ RUN      ] Fixture.ResetDetachesEarlyAndIsIdempotent
+[       OK ] Fixture.ResetDetachesEarlyAndIsIdempotent (0 ms)
+[ RUN      ] Fixture.ReduceVisitsExactlyTheAttachedThreads
+[       OK ] Fixture.ReduceVisitsExactlyTheAttachedThreads (0 ms)
+[ RUN      ] Fixture.AnyOfStopsAtTheFirstMatch
+[       OK ] Fixture.AnyOfStopsAtTheFirstMatch (0 ms)
+[ RUN      ] Fixture.AllOfStopsAtTheFirstFailure
+[       OK ] Fixture.AllOfStopsAtTheFirstFailure (0 ms)
+[ RUN      ] Fixture.ForEachActiveCanMutateAndForEachNodeReachesDetachedOnes
+[       OK ] Fixture.ForEachActiveCanMutateAndForEachNodeReachesDetachedOnes (0 ms)
+[ RUN      ] Fixture.PayloadSurvivesTheNodeBeingRecycled
+[       OK ] Fixture.PayloadSurvivesTheNodeBeingRecycled (0 ms)
+[----------] 13 tests from Fixture (1 ms total)
+
+[----------] Global test environment tear-down
+[==========] 25 tests from 2 test suites ran. (108 ms total)
+[  PASSED  ] 25 tests.
+<end of output>
+Test time =   0.12 sec
+----------------------------------------------------------
+Test Passed.
+"ThreadRegistryTest" end time: Aug 10 20:10 CEST
+"ThreadRegistryTest" time elapsed: 00:00:00
+----------------------------------------------------------
+
+8/10 Testing: ThreadPinnerTest
+8/10 Test: ThreadPinnerTest
+Command: "/home/matti/Projects/mpmc_queues/build-asan/ThreadPinnerTest"
+Directory: /home/matti/Projects/mpmc_queues/build-asan
+"ThreadPinnerTest" start time: Aug 10 20:10 CEST
+Output:
+----------------------------------------------------------
+Running main() from /home/matti/Projects/mpmc_queues/cmake/extern/googletest/googletest/src/gtest_main.cc
+[==========] Running 15 tests from 3 test suites.
+[----------] Global test environment set-up.
+[----------] 7 tests from ThreadPinnerPlan
+[ RUN      ] ThreadPinnerPlan.OneGroupIsRoundRobin
+[       OK ] ThreadPinnerPlan.OneGroupIsRoundRobin (0 ms)
+[ RUN      ] ThreadPinnerPlan.EqualGroupsAlternate
+[       OK ] ThreadPinnerPlan.EqualGroupsAlternate (0 ms)
+[ RUN      ] ThreadPinnerPlan.UnequalGroupsInterleaveInProportion
+[       OK ] ThreadPinnerPlan.UnequalGroupsInterleaveInProportion (0 ms)
+[ RUN      ] ThreadPinnerPlan.TheSmallerGroupLeadsWhicheverArgumentItIs
+[       OK ] ThreadPinnerPlan.TheSmallerGroupLeadsWhicheverArgumentItIs (0 ms)
+[ RUN      ] ThreadPinnerPlan.EveryThreadIsPlacedAndNothingRunsAway
+[       OK ] ThreadPinnerPlan.EveryThreadIsPlacedAndNothingRunsAway (0 ms)
+[ RUN      ] ThreadPinnerPlan.FewerCoresThanThreadsWrapsRatherThanOverruns
+[       OK ] ThreadPinnerPlan.FewerCoresThanThreadsWrapsRatherThanOverruns (0 ms)
+[ RUN      ] ThreadPinnerPlan.NoCoresPlacesNothing
+[       OK ] ThreadPinnerPlan.NoCoresPlacesNothing (0 ms)
+[----------] 7 tests from ThreadPinnerPlan (0 ms total)
+
+[----------] 6 tests from ThreadPinnerParse
+[ RUN      ] ThreadPinnerParse.ReadsOneIdPerLineInOrder
+[       OK ] ThreadPinnerParse.ReadsOneIdPerLineInOrder (0 ms)
+[ RUN      ] ThreadPinnerParse.SkipsBlankLinesAndComments
+[       OK ] ThreadPinnerParse.SkipsBlankLinesAndComments (0 ms)
+[ RUN      ] ThreadPinnerParse.DropsDuplicatesKeepingFirstSeenOrder
+[       OK ] ThreadPinnerParse.DropsDuplicatesKeepingFirstSeenOrder (0 ms)
+[ RUN      ] ThreadPinnerParse.RejectsAMalformedLine
+[       OK ] ThreadPinnerParse.RejectsAMalformedLine (0 ms)
+[ RUN      ] ThreadPinnerParse.DropsIdsNoCpuSetCouldHold
+[       OK ] ThreadPinnerParse.DropsIdsNoCpuSetCouldHold (0 ms)
+[ RUN      ] ThreadPinnerParse.AnEmptyFileParsesToNothing
+[       OK ] ThreadPinnerParse.AnEmptyFileParsesToNothing (0 ms)
+[----------] 6 tests from ThreadPinnerParse (0 ms total)
+
+[----------] 2 tests from ThreadPinner
+[ RUN      ] ThreadPinner.FallsBackToProcessAffinityWhenTheFileIsMissing
+[       OK ] ThreadPinner.FallsBackToProcessAffinityWhenTheFileIsMissing (0 ms)
+[ RUN      ] ThreadPinner.PinningIsANoOpFailureWhenThereAreNoCores
+[       OK ] ThreadPinner.PinningIsANoOpFailureWhenThereAreNoCores (0 ms)
+[----------] 2 tests from ThreadPinner (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 15 tests from 3 test suites ran. (0 ms total)
+[  PASSED  ] 15 tests.
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"ThreadPinnerTest" end time: Aug 10 20:10 CEST
+"ThreadPinnerTest" time elapsed: 00:00:00
+----------------------------------------------------------
+
+9/10 Testing: ProxyAccountingTest
+9/10 Test: ProxyAccountingTest
+Command: "/home/matti/Projects/mpmc_queues/build-asan/ProxyAccountingTest"
+Directory: /home/matti/Projects/mpmc_queues/build-asan
+"ProxyAccountingTest" start time: Aug 10 20:10 CEST
+Output:
+----------------------------------------------------------
+Running main() from /home/matti/Projects/mpmc_queues/cmake/extern/googletest/googletest/src/gtest_main.cc
+[==========] Running 4 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 4 tests from ProxyAccounting
+[ RUN      ] ProxyAccounting.ItemsSurviveTheThreadThatEnqueuedThem
+[       OK ] ProxyAccounting.ItemsSurviveTheThreadThatEnqueuedThem (0 ms)
+[ RUN      ] ProxyAccounting.ADetachedProducerAndAttachedConsumerAgree
+[       OK ] ProxyAccounting.ADetachedProducerAndAttachedConsumerAgree (0 ms)
+[ RUN      ] ProxyAccounting.CountsDoNotAccumulateAcrossManyShortLivedThreads
+[       OK ] ProxyAccounting.CountsDoNotAccumulateAcrossManyShortLivedThreads (1 ms)
+[ RUN      ] ProxyAccounting.AnInheritedNodeDoesNotCarryTheLastOwnersCloseHint
+[       OK ] ProxyAccounting.AnInheritedNodeDoesNotCarryTheLastOwnersCloseHint (0 ms)
+[----------] 4 tests from ProxyAccounting (2 ms total)
+
+[----------] Global test environment tear-down
+[==========] 4 tests from 1 test suite ran. (2 ms total)
+[  PASSED  ] 4 tests.
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"ProxyAccountingTest" end time: Aug 10 20:10 CEST
+"ProxyAccountingTest" time elapsed: 00:00:00
+----------------------------------------------------------
+
+10/10 Testing: BucketTest
+10/10 Test: BucketTest
+Command: "/home/matti/Projects/mpmc_queues/build-asan/BucketTest"
+Directory: /home/matti/Projects/mpmc_queues/build-asan
+"BucketTest" start time: Aug 10 20:10 CEST
+Output:
+----------------------------------------------------------
+Running main() from /home/matti/Projects/mpmc_queues/cmake/extern/googletest/googletest/src/gtest_main.cc
+[==========] Running 10 tests from 2 test suites.
+[----------] Global test environment set-up.
+[----------] 5 tests from PhasedBucket
+[ RUN      ] PhasedBucket.StartsEmpty
+[       OK ] PhasedBucket.StartsEmpty (0 ms)
+[ RUN      ] PhasedBucket.AFillPhaseFollowedByADrainYieldsEveryValueOnce
+[       OK ] PhasedBucket.AFillPhaseFollowedByADrainYieldsEveryValueOnce (0 ms)
+[ RUN      ] PhasedBucket.TheImplicitResetSurvivesRepeatedPhaseFlips
+[       OK ] PhasedBucket.TheImplicitResetSurvivesRepeatedPhaseFlips (0 ms)
+[ RUN      ] PhasedBucket.WithoutTheImplicitResetTheOwnerFlipsThePhase
+[       OK ] PhasedBucket.WithoutTheImplicitResetTheOwnerFlipsThePhase (0 ms)
+[ RUN      ] PhasedBucket.DrainingPastTheEndKeepsReportingEmpty
+[       OK ] PhasedBucket.DrainingPastTheEndKeepsReportingEmpty (0 ms)
+[----------] 5 tests from PhasedBucket (0 ms total)
+
+[----------] 5 tests from CacheRing
+[ RUN      ] CacheRing.StartsEmptyAndFillsToCapacity
+[       OK ] CacheRing.StartsEmptyAndFillsToCapacity (0 ms)
+[ RUN      ] CacheRing.IsFirstInFirstOut
+[       OK ] CacheRing.IsFirstInFirstOut (0 ms)
+[ RUN      ] CacheRing.CellsStayDistinguishableAcrossManyLaps
+[       OK ] CacheRing.CellsStayDistinguishableAcrossManyLaps (1 ms)
+[ RUN      ] CacheRing.ANonPowerOfTwoCapacityRoundsUp
+[       OK ] CacheRing.ANonPowerOfTwoCapacityRoundsUp (0 ms)
+[ RUN      ] CacheRing.PaddingIsOptional
+[       OK ] CacheRing.PaddingIsOptional (0 ms)
+[----------] 5 tests from CacheRing (1 ms total)
+
+[----------] Global test environment tear-down
+[==========] 10 tests from 2 test suites ran. (1 ms total)
+[  PASSED  ] 10 tests.
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"BucketTest" end time: Aug 10 20:10 CEST
+"BucketTest" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Aug 10 20:10 CEST

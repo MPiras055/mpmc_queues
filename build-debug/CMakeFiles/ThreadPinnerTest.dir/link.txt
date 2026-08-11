@@ -1,0 +1,1 @@
+/usr/bin/clang++ -g -Xlinker --dependency-file=CMakeFiles/ThreadPinnerTest.dir/link.d CMakeFiles/ThreadPinnerTest.dir/src/test/unit/ThreadPinnerTest.cpp.o -o ThreadPinnerTest  lib/libgtest_main.a lib/libgtest.a

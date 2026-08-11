@@ -10,6 +10,7 @@
 #include <cassert>
 #include <concepts>
 #include <cstdint>
+#include <utility>
 
 namespace proxy {
 
@@ -82,8 +83,60 @@ class LinkedProxy {
                   "as e.g. mem::source::Hazard<Segment, proxy::ThreadMeta<Segment*>>");
 
 public:
-    /// A scope in which the calling thread may use this queue; see join().
-    using session = typename Source::session;
+    /**
+     * @brief A scope in which the calling thread may use this queue; see join().
+     *
+     * Wraps the source's session so that a departing thread's tally is not lost with it.
+     * `size()` folds over *attached* threads, so a producer that enqueued and then left used
+     * to take its count away with it and the queue under-reported for the rest of its life.
+     * On the way out this folds the thread's `ops` into a queue-wide total and clears the
+     * payload, so whoever inherits the recycled node starts from zero rather than from the
+     * last owner's tally and stale close hint.
+     */
+    class session {
+        LinkedProxy* q_ = nullptr;
+        Meta* me_ = nullptr; ///< stable while this thread is attached
+        typename Source::session inner_{};
+
+    public:
+        session() noexcept = default;
+        session(LinkedProxy* q, Meta* me, typename Source::session inner) noexcept
+            : q_{q}, me_{me}, inner_{std::move(inner)} {}
+
+        session(const session&) = delete;
+        session& operator=(const session&) = delete;
+
+        session(session&& o) noexcept
+            : q_{std::exchange(o.q_, nullptr)}, me_{std::exchange(o.me_, nullptr)},
+              inner_{std::move(o.inner_)} {}
+
+        session& operator=(session&& o) noexcept {
+            if (this != &o) {
+                hand_back();
+                q_ = std::exchange(o.q_, nullptr);
+                me_ = std::exchange(o.me_, nullptr);
+                inner_ = std::move(o.inner_);
+            }
+            return *this;
+        }
+
+        /// The body runs before `inner_` is destroyed, so the payload is cleaned while this
+        /// thread still owns the node -- and only then does the node become reusable.
+        ~session() { hand_back(); }
+
+        explicit operator bool() const noexcept { return static_cast<bool>(inner_); }
+
+    private:
+        void hand_back() noexcept {
+            if (q_ && me_) {
+                q_->departed_ops_.fetch_add(me_->ops.exchange(0, std::memory_order_relaxed),
+                                            std::memory_order_relaxed);
+                me_->last_seen = Source::nil();
+            }
+            q_ = nullptr;
+            me_ = nullptr;
+        }
+    };
 
     /**
      * @param segment_capacity capacity of each segment
@@ -101,6 +154,9 @@ public:
         // The sentinel. Joining is required because the source hands out segments per thread.
         auto s = source_.join();
         assert(s && "LinkedProxy: could not register the constructing thread");
+        // A pooled source reclaims by epoch, so acquiring a segment is only meaningful under
+        // a pin. Nothing else runs yet, but the precondition is asserted rather than assumed.
+        auto g = source_.pin();
         auto sentinel = source_.acquire();
         assert(sentinel && "LinkedProxy: could not obtain a sentinel segment");
         head_.store(*sentinel, std::memory_order_relaxed);
@@ -112,10 +168,16 @@ public:
 
     ~LinkedProxy() {
         // Destroyed before `source_`, since it is a local in this body and members go after.
-        auto s = source_.join();
+        [[maybe_unused]] auto guard = source_.join();
         T ignore{};
         while (dequeue(ignore)) {}
         // Whatever the traversal left linked is now unreachable; hand it back.
+        //
+        // The pin covers the discard loop only, and starts after the drain: `dequeue()` pins
+        // internally, and a pooled source's pin is *not* re-entrant -- an inner guard's
+        // destructor clears the published epoch outright, which would leave this loop
+        // running unpinned with no diagnostic.
+        auto g = source_.pin();
         H h = head_.load(std::memory_order_relaxed);
         while (h != Source::nil()) {
             Segment* s = source_.deref(h);
@@ -136,6 +198,11 @@ public:
         }
 
         H tail = source_.protect(g, tail_.load(std::memory_order_relaxed));
+        // Bounds the retry below: one more attempt per distinct tail. Deliberately a local
+        // and not `me.last_seen` -- that field is the close hint, and writing a retry into it
+        // would make the next enqueue skip a segment it never saw closed.
+        H last_failed = Source::nil();
+
         for (;;) {
             const H observed = tail_.load(std::memory_order_acquire);
             if (tail != observed) { // tail moved under us; re-protect and restart
@@ -157,19 +224,27 @@ public:
 
             // This segment is full or closed. Get another.
             auto fresh = source_.acquire();
-            if (!fresh) { // pool exhausted: this *is* the memory bound
+            if (!fresh) {
+                // The source has nothing -- but it may have had nothing only because another
+                // producer took the last segment and is about to link it. Losing that race is
+                // not the same as the queue being full, so look once more before reporting a
+                // bound. `last_failed` makes this terminate: a tail that fails twice really
+                // has no successor coming.
+                if (last_failed != tail) {
+                    last_failed = tail;
+                    if (const H nx = s->next(); nx != Source::nil()) {
+                        tail = source_.protect(g, nx);
+                        continue;
+                    }
+                }
                 if constexpr (Admit::bounded) admit_.cancel_admit();
-                return false;
+                return false; // genuinely exhausted: this *is* the memory bound
             }
 
+            // No reopen here. Recycling is the source's business -- a source that hands back
+            // a used segment is the one that knows it needs resetting, and the proxy should
+            // not have to ask. See mem::source::Pool::acquire.
             Segment* ns = source_.deref(*fresh);
-            if constexpr (Source::recycles) {
-                if (!ns->reopen()) { // cannot be reused; do not publish it
-                    source_.discard(*fresh);
-                    if constexpr (Admit::bounded) admit_.cancel_admit();
-                    return false;
-                }
-            }
             const bool placed = ns->enqueue(item);
             assert(placed && "LinkedProxy: a fresh segment refused the first item");
             (void)placed;
@@ -182,8 +257,21 @@ public:
                 break;
             }
 
-            // Someone else linked first. Nobody ever saw ours, so it needs no scan --
-            // and `item` is still ours, so nothing is lost by retrying.
+            // Someone else linked first. Nobody ever saw ours, so it needs no scan -- but
+            // `item` is already *in* it, and the retry below will place `item` again. Take
+            // the copy back out before handing the segment over, or the queue holds two.
+            //
+            // Under an allocating source that is invisible: discard destroys the segment and
+            // the stray goes with it. Under a pooled source the segment comes straight back,
+            // and whether the stray survives depends on how much of itself that segment's
+            // reopen() rebuilds -- SCQ, FAAArray and HQ happen to wipe their cells, PRQ
+            // realigns indices only and delivers the stray a second time. Measured on
+            // mem-prq at capacity 8: 200048 items consumed against 200000 produced.
+            //
+            // This segment is ours alone, so the dequeue is uncontended and cannot fail.
+            T stray{};
+            [[maybe_unused]] const bool drained = ns->dequeue(stray);
+            assert(drained && "LinkedProxy: the segment we alone hold refused the item back");
             source_.discard(*fresh);
             tail = source_.protect(g, s->next());
         }
@@ -252,14 +340,20 @@ public:
     /**
      * @brief Approximate under concurrency; exact when quiescent.
      *
-     * Folds over the threads that have actually attached rather than over a fixed array
-     * sized for the worst case, so the cost tracks real concurrency.
+     * Two parts, because a per-thread counter stops being reachable when its thread leaves:
+     * the running total of everyone who has departed, plus a fold over the threads still
+     * attached. A scan only visits attached threads, so without the first part a producer
+     * that enqueued and then detached took its count with it and the queue under-reported
+     * permanently -- see ProxyAccountingTest.
+     *
+     * The fold is over threads that actually attached rather than a fixed array sized for
+     * the worst case, so its cost tracks real concurrency.
      */
     std::size_t size() const noexcept {
-        const int64_t total = source_.reduce_payloads(
-            int64_t{0}, [](int64_t acc, const Meta& m) {
-                return acc + m.ops.load(std::memory_order_relaxed);
-            });
+        int64_t total = departed_ops_.load(std::memory_order_relaxed);
+        total += source_.reduce_payloads(int64_t{0}, [](int64_t acc, const Meta& m) {
+            return acc + m.ops.load(std::memory_order_relaxed);
+        });
         return total > 0 ? static_cast<std::size_t>(total) : 0;
     }
 
@@ -273,7 +367,18 @@ public:
      * that skipped the release. It also un-collides two names: the source's `acquire()`
      * hands out a *segment*, which is a different thing entirely.
      */
-    [[nodiscard]] session join() { return source_.join(); }
+    [[nodiscard]] session join() {
+        auto inner = source_.join();
+        if (!inner) return session{};
+        // One lookup, here rather than on every operation: the payload's address is fixed
+        // for as long as this thread holds the node.
+        Meta* me = nullptr;
+        {
+            auto g = source_.pin();
+            me = &g.payload();
+        }
+        return session{this, me, std::move(inner)};
+    }
 
 private:
     void took_one(Meta& me) noexcept {
@@ -306,6 +411,11 @@ private:
     CACHE_PAD_TYPES(std::atomic<H>);
     ALIGNED_CACHE std::atomic<H> tail_{};
     CACHE_PAD_TYPES(std::atomic<H>);
+
+    /// Everything counted by threads that have since left. Kept apart from the per-thread
+    /// counters because those become unreachable the moment their thread detaches.
+    ALIGNED_CACHE std::atomic<int64_t> departed_ops_{0};
+    CACHE_PAD_TYPES(std::atomic<int64_t>);
 
     const std::size_t seg_capacity_;
     Source source_;

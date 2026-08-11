@@ -1,6 +1,7 @@
 #pragma once
 #include <core/SegmentTraits.hpp>
 #include <mem/SingleBlock.hpp>
+#include <mem/source/Payload.hpp>
 #include <util/specs.hpp>
 #include <util/threading/ThreadRegistry.hpp>
 #include <atomic>
@@ -17,9 +18,6 @@ namespace mem::source {
 /// Retired objects per thread before a reclamation scan is attempted.
 #define HAZARD_RETIRE_THRESHOLD 64
 #endif
-
-/// Default payload for a source used without a proxy: costs nothing.
-struct NoPayload {};
 
 /**
  * @brief Segment source backed by hazard pointers: allocate on demand, free when unseen.

@@ -1,0 +1,1 @@
+/usr/bin/clang++ -g -fsanitize=thread -Xlinker --dependency-file=CMakeFiles/ProxyAccountingTest.dir/link.d CMakeFiles/ProxyAccountingTest.dir/src/test/unit/ProxyAccountingTest.cpp.o -o ProxyAccountingTest  lib/libgtest_main.a lib/libgtest.a

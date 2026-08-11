@@ -1,18 +1,19 @@
 #pragma once
+#include <algo/CacheRing.hpp>
+#include <algo/PhasedBucket.hpp>
 #include <core/SegmentTraits.hpp>
 #include <mem/Handle.hpp>
 #include <mem/SingleBlock.hpp>
-#include <mem/detail/RingSlab.hpp>
-#include <mem/source/Hazard.hpp>  // NoPayload
+#include <mem/source/Payload.hpp>
 #include <util/bit.hpp>
 #include <util/specs.hpp>
 #include <util/threading/ThreadRegistry.hpp>
 #include <atomic>
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <utility>
-#include <vector>
 
 namespace mem::source {
 
@@ -28,29 +29,76 @@ namespace mem::source {
  * would let a stale `next` value alias a live segment (ABA); the version half makes reuse
  * observable.
  *
- * ## Reclamation
+ * ## Reclamation: four buckets in a rotation
  *
- * Three limbo buckets and one free list. A retirement lands in `limbo[e]` for the epoch
- * current at the time. When the epoch advances to `e'`, everything in `limbo[e' + 1]` --
- * the same bucket as `e' - 2`, i.e. retired two epochs ago -- is drained into the free
- * list, and only then can be handed out again.
+ * Every bucket plays each role in turn, and the role is just the epoch modulo four:
  *
- * A pinned thread publishes the epoch it saw, and the epoch may advance only when every
- * pinned thread published the current one. That is what makes "two epochs ago" mean "no
- * live reader can still hold it".
+ * ```
+ *   current(e) = e       retirements land here
+ *   grace(e)   = e - 1   late retirements, from a thread pinned one epoch back
+ * //@debug we need another grace bucket here because late grace(e) and early free(e) could collide
+ *   free(e)    = e - 2   acquire pops here
+ *   next(e)    = e + 1   late acquires, from a thread pinned one epoch back
  *
- * @note The free list is a *separate* ring rather than whichever limbo bucket happens to
- *       be oldest. Reusing a limbo bucket as the free list looks equivalent and is not:
- *       if the epoch moves past the moment that bucket is the free one -- which happens
- *       readily, since acquire() advances the epoch itself when it finds nothing -- its
- *       contents are stranded until the rotation comes round again. Draining on advance
- *       means an index is reusable from the moment it is safe, and stays reusable.
+ *   next <-- free <-- @debug(grace_1) <-- grace <-- current <--+
+ *     |                                                        |
+ *     +--------------------------------------------------------+
+ * ```
+ * 
+ * Race condition with having only grace:
+ * suppose thread wants to retire something on epoch e
+ * before it retires the epoch is advanced to e + 1
+ * grace(e) becomes free(e+1)
+ * a thread wants to get something on epoch e+1
+ * dequeues from free(e+1) which is grace(e) while the other thread
+ * is enqueing (violating the MP/NC invariant). Since rings are allocated
+ * as a single block of memory, this could determine that the enqueue or dequeue
+ * gets placed on another buffer or goes out of bounds
  *
- * @note This owns its reclamation outright. It used to delegate to a `Recycler` that
- *       carried its own ticketing, per-thread metadata, a reuse cache and a lookup-table
- *       template parameter, of which the proxy used almost nothing. The one part
- *       worth keeping was the lock-free index container, and that is `algo::LFring` via
- *       mem::detail::RingSlab, reused here rather than rewritten.
+ * An index retired at epoch *e* sits in `current(e)`; two advances later that same bucket is
+ * `free`, and only then can it be handed out. A pinned thread publishes the epoch it saw, and
+ * the epoch may advance only when every pinned thread published the current one -- which is
+ * what makes "two epochs ago" mean "no live reader can still hold it".
+ *
+ * ## Why four, and why these buckets
+ *
+ * Four stages is what lets the buckets be algo::PhasedBucket rather than a general MPMC ring.
+ * PhasedBucket is a single `fetch_add` at each end with no per-cell sequence word, but it
+ * requires that a bucket is never pushed and popped at the same time. The rotation delivers
+ * exactly that:
+ *
+ *  - a thread pinned at `e - 1` retires into `current(e - 1)`, which is `grace(e)`;
+ *  - a thread pinned at `e - 1` acquires from `free(e - 1)`, which is `next(e)`.
+ *
+ * So `current` and `grace` only ever see pushes, `free` and `next` only pops. The pin is what
+ * bounds the shift to a single epoch; without it a thread arbitrarily far behind could push
+ * into a bucket being drained.
+ *
+ * The one dangerous transition is `next -> current`, where pops would meet pushes. It cannot
+ * happen: `try_advance` refuses while any pinned thread is behind, so by the time that bucket
+ * becomes `current`, no thread pinned at `e - 1` remains to be popping it.
+ *
+ * @note **The drain belongs to acquire(), not to the advance**, and that is not a stylistic
+ *       choice. PhasedBucket resets lazily: a drain phase clears the tail only on a dequeue
+ *       that *fails*, and a fill phase clears the head on its first enqueue. A bucket emptied
+ *       by successful dequeues alone reports `size() == 0` while its tail still sits at the
+ *       old count, so the next fill would write past the end. Having the advancer drain and
+ *       reset instead is worse than redundant -- it is unsound. The drain would have to run
+ *       before the epoch is published, or pushers race it, and after the decision to advance,
+ *       or two advancers race each other; and a thread still draining once another has won
+ *       the CAS would have its failing dequeue's `fetch_and` wipe a fresh pusher's tail.
+ *       Letting `acquire()` walk `free` then `next` gives the failing dequeue for free, in the
+ *       ordinary path, with no extra synchronisation.
+ *
+ * @note `discard()` does not enter the rotation at all. A segment that was never published has
+ *       no observers, so making it wait two advances is pure latency; it goes to an
+ *       algo::CacheRing and `acquire()` looks there first. The cache is genuinely MPMC with no
+ *       phase discipline, which is why it is a CacheRing and not a fifth bucket -- its
+ *       single-word ABA-safe CAS is what makes that cheap.
+ *
+ * @note The total number of indices is `N`, spread across the cache, the four buckets and the
+ *       handles currently held. No container can therefore overflow its capacity, which is the
+ *       precondition PhasedBucket asserts rather than defends against.
  */
 template <typename S, std::size_t N, typename Payload = NoPayload>
 class Pool {
@@ -65,16 +113,18 @@ class Pool {
                   "false: this segment cannot be reopened after being drained");
     static_assert(N >= 2, "a pool needs at least two segments to make progress");
 
-    /// Limbo buckets. Three is the minimum that distinguishes current / grace / safe.
-    static constexpr std::size_t kStages = 3;
-    /// One more ring holds everything currently reusable.
-    static constexpr std::size_t kFreeBucket = kStages;
+    /// Four: current / grace / free / next. Three cannot separate "still being filled" from
+    /// "safe to drain" while a thread may be one epoch behind.
+    static constexpr uint8_t kStages = 4;
 
-    /// Per-thread published epoch, plus whatever the caller keeps per thread. MSB set means
-    /// pinned; the low bits are the epoch. Aligned here rather than in the registry, so a
-    /// thread's stores do not dirty the line another thread walks for links.
+    /// Bit 7 pinned, bits 0-1 the stage. The epoch scan only ever asks "pinned, and at my
+    /// stage?", and the pin bounds the shift to one epoch, so the full 64-bit epoch this used
+    /// to carry was never read.
+    static constexpr uint8_t kPinned = 0x80;
+    static constexpr uint8_t kStageMask = kStages - 1;
+
     struct alignas(CACHE_LINE) ThreadData {
-        std::atomic<uint64_t> state{0};
+        std::atomic<uint8_t> state{0};
         [[no_unique_address]] Payload user{};
     };
 
@@ -107,12 +157,23 @@ public:
      *
      * Protection is epoch-wide rather than per-object, so `protect()` has nothing to
      * publish — holding the pin is what keeps every slot alive.
+     *
+     * @warning **Not re-entrant.** The destructor stores 0 unconditionally, so an inner
+     *          guard ending clears the epoch the outer one published and leaves it running
+     *          unpinned, with nothing to report it. `LinkedProxy`'s destructor is written
+     *          around this: its pin covers the discard loop only, after the drain, because
+     *          `dequeue()` pins internally.
      */
     class guard {
         Node* node_;
+        uint8_t stage_;
 
     public:
-        explicit guard(Node* n) noexcept : node_{n} {}
+        guard(Node* n, uint8_t s) noexcept : node_{n}, stage_{s} {}
+
+        /// The stage this pin published. Every bucket role is derived from *this*, never
+        /// from the global stage -- see the note on Pool::acquire.
+        uint8_t stage() const noexcept { return stage_; }
         guard(const guard&) = delete;
         guard& operator=(const guard&) = delete;
         ~guard() { node_->data.state.store(0, std::memory_order_release); }
@@ -121,16 +182,46 @@ public:
         Payload& payload() const noexcept { return node_->data.user; }
     };
 
-    /// @param segment_capacity capacity handed to each of the N pooled segments
-    explicit Pool(std::size_t segment_capacity)
-        : buckets_{kStages + 1, N}, versions_(N), segments_(N) {
+    /**
+     * @brief Pins for the enclosing scope, unless the caller already holds a pin.
+     *
+     * `guard`'s destructor clears the published stage unconditionally, so pinning
+     * unconditionally inside a public entry point would silently unpin an outer scope and let
+     * the rotation run away from a caller that is still holding handles. The conditional is
+     * what makes `acquire()` and `retire()` callable whether or not the caller pinned.
+     */
+    class auto_pin {
+        Pool* owner_; ///< non-null only when *this* took the pin
+
+    public:
+        explicit auto_pin(Pool& p) noexcept : owner_{p.pinned() ? nullptr : &p} {
+            if (owner_) (void)owner_->publish(owner_->node());
+        }
+        auto_pin(const auto_pin&) = delete;
+        auto_pin& operator=(const auto_pin&) = delete;
+        ~auto_pin() {
+            if (owner_)
+                owner_->registry_.self()->data.state.store(0, std::memory_order_release);
+        }
+    };
+
+    /**
+     * @param segment_capacity capacity handed to each of the N pooled segments
+     *
+     * Only the buckets need a runtime size: their capacity is N, the number of slot indices
+     * that can be in flight. The slot arrays are sized by the template parameter, so they
+     * are members rather than allocations and nothing here needs a length argument.
+     */
+    explicit Pool(std::size_t segment_capacity) {
         assert(segment_capacity != 0);
 
         for (std::size_t i = 0; i < N; ++i) {
             segments_[i].reset(mem::SingleBlock<S>::create(segment_capacity));
             versions_[i].store(0, std::memory_order_relaxed);
         }
-        for (std::size_t i = 0; i < N; ++i) free_list().enqueue(i);
+        // Everything starts in the cache: no index has been published, so none of them owes
+        // the rotation a grace period.
+        for (std::size_t i = 0; i < N; ++i) (void)cache_.enqueue(i);
     }
 
     Pool(const Pool&) = delete;
@@ -138,11 +229,9 @@ public:
 
     guard pin() noexcept {
         Node* n = node();
-        // Publish the epoch we are about to read under. Sequentially consistent so a
-        // thread trying to advance cannot miss us while we cannot see its advance.
-        n->data.state.store(bit::set_msb(epoch_.load(std::memory_order_acquire)),
-                            std::memory_order_seq_cst);
-        return guard{n};
+        // Publish the stage we are about to read under. Sequentially consistent so a thread
+        // trying to advance cannot miss us while we cannot see its advance.
+        return guard{n, publish(n)};
     }
 
     /// No-op: the epoch pin already covers every slot.
@@ -153,34 +242,96 @@ public:
         return segments_[h.index()].get();
     }
 
-    /// @return nullopt when the pool is exhausted — i.e. the memory bound is reached.
+    /**
+     * @brief Take a segment, reopened and ready to use.
+     * @return nullopt when the pool is exhausted — i.e. the memory bound is reached.
+     *
+     * Reopening happens here rather than in the proxy. A source that hands back a segment
+     * which has already held items is the one that knows it needs resetting; making the
+     * caller ask `if constexpr (Source::recycles)` first put that knowledge in the wrong
+     * place. `recycles` remains, because LinkedProxy still static_asserts on it.
+     *
+     * @pre The calling thread holds a pin. Reclamation here is epoch-based, so taking a
+     *      segment outside one is meaningless: nothing would stop the epoch advancing past
+     *      the point where this handle is safe to deref.
+     * 
+     * @note **A full rotation, not one step.** A slot retired at stage `r` only reaches a
+     *       thread pinned at `r + 2`, so a single advance cannot surface it; giving up after
+     *       one made a pool with free capacity report exhaustion, which `admit::None` turns
+     *       into a refused enqueue. The loop is bounded by the rotation length, so a pool that
+     *       really is full still reports the memory bound rather than spinning on it.
+     *
+     * @note This does **not** re-publish the pin after a rotation, and must not. The pin is
+     *       the only protection there is -- `protect()` is a no-op, because it is epoch-wide --
+     *       so moving it forward would let the stage pass the point where a segment the
+     *       *caller* is still holding becomes reusable. `LinkedProxy::enqueue` holds a
+     *       protected tail across this call and keeps using it afterwards. Progress does not
+     *       need it either: a rotation sweeps the flipping bucket into the cache, and `take()`
+     *       looks there first.
+     */
     std::optional<handle> acquire() {
-        std::size_t idx = 0;
-        if (free_list().dequeue(idx)) return make_handle(idx);
+        auto_pin pinned_here{*this};
 
-        // Nothing free. If every pinned thread is up to date we can advance, which
-        // releases whatever has been sitting in limbo for two epochs.
-        if (try_advance(epoch_.load(std::memory_order_acquire)) && free_list().dequeue(idx))
-            return make_handle(idx);
-        return std::nullopt;
+        std::size_t idx = 0;
+        bool got = false;
+        for (unsigned attempt = 0; attempt <= kStages; ++attempt) {
+            if (take(pin_stage(), idx)) { got = true; break; }
+            // Nothing reachable from this thread's stage. If every pinned thread is up to
+            // date the rotation can move, which sweeps the flipping bucket into the cache and
+            // brings the bucket retired two stages ago within reach.
+            if (!try_advance(pin_stage())) break; // cannot rotate: nothing to wait for
+        }
+        if (!got) return std::nullopt;
+        bool op = segments_[idx]->reopen();
+#ifdef NDEBUG
+        (void) op;
+#else
+        assert(op && "Pool::acquire: segment that could have been reopened didnt");
+#endif
+        return make_handle(idx);
     }
 
     /**
      * @brief Return a segment that was never published.
      *
-     * Straight to the free bucket: no other thread can hold a reference to something
-     * that was never linked, so there is nothing to wait for.
+     * Straight to the cache, bypassing the rotation entirely: no other thread can hold a
+     * reference to something that was never linked, so there is nothing to wait for, and
+     * making it sit out two advances would be latency for nothing.
+     *
+     * @note No pin needed, unlike acquire() and retire(). The cache sits outside the rotation
+     *       entirely, so nothing here depends on the stage and there is no epoch to protect.
      */
-    void discard(handle h) noexcept { free_list().enqueue(h.index()); }
+    void discard(handle h) noexcept {
+        // Cannot fail: the cache holds N and there are only N indices in existence.
+        const bool ok = cache_.enqueue(h.index());
+        assert(ok && "Pool::discard: the reuse cache refused an index it must have room for");
+        (void)ok;
+    }
 
     /**
      * @brief Retire a segment that was reachable.
      *
-     * Into the current epoch's stage bucket; it becomes reusable two advances later,
-     * by which time no thread pinned when it was still linked can remain.
+     * Into the current stage's bucket; it becomes reusable two rotations later, by which time
+     * no thread pinned when it was still linked can remain.
      */
     void retire(handle h) noexcept {
-        limbo(epoch_.load(std::memory_order_acquire)).enqueue(h.index());
+        auto_pin pinned_here{*this};
+        // Into `current` for the **global** stage -- deliberately not this thread's published
+        // one, which is what pops use.
+        //
+        // The grace period has to be measured from when the segment stopped being reachable,
+        // and that is now. Retiring into the retiring thread's own stage measures it from
+        // where that thread happens to be: a straggler pinned at `p-1` would file a segment
+        // into `bucket(p-1)`, two rotations from free, while a reader pinned at `p` is still
+        // holding it -- and a pin at `p` permits the stage to reach `p+1`, which is exactly
+        // when that bucket is handed out. That is a live segment recycled under a reader, and
+        // it shows up as duplicates rather than a crash.
+        //
+        // Still phase-safe: fills land only in `bucket(g)`, pops come from `bucket(p+2)` for
+        // `p` in `{g-1, g}`, i.e. `{g+1, g+2}`. A rotation between this load and the enqueue
+        // moves the push into `grace`, which is also a fill-phase bucket, and cannot happen
+        // twice -- a straggler's own pin blocks the second.
+        bucket(stage()).enqueue(h.index());
     }
 
     /// Fold @p op over every attached thread's caller-owned payload. See Hazard's copy.
@@ -215,20 +366,109 @@ public:
 
     // -- exposed for deterministic testing of the epoch machine ------------------
 
-    /// Current global epoch.
-    uint64_t epoch() const noexcept { return epoch_.load(std::memory_order_acquire); }
+    /// Current stage, 0..kStages-1. Wraps: EBR has no ABA to protect against here, because a
+    /// thread is either pinned at the current stage or it blocks the advance outright.
+    uint8_t epoch() const noexcept { return stage(); }
 
-    /// Attempt one epoch advance. @return true if the epoch moved.
-    bool try_advance_epoch() noexcept { return try_advance(epoch_.load(std::memory_order_acquire)); }
+    /// Attempt one advance. @return true if the stage moved.
+    bool try_advance_epoch() noexcept { return try_advance(stage()); }
 
-    /// Indices currently reusable.
-    std::size_t free_count() const noexcept { return free_list().size(); }
+    /// Indices that acquire() could hand out right now, without rotating.
+    ///
+    /// @note Deliberately unpinned, and therefore approximate under concurrency: it reads a
+    ///       bucket chosen from the global stage, which may move under it. Pinning inside a
+    ///       const accessor would perturb the very epoch state the tests inspect through it.
+    std::size_t free_count() const noexcept {
+        return cache_.size() + bucket(rotate(stage(), 2)).size();
+    }
+
+    /// Indices parked in the reuse cache, i.e. discarded rather than retired.
+    std::size_t cache_count() const noexcept { return cache_.size(); }
 
 private:
-    using Ring = mem::detail::RingSlab::Ring;
+    using Bucket = algo::PhasedBucket<N>;
+    using Cache = algo::CacheRing<N>;
 
-    Ring& limbo(uint64_t e) const noexcept { return *buckets_.get(e % kStages); }
-    Ring& free_list() const noexcept { return *buckets_.get(kFreeBucket); }
+    // ---- stage arithmetic -----------------------------------------------------
+    //
+    // Every role is the stage plus an offset, modulo four. Named rather than inlined because
+    // an off-by-one here is a silent reclamation bug, not a crash.
+
+    uint8_t stage() const noexcept { return stage_.load(std::memory_order_acquire); }
+
+    static constexpr uint8_t rotate(uint8_t s, uint8_t by) noexcept {
+        return static_cast<uint8_t>((s + by) & kStageMask);
+    }
+
+    /**
+     * @brief The stage this thread published when it pinned.
+     *
+     * **Every bucket role is derived from this, never from the global stage.** Pins span at
+     * most two stages -- `try_advance` refuses while anyone is further behind -- so with roles
+     * taken from the pinned stage `p`:
+     *
+     * ```
+     *   fills go to  bucket(p)      for p in {g-1, g}   ->  buckets {g-1, g}
+     *   pops come from bucket(p+2)  for p in {g-1, g}   ->  buckets {g+1, g+2}
+     * ```
+     *
+     * Those two sets are disjoint, which is the entire reason there are four stages and what
+     * lets the buckets be algo::PhasedBucket. Deriving the roles from the *global* stage
+     * instead breaks it: a thread pinned at `g` would pop `bucket(g+1)`, and the moment the
+     * rotation moves that same bucket becomes `current(g+1)` and is filled -- a pop meeting a
+     * push, which is precisely what PhasedBucket forbids. That is not theoretical; it trips
+     * PhasedBucket's own assertion within a few hundred milliseconds of stress.
+     */
+    uint8_t pin_stage() noexcept {
+        return static_cast<uint8_t>(registry_.self()->data.state.load(std::memory_order_relaxed) &
+                                    kStageMask);
+    }
+
+    /**
+     * @brief Publish a pin at the current stage, and make sure it landed in time.
+     *
+     * The loop is not belt and braces. Between loading the stage and storing it, this thread
+     * is **invisible** to `try_advance`: its state word still reads unpinned, so it blocks
+     * nothing. The rotation can therefore move more than once in that window, and the thread
+     * would go on to publish a stage two or more behind -- at which point pins no longer span
+     * two stages, the fill and pop sets stop being disjoint, and a push lands in a bucket
+     * somebody is draining. That is not theoretical: it corrupts a bucket within a few hundred
+     * milliseconds of stress, and surfaces as a stale cell one whole rotation later.
+     *
+     * Re-reading after the store closes it. The store and the advance scan are both sequentially
+     * consistent, so they are totally ordered: either the scan sees this pin and refuses, or
+     * this re-read sees the advance and tries again. Once the re-read agrees, any later advance
+     * can move by one at most, which is the invariant everything else rests on.
+     */
+    uint8_t publish(Node* n) noexcept {
+        for (;;) {
+            const uint8_t s = stage();
+            n->data.state.store(static_cast<uint8_t>(kPinned | s), std::memory_order_seq_cst);
+            if (stage() == s) return s;
+        }
+    }
+
+
+    Bucket& bucket(uint8_t s) const noexcept { return buckets_[s]; }
+
+    /**
+     * @brief Take a reusable index for a thread pinned at @p p, cheapest source first.
+     *
+     * The failing dequeue on `bucket(p + 2)` is load-bearing beyond just reporting empty:
+     * algo::PhasedBucket clears its tail only on a dequeue that fails, and that bucket becomes
+     * `current` two rotations later. Testing `size()` instead would leave the tail where the
+     * drain left it, and the next fill would write past the end of the array.
+     */
+    bool take(uint8_t p, std::size_t& idx) noexcept {
+        if (cache_.dequeue(idx)) return true;   // never published: no grace owed
+        return bucket(rotate(p, 2)).dequeue(idx);
+    }
+
+    /// Is the calling thread inside a pin()?
+    bool pinned() noexcept {
+        const Node* n = registry_.self();
+        return n && (n->data.state.load(std::memory_order_relaxed) & kPinned) != 0;
+    }
 
     /// Stamp a fresh version onto @p idx. The counter is free-running; the handle folds it
     /// into the bits it has and skips 0, which is reserved for nil.
@@ -243,9 +483,9 @@ private:
      * Three tiers, cheapest first: a thread-local read; then a lock-free claim of a node that
      * is already free; then, only if the registry has none, an allocation. The last tier can
      * throw, and this is reached from `pin()`, which is noexcept -- so an allocation failure
-     * terminates. That is the same bargain `retire()` already makes by pushing onto a vector
-     * in a noexcept function, and it is why `join()` exists: holding a session for the life
-     * of the thread keeps every later operation on the first tier.
+     * terminates. That is the same bargain `retire()` already makes, and it is why `join()`
+     * exists: holding a session for the life of the thread keeps every later operation on the
+     * first tier.
      */
     Node* node() {
         if (Node* n = registry_.self()) return n;
@@ -255,45 +495,76 @@ private:
     }
 
     /**
-     * @brief Advance the epoch if every pinned thread has already published @p e.
+     * @brief Rotate the roles by one, if it is safe and if it would achieve anything.
      *
-     * A thread pinned at an older epoch may still be reading something retired then, so
-     * the epoch must wait for it. Unpinned threads hold nothing, and detached threads are
-     * not walked at all.
+     * Two refusals, for different reasons:
      *
-     * The functor is idempotent, as ThreadRegistry requires: visiting the same node twice
-     * asks the same question and gets the same answer.
+     *  - **A pinned thread is behind.** It may still be reading something retired at its
+     *     stage, so the bucket that would become `free` is not safe yet. This is the property
+     *     the whole scheme rests on, and it is also what keeps `next -> current` from turning
+     *     into pops meeting pushes.
+     *  - **Another thread is already rotating.** The drain of the flipping bucket has to be
+     *     exclusive and has to complete before the new stage is published.
+     *
+     * @note No bucket work happens here. Nothing is drained, nothing is reset; the rotation
+     *       is a single CAS on the stage. See the class note.
      */
-    bool try_advance(uint64_t e) noexcept {
+    bool try_advance(uint8_t s) noexcept {
         // Short-circuits on the first thread that is behind, which is the common reason to
         // refuse: no point asking the rest.
-        const bool everyone_current = registry_.all_of([e](const ThreadData& d) noexcept {
-            const uint64_t st = d.state.load(std::memory_order_seq_cst);
-            if (bit::get_msb(st) == 0) return true;   // not pinned: holds nothing
-            return bit::clear_msb(st) == e;           // pinned: must be up to date
+        const bool everyone_current = registry_.all_of([s](const ThreadData& d) noexcept {
+            const uint8_t st = d.state.load(std::memory_order_seq_cst);
+            if ((st & kPinned) == 0) return true;      // not pinned: holds nothing
+            return (st & kStageMask) == s;             // pinned: must be at this stage
         });
         if (!everyone_current) return false;
 
-        uint64_t expected = e;
-        if (!epoch_.compare_exchange_strong(expected, e + 1, std::memory_order_acq_rel,
-                                            std::memory_order_acquire))
+        // Take the rotation exclusively. The drain below has to finish *before* the new stage
+        // is published, or threads pinning at s + 1 start filling the very bucket a straggling
+        // drainer is still popping. A second CAS is the cheapest way to say "one winner"; the
+        // alternative, draining after publishing, is the overlap PhasedBucket forbids.
+        bool expected_flag = false;
+        if (!rotating_.compare_exchange_strong(expected_flag, true, std::memory_order_acquire,
+                                               std::memory_order_relaxed))
             return false;
+        if (stage() != s) { // somebody rotated between the scan and the claim
+            rotating_.store(false, std::memory_order_release);
+            return false;
+        }
 
-        // Exactly one thread wins the CAS, so exactly one drains. Everything retired two
-        // epochs ago is now beyond the reach of any pin and becomes reusable.
-        Ring& safe = limbo(e + 2);
+        // Empty the bucket that is about to flip from draining to filling. Its contents are
+        // free indices that only a thread a stage behind could otherwise reach -- and the scan
+        // above just established there is no such thread, so without this they would be
+        // stranded until the rotation came round again, which is itself blocked on this
+        // bucket. Moving them to the cache is safe: nothing fills bucket(s + 1) until the
+        // store below publishes s + 1, and this claim makes us the only drainer.
+        Bucket& flipping = bucket(rotate(s, 1));
         std::size_t idx = 0;
-        while (safe.dequeue(idx)) free_list().enqueue(idx);
+        while (flipping.dequeue(idx)) (void)cache_.enqueue(idx);
+        // That final failing dequeue is also what clears the bucket's tail for the fill phase
+        // it is about to enter.
+
+        stage_.store(rotate(s, 1), std::memory_order_release);
+        rotating_.store(false, std::memory_order_release);
         return true;
     }
 
     Registry registry_;
-    mutable mem::detail::RingSlab buckets_;
-    std::vector<std::atomic<uint64_t>> versions_;
-    std::vector<mem::unique_block<S>> segments_;
-
-    ALIGNED_CACHE std::atomic<uint64_t> epoch_{0};
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
+    /// The rotation. Sized at compile time, so these are members: no slab, no allocation.
+    mutable Bucket buckets_[kStages];
+    /// Discarded indices, outside the rotation entirely. Genuinely MPMC, hence a ring rather
+    /// than a fifth phased bucket.
+    mutable Cache cache_;
+    /// Per-slot reuse counters, feeding the version half of every handle.
+    std::atomic<uint64_t> versions_[N]{};
+    /// The pooled segments themselves. N is a template parameter, so these are members
+    /// rather than a heap vector: one allocation per segment and none for the array.
+    mem::unique_block<S> segments_[N];
+    ALIGNED_CACHE std::atomic<uint8_t> stage_{0};
+    /// Held across a rotation so the drain of the flipping bucket finishes before the new
+    /// stage is visible. Rotations are rare -- only when a thread finds nothing to acquire.
+    std::atomic<bool> rotating_{false};
+    CACHE_PAD_TYPES(std::atomic<uint8_t>, std::atomic<bool>);
 };
 
 } // namespace mem::source

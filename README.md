@@ -116,12 +116,28 @@ reclamation scheme:
 dry, which is a *source that runs out* rather than a rule the proxy enforces. That
 observation is what collapses four proxies into one.
 
-`source::Pool` owns its epoch-based reclamation — three limbo buckets and a separate free
-list — and reuses segments, so it `static_assert`s on `segment_traits<S>::recyclable`. Its
-handles are `mem::VersionedIndex<N>`, sized by the pool: the index gets the `log2(N)` bits it
-actually needs and the version gets the rest, so a pool of 8 has a 61-bit ABA counter rather
-than the 32 a fixed split left it. `N` therefore appears both in the segment's
+Reopening a recycled segment is the **source's** job, not the traversal's: `source::Pool`
+reopens inside `acquire()`, so the proxy never asks whether its source recycles. And when the
+pool comes up empty the proxy looks once more for a successor another producer may have just
+linked before reporting the bound — losing that race is not the same as being full.
+
+`source::Pool` owns its epoch-based reclamation and `static_assert`s on
+`segment_traits<S>::recyclable`. Its handles are `mem::VersionedIndex<N>`, sized by the pool: the
+index gets the `log2(N)` bits it needs and the version gets the rest, so a pool of 8 has a 61-bit
+ABA counter rather than the 32 a fixed split left it. `N` therefore appears both in the segment's
 `IndexHandle<N>` and in the proxy alias, and `LinkedProxy` static_asserts that the two agree.
+
+Reclamation is **four buckets in a rotation**, roles taken from the stage modulo four:
+`current` receives retirements, `grace` catches late ones from a thread a stage behind, `free` is
+what `acquire()` pops, and `next` is about to become `current`. Four rather than three is what
+lets the buckets be `algo::PhasedBucket` — a single `fetch_add` at each end, no per-cell sequence
+word, no padding — because a bucket is then never filled and drained at the same time. Every role
+is derived from the stage a thread **pinned** at, never the global one: pins span two stages, so
+fills land in `{g-1, g}` and pops come from `{g+1, g+2}`, and those sets are disjoint.
+
+Discards skip the rotation entirely. A segment nobody ever saw owes no grace period, so it goes
+straight to an `algo::CacheRing` — genuinely MPMC, one word per cell, ABA-safe on a single CAS —
+and `acquire()` looks there first.
 
 Both sources find their participating threads through `util::threading::ThreadRegistry`, an
 unbounded lock-free registry. Each thread's state — a hazard pointer and its retire list, or an
@@ -152,6 +168,13 @@ stalled `CAS(head, A, B)` from succeeding when the head is A *again* rather than
 publishing a node another thread owns. Immortal nodes rule out use-after-free but not that.
 On x86-64 with `-mcx16` the pair is one `cmpxchg16b`, so attach and detach are both lock-free
 CAS loops; `ThreadRegistry::free_list_is_lock_free` reports whether that held on the target.
+
+`size()` is two parts: a running total for threads that have departed, plus a fold over those
+still attached. A per-thread counter stops being reachable the moment its thread detaches, so
+without the first part a producer that enqueued and then left took its count with it and the
+queue under-reported for the rest of its life. A departing thread folds its tally in and clears
+its payload, so whoever inherits the recycled node starts from zero rather than from the last
+owner's tally and stale close hint. `ProxyAccountingTest` covers both halves.
 
 Item admission *reserves* rather than testing-then-acting, so the bound is hard: a plain
 check followed by an enqueue let every producer that passed the check commit, overshooting
@@ -220,6 +243,9 @@ including the Python tooling, which asks the binary what exists.
 | `MemoryLayoutTest` | single-block layout arithmetic |
 | `PoolReclamationTest` | the pooled source's epoch machine, driven deterministically |
 | `ThreadRegistryTest` | attach/detach/recycle, and that a scan never misses a stable thread |
+| `ThreadPinnerTest` | core placement rule and topology parsing |
+| `ProxyAccountingTest` | `size()` across threads that join and leave |
+| `BucketTest` | the phased and cache index buckets the pool is built from |
 | `ConcurrencyTest` | loss, duplication and per-producer FIFO across thread shapes |
 
 Concurrency defects here are intermittent — a lost-item bug reproduced in 3 runs of 8, a

@@ -3,9 +3,9 @@ cmake_minimum_required(VERSION 3.20)
 # ============================================================
 # Toolchain selection -- must happen before project()
 # ============================================================
-# Default to clang when it is installed, so compile_commands.json records the same
-# compiler a clangd-based editor uses. Mixing them (database says GCC, editor runs
-# clangd) makes clangd guess at system include paths from GCC's driver, which is a
+# Default to clang when it is installed, compile_commands.json records the same
+# compiler a clangd-based editor. Mixing them (database says GCC, editor runs
+# clangd) makes clangd guess at system include paths from GCC's driver,
 # common source of phantom "file not found" diagnostics.
 #
 # Override with any of:
@@ -99,9 +99,9 @@ set(TOPOLOGY_OUTPUT ${CMAKE_BINARY_DIR}/sys.topo)
 set(TOPOLOGY_SCRIPT ${CMAKE_SOURCE_DIR}/python/mpmc_bench/topology/generator.py)
 
 if(BUILD_BENCHMARK)
-    # Note the guard is on BUILD_BENCHMARK alone. Testing EXISTS here too would mean that
-    # moving or renaming the script skips generation *silently*, leaving a stale sys.topo
-    # and a quietly broken `benchmark ... pin`. A missing script is worth saying out loud.
+    # guard is on BUILD_BENCHMARK alone. Testing EXISTS here too would mean that
+    # moving script skips generation *silently*, leaving a stale sys.topo
+    # and a quietly broken `benchmark ... pin`.
     if(NOT EXISTS ${TOPOLOGY_SCRIPT})
         message(WARNING "Topology generator not found at ${TOPOLOGY_SCRIPT}; "
                         "benchmark 'pin' will be unavailable")
@@ -109,7 +109,10 @@ if(BUILD_BENCHMARK)
         find_package(Python3 COMPONENTS Interpreter)
         if(Python3_FOUND)
             execute_process(
-                COMMAND ${Python3_EXECUTABLE} ${TOPOLOGY_SCRIPT} --pin_cluster ${TOPOLOGY_OUTPUT}
+                COMMAND 
+                  ${Python3_EXECUTABLE} 
+                  ${TOPOLOGY_SCRIPT} 
+                  --pin_cluster ${TOPOLOGY_OUTPUT}
                 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
                 RESULT_VARIABLE topo_result
                 OUTPUT_QUIET ERROR_QUIET
@@ -117,7 +120,8 @@ if(BUILD_BENCHMARK)
             if(topo_result EQUAL 0)
                 message(STATUS "Topology written to ${TOPOLOGY_OUTPUT}")
             else()
-                message(WARNING "Topology generation failed; benchmark 'pin' will be unavailable")
+                message(WARNING "Topology generation failed; 
+                benchmark 'pin' will be unavailable")
             endif()
         endif()
     endif()
@@ -128,7 +132,9 @@ endif()
 # ============================================================
 if(BUILD_TESTING_MPMC)
     enable_testing()
-    add_subdirectory(${PROJECT_SOURCE_DIR}/cmake/extern/googletest EXCLUDE_FROM_ALL)
+    add_subdirectory(
+      ${PROJECT_SOURCE_DIR}/cmake/extern/googletest 
+      EXCLUDE_FROM_ALL)
 endif()
 
 # ============================================================
@@ -141,7 +147,7 @@ target_compile_definitions(timeTicks PRIVATE NDEBUG)
 # ============================================================
 # Benchmark
 # ============================================================
-# One binary covering every registered implementation, selected by name at startup
+# binary covering every registered implementation, selected by name at startup
 # through a compile-time fold over the registry (include/registry/Registry.hpp).
 if(BUILD_BENCHMARK)
     add_executable(benchmark src/bench/main.cpp)
@@ -150,18 +156,17 @@ if(BUILD_BENCHMARK)
         target_compile_options(benchmark PRIVATE ${MPMC_LTO_FLAG})
         target_link_options(benchmark PRIVATE ${MPMC_LTO_FLAG})
     endif()
-    target_compile_definitions(benchmark PRIVATE CORE_TOPOLOGY="${TOPOLOGY_OUTPUT}")
+    target_compile_definitions(
+    benchmark 
+    PRIVATE CORE_TOPOLOGY="${TOPOLOGY_OUTPUT}")
 endif()
 
 # ============================================================
 # Unit tests
 # ============================================================
 if(BUILD_TESTING_MPMC)
-    # An explicit list, not a glob. A glob picks up whatever happens to be sitting in the
-    # directory -- this tree had a SegmentRecyclerTest.cpp.errored_out parked beside the
-    # real tests -- and needs a reconfigure before it notices a new file.
     set(UNIT_TESTS
-        RegistryConformanceTest   # contract + sequential behaviour, every registry entry
+      RegistryConformanceTest # contract + sequential behaviour, every registry entry
         SegmentLifecycleTest      # close/reopen/link, per segment type, directly
         TaggingTest               # cell tagging policies
         AdmissionTest             # bound enforcement, per admission policy
@@ -170,6 +175,8 @@ if(BUILD_TESTING_MPMC)
         ConcurrencyTest           # MPMC loss/duplication/ordering, several thread shapes
         ThreadRegistryTest        # the lock-free thread registry both sources are built on
         ThreadPinnerTest          # core placement rule and topology parsing
+        ProxyAccountingTest       # size() across threads that join and leave
+        BucketTest                # the phased and cache index buckets
     )
 
     foreach(test_name IN LISTS UNIT_TESTS)
