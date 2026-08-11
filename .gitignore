@@ -48,7 +48,7 @@ compile_commands.json
 .zed
 
 # cmake
-build
+build*
 cmake/*
 
 # scripts

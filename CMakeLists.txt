@@ -130,11 +130,39 @@ endif()
 # ============================================================
 # Third-party
 # ============================================================
+# GoogleTest, from whichever of three places is available -- in that order:
+#
+#   1. -DGTEST_DIR=/path/to/tree   an explicit local checkout; nothing is downloaded
+#   2. cmake/extern/googletest     a checkout sitting in-tree, the historical layout
+#   3. FetchContent                cloned from GTEST_REPO at GTEST_TAG, cached in the
+#                                  build directory
+#
+# The point of (3) is that a fresh machine needs no manual step: `cmake -S . -B build` is
+# enough. The point of keeping (1) and (2) is that a machine without network still builds
+# from a tree copied by hand.
+set(GTEST_DIR "" CACHE PATH "Local GoogleTest checkout; empty to search then fetch")
+set(GTEST_REPO "https://github.com/MPiras055/googletest-minimal.git"
+    CACHE STRING "Git remote used when no local GoogleTest is found")
+set(GTEST_TAG "main" CACHE STRING "Ref to fetch from GTEST_REPO")
+
 if(BUILD_TESTING_MPMC)
     enable_testing()
-    add_subdirectory(
-      ${PROJECT_SOURCE_DIR}/cmake/extern/googletest 
-      EXCLUDE_FROM_ALL)
+
+    if(GTEST_DIR AND EXISTS "${GTEST_DIR}/CMakeLists.txt")
+        message(STATUS "GoogleTest: local tree at ${GTEST_DIR}")
+        add_subdirectory(${GTEST_DIR} ${CMAKE_BINARY_DIR}/googletest-build EXCLUDE_FROM_ALL)
+    elseif(EXISTS "${PROJECT_SOURCE_DIR}/cmake/extern/googletest/CMakeLists.txt")
+        message(STATUS "GoogleTest: in-tree at cmake/extern/googletest")
+        add_subdirectory(${PROJECT_SOURCE_DIR}/cmake/extern/googletest EXCLUDE_FROM_ALL)
+    else()
+        message(STATUS "GoogleTest: fetching ${GTEST_REPO}@${GTEST_TAG}")
+        include(FetchContent)
+        FetchContent_Declare(googletest
+            GIT_REPOSITORY ${GTEST_REPO}
+            GIT_TAG        ${GTEST_TAG}
+            GIT_SHALLOW    TRUE)
+        FetchContent_MakeAvailable(googletest)
+    endif()
 endif()
 
 # ============================================================
