@@ -68,31 +68,31 @@ using IdxHQ = seg::HQ<T, meta::EmptyOptions, mem::IndexHandle<N>>;
  * refused enqueue and consumers must keep pulling it back.
  */
 template <typename T>
-using Standalone = meta::TypeList<>;
-//     Entry<"vyukov", queue::Vyukov<T>>,
-//     Entry<"vyukov-noaba", queue::VyukovNoABA<T>>,
-//     Entry<"vyukov-dcas", queue::VyukovDCAS<T>>,
-//     Entry<"scq", queue::SCQ<T>>,
-//     Entry<"pscq", queue::PSCQ<T>>,
-//     Entry<"mutex", queue::Mutex<T>>>;
+using Standalone = meta::TypeList<
+    Entry<"vyukov", queue::Vyukov<T>>,
+    Entry<"vyukov-noaba", queue::VyukovNoABA<T>>,
+    Entry<"vyukov-dcas", queue::VyukovDCAS<T>>,
+    Entry<"scq", queue::SCQ<T>>,
+    Entry<"pscq", queue::PSCQ<T>>,
+    Entry<"mutex", queue::Mutex<T>>>;
 
 // /// Linked queues: proxy x segment. Everything here models core::Proxy.
 template <typename T>
 using Linked = meta::TypeList<
-//     Entry<"u-vyukov", proxy::Unbounded<T, seg::Vyukov<T>>>,
-    // Entry<"u-prq", proxy::Unbounded<T, seg::PRQ<T>>>,
-//     Entry<"u-faaarray", proxy::Unbounded<T, seg::FAAArray<T>>>,
-//     Entry<"u-hq", proxy::Unbounded<T, seg::HQ<T>>>,
-//     Entry<"u-scq", proxy::Unbounded<T, seg::SCQ<T>>>,
+    Entry<"u-vyukov", proxy::Unbounded<T, seg::Vyukov<T>>>,
+    Entry<"u-prq", proxy::Unbounded<T, seg::PRQ<T>>>,
+    Entry<"u-faaarray", proxy::Unbounded<T, seg::FAAArray<T>>>,
+    Entry<"u-hq", proxy::Unbounded<T, seg::HQ<T>>>,
+    Entry<"u-scq", proxy::Unbounded<T, seg::SCQ<T>>>,
 
-//     Entry<"item-vyukov", proxy::ItemBounded<T, seg::Vyukov<T>>>,
-//     Entry<"item-prq", proxy::ItemBounded<T, seg::PRQ<T>>>,
+    Entry<"item-vyukov", proxy::ItemBounded<T, seg::Vyukov<T>>>,
+    Entry<"item-prq", proxy::ItemBounded<T, seg::PRQ<T>>>,
 
-//     Entry<"chunk-vyukov", proxy::ChunkBounded<T, seg::Vyukov<T>>>,
-    // Entry<"chunk-prq", proxy::ChunkBounded<T, seg::PRQ<T>>>,
-//     Entry<"chunk-faaarray", proxy::ChunkBounded<T, seg::FAAArray<T>>>,
-//     Entry<"chunk-scq",proxy::ChunkBounded<T,seg::SCQ<T>>>,
-//     Entry<"item-scq",proxy::ItemBounded<T,seg::SCQ<T>>>>;
+    Entry<"chunk-vyukov", proxy::ChunkBounded<T, seg::Vyukov<T>>>,
+    Entry<"chunk-prq", proxy::ChunkBounded<T, seg::PRQ<T>>>,
+    Entry<"chunk-faaarray", proxy::ChunkBounded<T, seg::FAAArray<T>>>,
+    Entry<"chunk-scq",proxy::ChunkBounded<T,seg::SCQ<T>>>,
+    Entry<"item-scq",proxy::ItemBounded<T,seg::SCQ<T>>>,
 
     // Pooled: the bound is the pool running dry, so the admission policy is None. FAAArray
     // and HQ are here now that their reopen() flips a generation flag instead of failing;
