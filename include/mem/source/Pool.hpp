@@ -123,6 +123,14 @@ class Pool {
     static constexpr uint8_t kPinned = 0x80;
     static constexpr uint8_t kStageMask = kStages - 1;
 
+    /// Advance attempts one acquire() will make: one rotation window and no more. Beyond a
+    /// full lap there is nothing left for a rotation to surface that this thread can reach.
+    static constexpr unsigned kMaxAdvances = kStages;
+    /// Re-checks of the containers while the caller says waiting is still worthwhile. Trades
+    /// a longer stall under contention against reporting a memory bound that is not real;
+    /// raise it first if a pooled proxy starts refusing below its actual capacity.
+    static constexpr unsigned kMaxSpins = 64;
+
     struct alignas(CACHE_LINE) ThreadData {
         std::atomic<uint8_t> state{0};
         [[no_unique_address]] Payload user{};
@@ -268,19 +276,49 @@ public:
      *       protected tail across this call and keeps using it afterwards. Progress does not
      *       need it either: a rotation sweeps the flipping bucket into the cache, and `take()`
      *       looks there first.
+     * @note **Whether to wait is the caller's question, not ours.** Coming up empty means
+     *       "nothing free at this instant", which is not the same fact as "the pool is full",
+     *       and nothing inside the pool can tell the two apart. `@p worth_waiting` is how the
+     *       caller says which one it is looking at: `LinkedProxy` asks whether the tail it
+     *       decided to extend is still the tail with still no successor, because once that
+     *       stops holding there may be no need for a segment at all. The nullary overload
+     *       does not wait, which is the right default for a caller with no opinion.
+     *
+     * @warning The spin runs **while pinned**, so it must stay bounded. Two threads pinned a
+     *          stage apart can each be waiting for the other to advance, and neither can:
+     *          what breaks the tie is one of them giving up, because returning drops its pin
+     *          and that release is exactly what unblocks the other's `try_advance`. An
+     *          unbounded spin here, or a default predicate that waits, reintroduces that
+     *          livelock rather than merely being impolite.
+     *
+     * @param worth_waiting called when the pool is dry and the rotation will not move;
+     *        returning false abandons the attempt.
      */
-    std::optional<handle> acquire() {
+    template <typename Retry>
+    std::optional<handle> acquire(Retry&& worth_waiting) {
         auto_pin pinned_here{*this};
+        // Fixed for the whole call: see the note above on not re-publishing the pin.
+        const uint8_t p = pin_stage();
 
         std::size_t idx = 0;
+        unsigned advances = 0;
         bool got = false;
-        for (unsigned attempt = 0; attempt <= kStages; ++attempt) {
-            if (take(pin_stage(), idx)) { got = true; break; }
+
+        for (unsigned spin = 0;; ++spin) {
+            if (take(p, idx)) { got = true; break; }
             // Nothing reachable from this thread's stage. If every pinned thread is up to
             // date the rotation can move, which sweeps the flipping bucket into the cache and
-            // brings the bucket retired two stages ago within reach.
-            if (!try_advance(pin_stage())) break; // cannot rotate: nothing to wait for
+            // brings the bucket retired two stages ago within reach. Capped at one rotation
+            // window: past that, a thread that still cannot find anything is not waiting on
+            // the rotation, it is waiting on another thread to give a segment back.
+            if (advances < kMaxAdvances) {
+                ++advances;
+                if (try_advance(p)) continue;
+            }
+            if (spin >= kMaxSpins || !worth_waiting()) break;
+            SPIN_HINT();
         }
+
         if (!got) return std::nullopt;
         bool op = segments_[idx]->reopen();
 #ifdef NDEBUG
@@ -290,6 +328,9 @@ public:
 #endif
         return make_handle(idx);
     }
+
+    /// Take a segment if one is free right now, without waiting for anybody.
+    std::optional<handle> acquire() { return acquire([]() noexcept { return false; }); }
 
     /**
      * @brief Return a segment that was never published.
@@ -461,7 +502,12 @@ private:
      */
     bool take(uint8_t p, std::size_t& idx) noexcept {
         if (cache_.dequeue(idx)) return true;   // never published: no grace owed
-        return bucket(rotate(p, 2)).dequeue(idx);
+        if (bucket(rotate(p, 2)).dequeue(idx)) return true;
+        // Look once more. Between the two misses above, another thread may have discard()ed a
+        // segment that was never published, or finished a rotation -- whose sweep empties the
+        // whole flipping bucket into the cache. Both are ordinary rather than exotic, and a
+        // miss on an empty CacheRing costs a load and a compare.
+        return cache_.dequeue(idx);
     }
 
     /// Is the calling thread inside a pin()?

@@ -145,7 +145,7 @@ template <typename Q>
 class Mpmc : public ::testing::Test {};
 
 using AllTypes = registry::AsTypes<registry::All<Item>>::apply<::testing::Types>;
-TYPED_TEST_SUITE(Mpmc, AllTypes);
+TYPED_TEST_SUITE(Mpmc, AllTypes, registry::TestNames<registry::All<Item>>);
 
 TYPED_TEST(Mpmc, NoLossNoDuplicationPerProducerFifo) {
     for (int attempt = 0; attempt < MPMC_REPEATS; ++attempt) {

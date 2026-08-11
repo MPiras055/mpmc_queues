@@ -1,1 +1,0 @@
-/usr/bin/clang++ -g -Xlinker --dependency-file=CMakeFiles/RegistryConformanceTest.dir/link.d CMakeFiles/RegistryConformanceTest.dir/src/test/unit/RegistryConformanceTest.cpp.o -o RegistryConformanceTest  lib/libgtest_main.a lib/libgtest.a

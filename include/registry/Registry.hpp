@@ -10,10 +10,12 @@
 #include <algo/Vyukov.hpp>
 #include <algo/VyukovDCAS.hpp>
 #include <algo/VyukovNoABA.hpp>
+#include <concepts>
 #include <meta/FixedString.hpp>
 #include <variant>
 #include <meta/TypeList.hpp>
 #include <proxy/Aliases.hpp>
+#include <string>
 #include <string_view>
 
 /**
@@ -51,6 +53,8 @@ template <typename T, std::size_t N = kPoolSize>
 using IdxFAAArray = seg::FAAArray<T, meta::EmptyOptions, mem::IndexHandle<N>>;
 template <typename T, std::size_t N = kPoolSize>
 using IdxHQ = seg::HQ<T, meta::EmptyOptions, mem::IndexHandle<N>>;
+template <typename T, std::size_t N = kPoolSize>
+using IdxMutex = seg::Mutex<T, meta::EmptyOptions, mem::IndexHandle<N>>;
 
 
 /**
@@ -76,7 +80,18 @@ using Standalone = meta::TypeList<
     Entry<"pscq", queue::PSCQ<T>>,
     Entry<"mutex", queue::Mutex<T>>>;
 
-// /// Linked queues: proxy x segment. Everything here models core::Proxy.
+/**
+ * @brief Linked queues: proxy x segment. Everything here models core::Proxy.
+ *
+ * The full grid -- four proxies over six segments. Kept complete rather than curated: the
+ * point of the registry is that a combination costs one line, so leaving cells empty only
+ * means nobody can benchmark them. `mutex` is in every family on purpose; a lock-based
+ * segment under each proxy is the baseline the lock-free ones are worth measuring against.
+ *
+ * @note Segment spelling is not uniform (`faaarray` in three families, `faa` in the pooled
+ *       one). Left alone deliberately: the names appear in saved benchmark CSVs, and a
+ *       rename would silently orphan them.
+ */
 template <typename T>
 using Linked = meta::TypeList<
     Entry<"u-vyukov", proxy::Unbounded<T, seg::Vyukov<T>>>,
@@ -84,15 +99,21 @@ using Linked = meta::TypeList<
     Entry<"u-faaarray", proxy::Unbounded<T, seg::FAAArray<T>>>,
     Entry<"u-hq", proxy::Unbounded<T, seg::HQ<T>>>,
     Entry<"u-scq", proxy::Unbounded<T, seg::SCQ<T>>>,
+    Entry<"u-mutex", proxy::Unbounded<T, seg::Mutex<T>>>,
 
     Entry<"item-vyukov", proxy::ItemBounded<T, seg::Vyukov<T>>>,
     Entry<"item-prq", proxy::ItemBounded<T, seg::PRQ<T>>>,
+    Entry<"item-faaarray", proxy::ItemBounded<T, seg::FAAArray<T>>>,
+    Entry<"item-hq", proxy::ItemBounded<T, seg::HQ<T>>>,
+    Entry<"item-scq", proxy::ItemBounded<T, seg::SCQ<T>>>,
+    Entry<"item-mutex", proxy::ItemBounded<T, seg::Mutex<T>>>,
 
     Entry<"chunk-vyukov", proxy::ChunkBounded<T, seg::Vyukov<T>>>,
     Entry<"chunk-prq", proxy::ChunkBounded<T, seg::PRQ<T>>>,
     Entry<"chunk-faaarray", proxy::ChunkBounded<T, seg::FAAArray<T>>>,
-    Entry<"chunk-scq",proxy::ChunkBounded<T,seg::SCQ<T>>>,
-    Entry<"item-scq",proxy::ItemBounded<T,seg::SCQ<T>>>,
+    Entry<"chunk-hq", proxy::ChunkBounded<T, seg::HQ<T>>>,
+    Entry<"chunk-scq", proxy::ChunkBounded<T, seg::SCQ<T>>>,
+    Entry<"chunk-mutex", proxy::ChunkBounded<T, seg::Mutex<T>>>,
 
     // Pooled: the bound is the pool running dry, so the admission policy is None. FAAArray
     // and HQ are here now that their reopen() flips a generation flag instead of failing;
@@ -101,7 +122,8 @@ using Linked = meta::TypeList<
     Entry<"mem-prq", proxy::MemBounded<T, IdxPRQ<T>, kPoolSize>>,
     Entry<"mem-scq", proxy::MemBounded<T, IdxSCQ<T>, kPoolSize>>,
     Entry<"mem-faa", proxy::MemBounded<T, IdxFAAArray<T>, kPoolSize>>,
-    Entry<"mem-hq", proxy::MemBounded<T, IdxHQ<T>, kPoolSize>>
+    Entry<"mem-hq", proxy::MemBounded<T, IdxHQ<T>, kPoolSize>>,
+    Entry<"mem-mutex", proxy::MemBounded<T, IdxMutex<T>, kPoolSize>>
     >;
 
 /// Everything, for the benchmark.
@@ -173,6 +195,54 @@ struct ToTypes<meta::TypeList<Es...>> {
 /// Expand a registry list into a gtest type list: registry::AsTypes<List>::apply<::testing::Types>
 template <typename List>
 using AsTypes = detail::ToTypes<List>;
+
+namespace detail {
+template <typename Q, typename... Es>
+constexpr std::string_view lookup_name(meta::TypeList<Es...>) noexcept {
+    std::string_view found{};
+    // Short-circuits on the match; `found` stays empty for a type that is not registered.
+    ((std::same_as<Q, typename Es::type> ? (found = Es::name.view(), true) : false) || ...);
+    return found;
+}
+} // namespace detail
+
+/// The registry name of @p Q, or an empty view when @p Q is not in @p List.
+template <typename List, typename Q>
+inline constexpr std::string_view name_of = detail::lookup_name<Q>(List{});
+
+/**
+ * @brief gtest type-parameter names, taken from the registry.
+ *
+ * Without this a typed suite over the registry identifies its cases by index, and a failure
+ * reports the type by its fully expanded template-id -- for a pooled entry that is a
+ * `LinkedProxy<Data*, algo::Mutex<Data*, OptionsPack<>, Node<IndexHandle<8>>>, admit::None,
+ * Pool<...same segment again..., 8, ThreadMeta<VersionedIndex<8>>>>`, which says nothing a
+ * reader did not already know and cannot be typed into `--gtest_filter`.
+ *
+ * The names are already in the registry, so this just reads them back:
+ *
+ * ```cpp
+ * TYPED_TEST_SUITE(Mpmc, AllTypes, registry::TestNames<registry::All<Item>>);
+ * ```
+ *
+ * turns `Mpmc/24.Foo` into `Mpmc/mem_mutex.Foo`.
+ *
+ * @note Hyphens become underscores: gtest requires the suffix to be alphanumeric, and a
+ *       name it rejects is a run-time abort rather than a compile error.
+ */
+template <typename List>
+struct TestNames {
+    template <typename Q>
+    static std::string GetName(int i) {
+        const std::string_view n = name_of<List, Q>;
+        if (n.empty()) return std::to_string(i); // unregistered: fall back to gtest's index
+        std::string out{n};
+        for (char& c : out)
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')))
+                c = '_';
+        return out;
+    }
+};
 
 /**
  * @brief Call @p f with the entry whose name matches @p name.

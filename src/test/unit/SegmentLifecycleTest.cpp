@@ -15,6 +15,7 @@
 
 #include <algo/FAAArray.hpp>
 #include <algo/HQ.hpp>
+#include <algo/Mutex.hpp>
 #include <algo/PRQ.hpp>
 #include <algo/SCQ.hpp>
 #include <algo/Vyukov.hpp>
@@ -51,7 +52,8 @@ protected:
 };
 
 using SegmentTypes = ::testing::Types<
-    seg::Vyukov<Item>, seg::PRQ<Item>, seg::FAAArray<Item>, seg::HQ<Item>, seg::SCQ<Item>>;
+    seg::Vyukov<Item>, seg::PRQ<Item>, seg::FAAArray<Item>, seg::HQ<Item>, seg::SCQ<Item>,
+    seg::Mutex<Item>>;
 TYPED_TEST_SUITE(SegmentLifecycle, SegmentTypes);
 
 TYPED_TEST(SegmentLifecycle, StartsOpenWithNoSuccessor) {

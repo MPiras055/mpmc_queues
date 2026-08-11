@@ -42,7 +42,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-option(SANITIZE_ADDR      "Build tests with AddressSanitizer" OFF)
+option(SANITIZE_ADDR      "Build tests with AddressSanitizer" ON)
 option(SANITIZE_THREAD    "Build tests with ThreadSanitizer"  OFF)
 option(BUILD_BENCHMARK    "Build the throughput benchmark"    ON)
 option(BUILD_TESTING_MPMC "Build the unit tests"              ON)
@@ -87,7 +87,7 @@ find_package(Threads REQUIRED)
 
 # Convenience bundle: headers + warnings + threads, with no opinion on optimisation.
 add_library(mpmc INTERFACE)
-target_link_libraries(mpmc INTERFACE project_includes project_flags Threads::Threads)
+target_link_libraries(mpmc INTERFACE project_includes project_flags Threads::Threads atomic)
 
 # ============================================================
 # Topology generation (configure time)
@@ -184,6 +184,21 @@ if(BUILD_TESTING_MPMC)
         # -O1 -g: optimised enough to shake races loose, still debuggable.
         target_compile_options(${test_name} PRIVATE -O1 -g)
         target_link_libraries(${test_name} PRIVATE mpmc gtest_main)
+
+        # Suppress the type-parameter trailer on typed-test output.
+        #
+        # A registry entry's real type is its fully expanded template-id -- a pooled one runs
+        # to several hundred characters and names the same segment three times -- and gtest
+        # appends it to every typed-test line as `, where TypeParam = ...`. It carries no
+        # information the test's own name does not, now that registry::TestNames labels the
+        # cases (`Mpmc/mem_mutex` rather than `Mpmc/29`).
+        #
+        # GTEST_HAS_RTTI is gtest's documented knob for this (gtest-port.h): with it off,
+        # internal::GetTypeName<T>() returns the literal "<type>" instead of demangling
+        # typeid(T). Scoped to the test executables, and safe here because neither this
+        # project nor its tests use dynamic_cast or typeid -- the whole design is deliberately
+        # free of vtable polymorphism.
+        target_compile_definitions(${test_name} PRIVATE GTEST_HAS_RTTI=0)
 
         if(SANITIZE_ADDR)
             target_compile_options(${test_name} PRIVATE -fsanitize=address -fno-omit-frame-pointer)

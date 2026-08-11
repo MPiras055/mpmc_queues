@@ -198,10 +198,6 @@ public:
         }
 
         H tail = source_.protect(g, tail_.load(std::memory_order_relaxed));
-        // Bounds the retry below: one more attempt per distinct tail. Deliberately a local
-        // and not `me.last_seen` -- that field is the close hint, and writing a retry into it
-        // would make the next enqueue skip a segment it never saw closed.
-        H last_failed = Source::nil();
 
         for (;;) {
             const H observed = tail_.load(std::memory_order_acquire);
@@ -223,19 +219,26 @@ public:
             if (try_enqueue(s, tail, me, item)) break;
 
             // This segment is full or closed. Get another.
-            auto fresh = source_.acquire();
+            //
+            // "The tail I decided to extend is still the tail, and still has no successor."
+            // While that holds, this producer is the one who has to make progress, so waiting
+            // for a segment is the right thing to do -- a source that came up empty may only
+            // have done so because another producer took the last one and is about to link
+            // it, which is a lost race and not a full queue. Once it stops holding there may
+            // be no need for a new segment at all, so stop waiting and re-traverse.
+            //
+            // Safe to deref `s` in here: the pin covers this whole scope and `tail` was
+            // published through protect(), which is what the loop above already relies on.
+            const auto unchanged = [&]() noexcept {
+                return tail_.load(std::memory_order_acquire) == tail &&
+                       s->next() == Source::nil();
+            };
+
+            auto fresh = source_.acquire(unchanged);
             if (!fresh) {
-                // The source has nothing -- but it may have had nothing only because another
-                // producer took the last segment and is about to link it. Losing that race is
-                // not the same as the queue being full, so look once more before reporting a
-                // bound. `last_failed` makes this terminate: a tail that fails twice really
-                // has no successor coming.
-                if (last_failed != tail) {
-                    last_failed = tail;
-                    if (const H nx = s->next(); nx != Source::nil()) {
-                        tail = source_.protect(g, nx);
-                        continue;
-                    }
+                if (!unchanged()) { // lost a race, not out of memory
+                    tail = source_.protect(g, tail_.load(std::memory_order_acquire));
+                    continue;
                 }
                 if constexpr (Admit::bounded) admit_.cancel_admit();
                 return false; // genuinely exhausted: this *is* the memory bound

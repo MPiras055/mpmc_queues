@@ -1,1 +1,0 @@
-/usr/bin/clang++ -g -fsanitize=address -Xlinker --dependency-file=CMakeFiles/SegmentLifecycleTest.dir/link.d CMakeFiles/SegmentLifecycleTest.dir/src/test/unit/SegmentLifecycleTest.cpp.o -o SegmentLifecycleTest  lib/libgtest_main.a lib/libgtest.a

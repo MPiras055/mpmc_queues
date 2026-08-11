@@ -1,1 +1,0 @@
-/usr/bin/clang++ -g -fsanitize=address -Xlinker --dependency-file=CMakeFiles/AdmissionTest.dir/link.d CMakeFiles/AdmissionTest.dir/src/test/unit/AdmissionTest.cpp.o -o AdmissionTest  lib/libgtest_main.a lib/libgtest.a

@@ -142,6 +142,14 @@ public:
         return std::optional<handle>{mem::SingleBlock<S>::create(seg_capacity_)};
     }
 
+    /// Same, ignoring the caller's retry policy: this source cannot run dry, so there is
+    /// never anything to wait for. Present so a proxy can pass one without asking which
+    /// source it has -- see mem::source::Pool::acquire, where it does real work.
+    template <typename Retry>
+    std::optional<handle> acquire(Retry&&) {
+        return acquire();
+    }
+
     /// Never published to another thread, so no scan is needed.
     void discard(handle h) noexcept { mem::SingleBlock<S>::destroy(h); }
 

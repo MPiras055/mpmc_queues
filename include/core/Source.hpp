@@ -65,6 +65,12 @@ concept SegmentSource = requires(Src src, const Src csrc, typename Src::handle h
     { src.deref(h) } noexcept -> std::same_as<S*>;
 
     { src.acquire() } -> std::same_as<std::optional<typename Src::handle>>;
+    /// Same, but the caller supplies a predicate answering "is it still worth waiting?".
+    /// A source that cannot run dry ignores it; a pooled one spins on it rather than
+    /// reporting a memory bound it has no way to distinguish from a lost race.
+    {
+        src.acquire([]() noexcept { return false; })
+    } -> std::same_as<std::optional<typename Src::handle>>;
     { src.discard(h) } noexcept -> std::same_as<void>;
     { src.retire(h) } noexcept -> std::same_as<void>;
 

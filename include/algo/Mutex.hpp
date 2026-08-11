@@ -41,7 +41,23 @@ public:
 
     bool enqueue(T item) noexcept {
         std::lock_guard<std::mutex> g(mu_);
-        if (closed_ || count_ == capacity_) return false;
+        if (closed_) return false;
+        if (count_ == capacity_) {
+            // Full. A *linked* segment closes itself here, and the close is permanent: the
+            // proxy reads a refusal as "link a successor", and from that moment this segment
+            // must refuse every later item even once consumers have drained it and made room.
+            //
+            // Without that, a producer that read next() == nil just before some other
+            // producer linked a successor goes on to enqueue into a segment the consumers
+            // have since drained and unlinked -- the item lands somewhere nothing will ever
+            // traverse, and is counted as enqueued. Every other linked segment closes on
+            // full for this reason; see algo::Vyukov::enqueue.
+            //
+            // Standalone, the opposite is wanted: a bounded queue that has been drained must
+            // accept items again, so the close is conditional on the linkage policy.
+            if constexpr (Link::is_linked) closed_ = true;
+            return false;
+        }
         cells_[tail_] = item;
         tail_ = (tail_ + 1) % capacity_;
         ++count_;

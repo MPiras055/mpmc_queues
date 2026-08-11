@@ -65,7 +65,7 @@ protected:
 };
 
 using AllTypes = registry::AsTypes<registry::All<Item>>::apply<::testing::Types>;
-TYPED_TEST_SUITE(QueueBehaviour, AllTypes);
+TYPED_TEST_SUITE(QueueBehaviour, AllTypes, registry::TestNames<registry::All<Item>>);
 
 TYPED_TEST(QueueBehaviour, EmptyOnCreation) {
     Item out = nullptr;
