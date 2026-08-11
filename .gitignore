@@ -49,7 +49,10 @@ compile_commands.json
 
 # cmake
 build*
-cmake/*
+# Only the vendored third-party checkout, NOT all of cmake/. `cmake/*` also swallowed
+# cmake/clangd.in, which configure_file() needs -- so a fresh clone failed to configure
+# with "File .../cmake/clangd.in does not exist".
+cmake/extern/
 
 # scripts
 *.sh

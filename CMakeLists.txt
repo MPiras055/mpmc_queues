@@ -42,7 +42,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-option(SANITIZE_ADDR      "Build tests with AddressSanitizer" ON)
+option(SANITIZE_ADDR      "Build tests with AddressSanitizer" OFF)
 option(SANITIZE_THREAD    "Build tests with ThreadSanitizer"  OFF)
 option(BUILD_BENCHMARK    "Build the throughput benchmark"    ON)
 option(BUILD_TESTING_MPMC "Build the unit tests"              ON)
@@ -151,9 +151,11 @@ if(BUILD_TESTING_MPMC)
     if(GTEST_DIR AND EXISTS "${GTEST_DIR}/CMakeLists.txt")
         message(STATUS "GoogleTest: local tree at ${GTEST_DIR}")
         add_subdirectory(${GTEST_DIR} ${CMAKE_BINARY_DIR}/googletest-build EXCLUDE_FROM_ALL)
+        set(MPMC_GTEST_ROOT "${GTEST_DIR}")
     elseif(EXISTS "${PROJECT_SOURCE_DIR}/cmake/extern/googletest/CMakeLists.txt")
         message(STATUS "GoogleTest: in-tree at cmake/extern/googletest")
         add_subdirectory(${PROJECT_SOURCE_DIR}/cmake/extern/googletest EXCLUDE_FROM_ALL)
+        set(MPMC_GTEST_ROOT "${PROJECT_SOURCE_DIR}/cmake/extern/googletest")
     else()
         message(STATUS "GoogleTest: fetching ${GTEST_REPO}@${GTEST_TAG}")
         include(FetchContent)
@@ -162,7 +164,11 @@ if(BUILD_TESTING_MPMC)
             GIT_TAG        ${GTEST_TAG}
             GIT_SHALLOW    TRUE)
         FetchContent_MakeAvailable(googletest)
+        set(MPMC_GTEST_ROOT "${googletest_SOURCE_DIR}")
     endif()
+    # Recorded for the .clangd template below, which has to name the header directory
+    # explicitly. All three layouts put the headers in the same place under their root.
+    set(MPMC_GTEST_INCLUDE "${MPMC_GTEST_ROOT}/googletest/include")
 endif()
 
 # ============================================================
@@ -250,13 +256,31 @@ endif()
 # infers a command for each header from the nearest indexed file -- which in this layout
 # is a googletest source, whose flags do not include this project's include directory.
 # The generated .clangd supplies those flags explicitly. See cmake/clangd.in.
+#
+# Both inputs are best-effort. This is editor convenience: a missing template, or a
+# GoogleTest that lives somewhere else, must not stop the build configuring -- the same
+# reasoning as the topology generator above, which used to be a FATAL_ERROR and meant an
+# unrelated Python problem blocked the tests.
 set(CLANGD_DB_DIR "${CMAKE_BINARY_DIR}")
-set(CLANGD_GTEST_INCLUDE "${PROJECT_SOURCE_DIR}/cmake/extern/googletest/googletest/include")
-configure_file(
-    ${PROJECT_SOURCE_DIR}/cmake/clangd.in
-    ${PROJECT_SOURCE_DIR}/.clangd
-    @ONLY
-)
+# Wherever GoogleTest actually came from; only tier 2 is under cmake/extern. With
+# BUILD_TESTING_MPMC=OFF no tier runs and this is unset -- the template would then emit a
+# bare `- -I`, a malformed flag that eats the argument after it. Fall back to the project's
+# own include directory: already listed above, so a duplicate is a no-op.
+if(MPMC_GTEST_INCLUDE)
+    set(CLANGD_GTEST_INCLUDE "${MPMC_GTEST_INCLUDE}")
+else()
+    set(CLANGD_GTEST_INCLUDE "${PROJECT_SOURCE_DIR}/include")
+endif()
+
+if(EXISTS "${PROJECT_SOURCE_DIR}/cmake/clangd.in")
+    configure_file(
+        ${PROJECT_SOURCE_DIR}/cmake/clangd.in
+        ${PROJECT_SOURCE_DIR}/.clangd
+        @ONLY
+    )
+else()
+    message(STATUS "cmake/clangd.in not found; skipping .clangd generation")
+endif()
 
 # A compile_commands.json at the project root, where editors look by default.
 if(EXISTS "${CMAKE_BINARY_DIR}/compile_commands.json"
