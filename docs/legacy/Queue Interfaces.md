@@ -1,3 +1,7 @@
+> **Archived.** Describes the IQueue<T> virtual interface, which the refactor removed entirely. Contracts are now C++20 concepts in include/core/.
+>
+> Kept for the design history; nothing here describes the current tree.
+
 # Segment Interfaces
 
 This design provides a **base queue interface** (`IQueue<T>`) that is type-agnostic, with an optional static check for pointer-based types (common in lock-free / intrusive queues).  

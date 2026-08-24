@@ -1,8 +1,34 @@
 #pragma once
+/**
+ * @file Admission.hpp
+ * @brief The contract for what stops a proxy admitting another item.
+ * @ingroup core
+ */
+
 #include <concepts>
 #include <cstddef>
 
 namespace core {
+
+/**
+ * @brief When the proxy must ask a policy, which is the main thing that distinguishes them.
+ *
+ * A policy that counts *items* must be asked before anything is committed, because the answer
+ * depends on the item itself. A policy that counts *segments* cannot answer usefully at that
+ * point: whether this enqueue causes a segment to be linked is not known until the tail refuses
+ * the item, and most enqueues link nothing. Asking it up front makes it refuse while the tail
+ * still has free slots.
+ *
+ * That was not hypothetical -- with `SegmentCount` asked at `Enqueue`, a chunk-bounded queue
+ * reached only `(bound - 1) * segment + 1` items, and at `chunks == 1` it held **zero** while
+ * advertising a full segment's worth.
+ */
+enum class AdmitPoint {
+    /// At the top of every enqueue, before the traversal. For policies that must *reserve*.
+    Enqueue,
+    /// Only when the tail has refused and a new segment is about to be acquired and linked.
+    SegmentLink,
+};
 
 /**
  * @brief Whether a proxy will admit another item, and the bookkeeping to decide it.
@@ -30,6 +56,20 @@ concept AdmissionPolicy = requires(A a, const A ca, std::size_t n) {
     requires std::constructible_from<A, typename A::Config>;
 
     { A::bounded } -> std::convertible_to<bool>; ///< does this policy impose any ceiling?
+
+    /// Where the proxy asks. Resolved with `if constexpr`, so a policy pays for exactly one
+    /// call site and the other compiles away entirely.
+    { A::admit_point } -> std::convertible_to<AdmitPoint>;
+
+    /**
+     * How many segments this policy allows to be live at once, given the chunk count.
+     *
+     * **0 means "this policy does not bound the segment count"**, which is the answer for a
+     * policy that counts items or nothing at all. LinkedProxy uses it as the divisor when
+     * splitting a total capacity across the segments that will exist, taking the smaller
+     * non-zero of this and the source's own limit.
+     */
+    { A::live_segments(n) } noexcept -> std::same_as<std::size_t>;
 
     /// The item ceiling, given the segment capacity. Lets the proxy report a capacity
     /// without knowing whether the bound counts items, segments, or nothing at all.

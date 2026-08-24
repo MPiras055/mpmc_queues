@@ -1,3 +1,7 @@
+> **Archived.** An old task list; every item is either done or superseded. The live backlog is docs/notes/Assessment.md.
+>
+> Kept for the design history; nothing here describes the current tree.
+
 ## implementations
 - [x] add compliant c++11 interface for lfring
 - [x] add compliant c++11 interface for scqueue (w indirection)

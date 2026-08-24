@@ -1,10 +1,17 @@
 #pragma once
+/**
+ * @file SCQ.hpp
+ * @brief Two index rings over a shared buffer: one of free slots, one of queued ones.
+ * @ingroup algo
+ */
+
 #include <algo/LFring.hpp>
 #include <core/SegmentTraits.hpp>
 #include <linkage/Linkage.hpp>
 #include <mem/SingleBlock.hpp>
 #include <meta/OptionsPack.hpp>
 #include <util/bit.hpp>
+#include <util/align.hpp>
 #include <util/specs.hpp>
 #include <atomic>
 #include <cassert>
@@ -14,21 +21,6 @@ namespace algo {
 struct SCQOpt {
     struct no_cell_padding {};
 };
-
-
-/**
- * @debug: no need to check for inflight since in the case of linked policy
- * each segment is protected via hazard Pointer: REMOVE THE INFLIGHT GUARD
- * 
- * Also no need for LFring to implement block_dequeue just revert to the old closure
- * on enqueue. If a slot cannot be enqueued then place it back in the old ring (should be
- * always successful due of the capacity of the ring). Moreover the threshold is not a heuristic
- * but is a conservative upper bound on the number of empty dequeue given an enqueue. So LFring linearizes
- * dequeues thanks to the threshold. Make sure that no slot is ever lost, so when processing reopen, there's no
- * need in resetting both rings, just opening the one closed and resetting the threshold for for the free slots 
- * queue
- */
-
 
 
 /**
@@ -48,6 +40,26 @@ struct SCQOpt {
  *       version built this with a bump-allocator overload that mutated a running size
  *       and returned the next free address, which could not be checked. Here the plan is
  *       constexpr and mem::SingleBlock static_asserts that the regions do not overlap.
+ *
+ * @todo Three simplifications, none applied yet, recorded so the reasoning is not lost. They
+ *       are related: each rests on the threshold being a conservative bound rather than a
+ *       guess.
+ *
+ *       1. **Drop the in-flight guard.** Under the linked policy every segment is protected
+ *          by a hazard pointer for the whole traversal, so it cannot be freed under a
+ *          producer that is mid-insert. If that holds, `needs_inflight_drain` can go false
+ *          and `has_inflight()` with it.
+ *       2. **Drop LFring's `block_dequeue`** and close on enqueue instead: a slot that cannot
+ *          be enqueued goes back to the ring it came from, which always has room because the
+ *          ring is sized for every index that exists.
+ *       3. **Stop rebuilding both rings in `reopen()`.** The threshold is an upper bound on
+ *          how many empty dequeues an enqueue can cause, which is what lets LFring linearise
+ *          dequeues; given that, reopening need only re-open the closed ring and reset the
+ *          free ring's threshold, provided no index is ever lost.
+ *
+ *       Point 3 needs care: the current unconditional rebuild is what fixed a
+ *       duplicate-delivery bug (see reopen()), so it must not be relaxed without a test that
+ *       reproduces that bug first.
  */
 template <typename T, typename Opt = meta::EmptyOptions, typename Link = linkage::None>
     requires meta::AcceptsOnly<Opt, typename SCQOpt::no_cell_padding>
@@ -70,6 +82,18 @@ public:
         return bit::round_to_next_pow2(n < 2 ? 2 : n);
     }
 
+    /**
+     * @brief What a capacity request of @p n actually yields.
+     * @return the capacity a segment built with @p n will report.
+     *
+     * Static so a caller can size a split before anything is constructed: LinkedProxy divides
+     * its total across the segments that will exist, and has to know what each one rounds to
+     * before it can report a capacity the queue can genuinely reach.
+     */
+    static constexpr std::size_t capacity_for(std::size_t n) noexcept { return round_size(n); }
+
+    /// @brief Where the co-allocated regions go. See @ref block-construction.
+    /// @param n requested capacity; the only thing the layout may depend on.
     static constexpr auto plan(std::size_t n) noexcept {
         const std::size_t cap = round_size(n);
         const std::size_t order = Ring::order_for(cap);
@@ -103,6 +127,8 @@ public:
         data_->~Ring();
     }
     
+    /// @brief Add an item.
+    /// @return false if the queue is full, or closed.
     FORCE_INLINE bool enqueue(T item) noexcept {
         std::size_t slot = 0;
         if (!free_->dequeue(slot)) {
@@ -122,6 +148,10 @@ public:
         return ok;
     }
 
+    /// @brief Add an item, skipping the attempt when the caller already knows it is closed.
+    /// @param closed_hint the caller believes this segment is closed; see
+    ///        core::segment_traits::needs_close_hint.
+    /// @return false if the queue is full, or closed.
     FORCE_INLINE bool enqueue(T item, bool closed_hint) noexcept {
         if constexpr (Link::is_linked) {
             if (closed_hint && is_closed()) return false;
@@ -129,6 +159,8 @@ public:
         return enqueue(item);
     }
 
+    /// @brief Take the oldest item.
+    /// @return false if the queue is empty.
     FORCE_INLINE bool dequeue(T& out) noexcept {
         std::size_t slot = 0;
         if (!data_->dequeue(slot)) return false;
@@ -141,12 +173,15 @@ public:
         return true;
     }
 
+    /// @return Items currently held. Approximate under concurrency, exact when quiescent.
     std::size_t size() const noexcept { return data_->size(); }
+    /// @return Items this queue can hold.
     std::size_t capacity() const noexcept { return capacity_; }
 
     /// See LFring::reset_threshold -- disarm the empty shortcut before the final drain.
     void prepare_dequeue_after_link() noexcept { data_->reset_threshold(); }
 
+    /// @brief Refuse all further enqueues, permanently.
     void close() noexcept
         requires(Link::is_linked)
     {
@@ -154,6 +189,7 @@ public:
         data_->close();
     }
 
+    /// @return true once closed; a closed segment still drains.
     bool is_closed() const noexcept
         requires(Link::is_linked)
     {
@@ -178,16 +214,21 @@ public:
         return true;
     }
 
+    /// @return The successor handle, or nil if this is the tail.
     handle_type next() const noexcept
         requires(Link::is_linked)
     {
         return link_.next();
     }
 
-    bool link_next(handle_type h) noexcept
+    /// @brief Publish @p h as the successor.
+    /// @param current set to the successor now installed -- @p h if we won, the winner's
+    ///        handle if we lost, so a losing caller need not re-read next().
+    /// @return true for exactly one caller; the loser must discard its segment.
+    bool link_next(handle_type h, handle_type& current) noexcept
         requires(Link::is_linked)
     {
-        return link_.link_next(h);
+        return link_.link_next(h, current);
     }
 
 private:
@@ -202,12 +243,14 @@ private:
     Ring* free_ = nullptr;
     Ring* data_ = nullptr;
     T* buffer_ = nullptr;
-    // ALIGNED_CACHE std::atomic<uint32_t> inflight_{0};
-    // CACHE_PAD_TYPES(std::atomic<uint32_t>);
+    // CACHE_ALIGN std::atomic<uint32_t> inflight_{0};
+    // CACHE_PAD(std::atomic<uint32_t>);
 };
 
 } // namespace algo
 
+/// @brief Capabilities of algo::SCQ as a linked segment. Every field is mandatory:
+/// core::segment_traits has no primary definition, so omitting one is a compile error.
 template <typename T, typename Opt, typename Link>
 struct core::segment_traits<algo::SCQ<T, Opt, Link>> {
     /// Re-entering enqueue on a closed SCQ burns free-ring work for nothing.
@@ -224,10 +267,12 @@ MPMC_ASSERT_SEGMENT_TRAITS(algo::SCQ<int*, meta::EmptyOptions, linkage::None>);
 
 namespace queue {
 template <typename T, typename Opt = meta::EmptyOptions>
+/// Standalone SCQ: two index rings over a shared buffer.
 using SCQ = algo::SCQ<T, Opt, linkage::None>;
 }
 
 namespace seg {
 template <typename T, typename Opt = meta::EmptyOptions, typename HP = mem::PtrHandle>
+/// SCQ as a linked segment.
 using SCQ = algo::SCQ<T, Opt, linkage::Node<HP>>;
 }

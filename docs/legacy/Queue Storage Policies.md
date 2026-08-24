@@ -1,3 +1,7 @@
+> **Archived.** Describes an IStoragePolicy interface for stack vs heap buffers. Replaced by single-block co-allocation; see the block-construction section of docs/Extending.md.
+>
+> Kept for the design history; nothing here describes the current tree.
+
 
 # Overview
 

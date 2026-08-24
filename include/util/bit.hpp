@@ -1,4 +1,10 @@
 #pragma once
+/**
+ * @file bit.hpp
+ * @brief Bit helpers: powers of two, widths, and most-significant-bit tagging.
+ * @ingroup util
+ */
+
 #include <cstddef>
 #include <type_traits>
 #include <limits>

@@ -1,5 +1,12 @@
 #pragma once
+/**
+ * @file Linkage.hpp
+ * @brief Whether an algorithm carries a successor handle, and of what type.
+ * @ingroup linkage
+ */
+
 #include <mem/Handle.hpp>
+#include <util/align.hpp>
 #include <util/specs.hpp>
 #include <atomic>
 
@@ -41,37 +48,66 @@ struct None {
 /**
  * @brief Linked: the segment carries a successor handle.
  *
- * The handle type comes from the *source* (a pointer source hands out `S*`, a pooled
+ * The handle type comes from the *source* (e.g., a pointer source hands out `S*`, a pooled
  * one hands out VersionedIndex), which is why it is a policy here rather than a fourth
  * template parameter every proxy had to remember to pass in the right slot.
  *
- * @tparam HandlePolicy mem::PtrHandle or mem::IndexHandle
+ * @tparam HandlePolicy (see mem::PtrHandle or mem::IndexHandle)
  */
-template <typename HandlePolicy = mem::PtrHandle>
+template <typename HandlePolicy>
 struct Node {
     static constexpr bool is_linked = true;
 
     template <typename S>
     struct state {
+        // templated handle type
         using handle = typename HandlePolicy::template type<S>;
 
+        // null handle
         static constexpr handle nil() noexcept { return handle{}; }
 
+        // getter method for the next field
         handle next() const noexcept { return next_.load(std::memory_order_acquire); }
 
-        /// CAS nil -> h. Succeeds for exactly one caller.
-        bool link_next(handle h) noexcept {
-            handle expected = nil();
-            return next_.compare_exchange_strong(expected, h, std::memory_order_acq_rel,
-                                                 std::memory_order_acquire);
+        /**
+         * @brief CAS nil -> @p h. Succeeds for exactly one caller.
+         *
+         * @param h       the successor to install.
+         * @param current always set to the successor that is installed when this returns:
+         *                @p h on success, the winner's handle on failure.
+         * @return true for the one caller that installed it.
+         *
+         * The out-parameter is free. A failing `compare_exchange_strong` writes the value it
+         * actually found into `expected`, so the loser already holds the winner's handle and
+         * needs no second acquire load of `next_` -- which it would otherwise do on exactly
+         * the path where producers are colliding and that line is contended.
+         *
+         * Set on the success path too, rather than only on failure: one store on a path that
+         * runs once per segment, against a parameter whose meaning would otherwise depend on
+         * the return value.
+         */
+
+        /**
+         * @brief link a handle to the current one
+         * @param h     successor handle to install
+         * @param c     reference which is updated with the current
+         *  `next` field if the method fails
+         * @returns: true if the link was successful, false otherwise
+         * setting the reference 
+         */
+        bool link_next(handle h, handle& c) noexcept {
+            assert(c == nil() && "Provided handle reference is not nil()");
+            return (next_.compare_exchange_strong(c, h, std::memory_order_acq_rel,
+                                              std::memory_order_acquire));
         }
 
-        /// Detach, so a recycled segment does not carry a stale successor.
+        /**
+         * @brief: unlink the successor handle
+         */
         void unlink() noexcept { next_.store(nil(), std::memory_order_relaxed); }
 
     private:
-        ALIGNED_CACHE std::atomic<handle> next_{handle{}};
-        CACHE_PAD_TYPES(std::atomic<handle>);
+        CACHE_LINE_MEMBER(std::atomic<handle>, next_, {handle{}});
     };
 };
 

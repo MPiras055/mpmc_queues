@@ -1,3 +1,7 @@
+> **Archived.** Interface architecture for the former UnboundedProxy, which no longer exists. Replaced by proxy::LinkedProxy and its aliases.
+>
+> Kept for the design history; nothing here describes the current tree.
+
 
 ## Overview
 

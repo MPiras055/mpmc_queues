@@ -1,4 +1,10 @@
 #pragma once
+/**
+ * @file cas2.hpp
+ * @brief Double-width compare-and-swap inline assembly code
+ * @ingroup util
+ */
+
 #include <cstdint>
 
 
@@ -19,7 +25,7 @@ namespace p_atomic {
  * @param desired_hi Desired new high word.
  * @return true if swap succeeded, false otherwise.
  */
-inline bool cas2(void* addr,
+inline bool dcas(void* addr,
                  uint64_t& expected_lo, uint64_t& expected_hi,
                  uint64_t desired_lo, uint64_t desired_hi) {
 #if defined(__x86_64__)
@@ -92,7 +98,7 @@ inline bool cas2(void* addr,
     return true;
 
 #else
-#   error "cas2 not supported on this architecture"
+#   error "architecture doesn't support dcas"
 #endif
 }
 

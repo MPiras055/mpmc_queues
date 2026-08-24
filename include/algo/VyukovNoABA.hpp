@@ -1,10 +1,17 @@
 #pragma once
+/**
+ * @file VyukovNoABA.hpp
+ * @brief Vyukov's ring with the lap folded into the empty cell, removing the separate sequence word.
+ * @ingroup algo
+ */
+
 #include <cell/PlainCell.hpp>
 #include <core/SegmentTraits.hpp>
 #include <linkage/Linkage.hpp>
 #include <mem/SingleBlock.hpp>
 #include <meta/OptionsPack.hpp>
 #include <util/bit.hpp>
+#include <util/align.hpp>
 #include <util/specs.hpp>
 #include <atomic>
 #include <cassert>
@@ -56,6 +63,8 @@ public:
         return bit::round_to_next_pow2(n < 2 ? 2 : n);
     }
 
+    /// @brief Where the co-allocated regions go. See @ref block-construction.
+    /// @param n requested capacity; the only thing the layout may depend on.
     static constexpr auto plan(std::size_t n) noexcept {
         mem::LayoutBuilder b{sizeof(Self), alignof(Self)};
         mem::Plan<1> p{};
@@ -72,6 +81,8 @@ public:
             cells_[i].val.store(lap_word(i >> shift_), std::memory_order_relaxed);
     }
 
+    /// @brief Add an item.
+    /// @return false if the queue is full, or closed.
     bool enqueue(T item) noexcept {
         assert(!is_lap_word(reinterpret_cast<uintptr_t>(item)) &&
                "VyukovNoABA: item collides with the reserved encoding");
@@ -91,6 +102,8 @@ public:
         }
     }
 
+    /// @brief Take the oldest item.
+    /// @return false if the queue is empty.
     bool dequeue(T& out) noexcept {
         for (;;) {
             const uint64_t t = tail_.load(std::memory_order_relaxed);
@@ -120,27 +133,28 @@ public:
         }
     }
 
+    /// @return Items currently held. Approximate under concurrency, exact when quiescent.
     std::size_t size() const noexcept {
         const uint64_t t = tail_.load(std::memory_order_acquire);
         const uint64_t h = head_.load(std::memory_order_acquire);
         return t < h ? 0 : static_cast<std::size_t>(t - h);
     }
 
+    /// @return Items this queue can hold.
     std::size_t capacity() const noexcept { return capacity_; }
 
 private:
     const std::size_t capacity_;
     const std::size_t shift_;
     cell_type* const cells_;
-    ALIGNED_CACHE std::atomic<uint64_t> tail_{0};
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
-    ALIGNED_CACHE std::atomic<uint64_t> head_{0};
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
+    CACHE_LINE_MEMBER(std::atomic<uint64_t>, tail_, {0});
+    CACHE_LINE_MEMBER(std::atomic<uint64_t>, head_, {0});
 };
 
 } // namespace algo
 
 namespace queue {
 template <typename T, typename Opt = meta::EmptyOptions>
+/// Standalone ring with the lap folded into the empty cell; no separate sequence word.
 using VyukovNoABA = algo::VyukovNoABA<T, Opt, linkage::None>;
 }

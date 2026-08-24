@@ -1,6 +1,13 @@
 #pragma once
+/**
+ * @file PlainCell.hpp
+ * @brief One payload word per cell, optionally padded to a cache line.
+ * @ingroup cell
+ */
+
 
 #include <atomic>
+#include <util/align.hpp>
 #include <util/specs.hpp>  // defines CACHE_LINE
 
 
@@ -36,7 +43,7 @@ struct PlainCell;
 template <typename T>
 struct alignas(CACHE_LINE) PlainCell<T, true> {
     std::atomic<T>        val;  ///< Stored value.
-    CACHE_PAD_TYPES(std::atomic<T>);
+    CACHE_PAD(std::atomic<T>);
 };
 
 // -----------------------------------------------------------------------------

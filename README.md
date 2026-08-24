@@ -40,6 +40,11 @@ needs. `compile_commands.json` and a `.clangd` are generated at configure time.
 `<name> <producers> <consumers> <items> <capacity> [pin] [prod_ticks amp] [cons_ticks amp]`,
 printing items/second. For sweeps and plots see [`python/README.md`](python/README.md).
 
+`<capacity>` is the queue's **total**, split across the segments that will exist — divided by
+the chunk count for a bounded proxy, by the pool size for a pooled one. Each segment is floored
+at two slots and then rounded up by its own algorithm, so `capacity()` reports what the queue
+can actually reach, which may exceed what was asked for.
+
 ---
 
 ## Architecture
@@ -254,16 +259,37 @@ it) and treats a stall as a failure rather than hanging.
 
 ## Documentation
 
+Start at [`docs/README.md`](docs/README.md), which indexes everything. The essentials:
+
+- [`docs/Extending.md`](docs/Extending.md) — **how to add** an algorithm, a policy, a source,
+  or an object with co-allocated arrays, with a worked example each and the obligations that
+  the concepts cannot state
+- [`docs/Testing.md`](docs/Testing.md) — the suites, the four build configurations, and the
+  isolation-harness technique the concurrency bugs were found with
 - [`docs/notes/As Shipped.md`](docs/notes/As%20Shipped.md) — **the design that exists**,
   every deviation from the plan, how the pooled reclamation works, and what is still open
+- [`docs/notes/Assessment.md`](docs/notes/Assessment.md) — code review, known defects, and the
+  optimisation backlog
 - [`python/README.md`](python/README.md) — running sweeps and plotting
-- [`docs/notes/Architecture Patterns.md`](docs/notes/Architecture%20Patterns.md) —
-  historical: the patterns the pre-refactor code used and what each cost
-- [`docs/notes/Abstraction Map.md`](docs/notes/Abstraction%20Map.md) — the abstraction set
-  and UML; the plan rather than the outcome
+
+Generated API documentation:
+
+```bash
+cmake --build build --target docs     # -> build/docs/html/index.html
+```
+
+Superseded designs live in [`docs/legacy/`](docs/legacy), each headed with what replaced it.
 
 # Benchmarks
 - `FAAArrayQueue VS HybridQueue`: set the patience to a really small number: heuristics in an imbalanced (low prod - high cons) FAAArrayQueue should quickly waste all the cells while HybridQueue benefits a lot from the asymmetric-slow dequeue until the full segment has been published
 
-- Memory Usage For Linked Segments: hard to estimate due to allocator caching, needs meta at `LinkedProxy` level to record the number of segments (simple atomic counter incremented for each successful linkage), so with the size of the struct we can reliably estimate the number of used segment
+- Memory Usage For Linked Segments: hard to estimate from the allocator because of its caching,
+  so the proxy counts instead. `proxy::ProxyOpt::segment_stats` — off by default and free when
+  off — turns on `segments_linked()`, `segments_retired()` and `segments_discarded()`; multiply
+  by the segment size for the memory estimate, or divide by the pool size for the reuse factor:
+
+  ```cpp
+  using Q = proxy::MemBounded<Item, IdxHQ<Item>, 8, meta::EmptyOptions,
+                              meta::OptionsPack<proxy::ProxyOpt::segment_stats>>;
+  ```
 

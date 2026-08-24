@@ -1,10 +1,17 @@
 #pragma once
+/**
+ * @file Vyukov.hpp
+ * @brief Bounded MPMC ring with a sequence number per cell; the baseline every other algorithm here is compared against.
+ * @ingroup algo
+ */
+
 #include <cell/SequencedCell.hpp>
 #include <core/SegmentTraits.hpp>
 #include <linkage/Linkage.hpp>
 #include <mem/SingleBlock.hpp>
 #include <meta/OptionsPack.hpp>
 #include <util/bit.hpp>
+#include <util/align.hpp>
 #include <util/specs.hpp>
 #include <atomic>
 #include <cassert>
@@ -48,12 +55,32 @@ public:
     using handle_type = typename link_state::handle;
 
     /** @brief Capacity actually used for a requested size. */
+    /**
+     * @note The floor of two is not cosmetic. These cells distinguish laps by `seq == t +
+     *       capacity`, and at capacity 1 that aliases with the very next ticket: a one-slot
+     *       ring never reports itself full, accepts unboundedly, and overwrites its own cell.
+     *       Measured directly: `create(1)` accepted three items and reported `size() == 3`.
+     *       A linked segment that never closes also never gets a successor, so the proxy
+     *       spins there for ever.
+     */
     static constexpr std::size_t round_size(std::size_t n) noexcept {
         if constexpr (force_pow2) return bit::round_to_next_pow2(n > 1 ? n : 2);
-        else return n;
+        else return n > 1 ? n : 2;
     }
 
     // -- single-block layout -------------------------------------------------
+    /**
+     * @brief What a capacity request of @p n actually yields.
+     * @return the capacity a segment built with @p n will report.
+     *
+     * Static so a caller can size a split before anything is constructed: LinkedProxy divides
+     * its total across the segments that will exist, and has to know what each one rounds to
+     * before it can report a capacity the queue can genuinely reach.
+     */
+    static constexpr std::size_t capacity_for(std::size_t n) noexcept { return round_size(n); }
+
+    /// @brief Where the co-allocated regions go. See @ref block-construction.
+    /// @param n requested capacity; the only thing the layout may depend on.
     static constexpr auto plan(std::size_t n) noexcept {
         mem::LayoutBuilder b{sizeof(Self), alignof(Self)};
         mem::Plan<1> p{};
@@ -74,6 +101,8 @@ public:
 
     // -- queue ---------------------------------------------------------------
 
+    /// @brief Add an item.
+    /// @return false if the queue is full, or closed.
     FORCE_INLINE bool enqueue(T item) noexcept {
         uint64_t t = tail_.load(std::memory_order_relaxed);
         for (;;) {
@@ -102,6 +131,8 @@ public:
     /// Hinted overload; Vyukov's own closed check is already inside the loop.
     FORCE_INLINE bool enqueue(T item, bool /*closed_hint*/) noexcept { return enqueue(item); }
 
+    /// @brief Take the oldest item.
+    /// @return false if the queue is empty.
     FORCE_INLINE bool dequeue(T& out) noexcept {
         uint64_t h = head_.load(std::memory_order_relaxed);
         for (;;) {
@@ -120,6 +151,7 @@ public:
         }
     }
 
+    /// @return Items currently held. Approximate under concurrency, exact when quiescent.
     std::size_t size() const noexcept {
         uint64_t t = tail_.load(std::memory_order_acquire);
         if constexpr (Link::is_linked) t = bit::clear_msb(t);
@@ -127,16 +159,19 @@ public:
         return t >= h ? static_cast<std::size_t>(t - h) : 0;
     }
 
+    /// @return Items this queue can hold.
     std::size_t capacity() const noexcept { return capacity_; }
 
     // -- linkage (only when linked) -----------------------------------------
 
+    /// @brief Refuse all further enqueues, permanently.
     void close() noexcept
         requires(Link::is_linked)
     {
         tail_.fetch_or(bit::set_msb<uint64_t>(0), std::memory_order_release);
     }
 
+    /// @return true once closed; a closed segment still drains.
     bool is_closed() const noexcept
         requires(Link::is_linked)
     {
@@ -156,16 +191,21 @@ public:
         return true;
     }
 
+    /// @return The successor handle, or nil if this is the tail.
     handle_type next() const noexcept
         requires(Link::is_linked)
     {
         return link_.next();
     }
 
-    bool link_next(handle_type h) noexcept
+    /// @brief Publish @p h as the successor.
+    /// @param current set to the successor now installed -- @p h if we won, the winner's
+    ///        handle if we lost, so a losing caller need not re-read next().
+    /// @return true for exactly one caller; the loser must discard its segment.
+    bool link_next(handle_type h, handle_type& current) noexcept
         requires(Link::is_linked)
     {
-        return link_.link_next(h);
+        return link_.link_next(h, current);
     }
 
 private:
@@ -176,10 +216,8 @@ private:
         else return i % capacity_;
     }
 
-    ALIGNED_CACHE std::atomic<uint64_t> head_{0};
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
-    ALIGNED_CACHE std::atomic<uint64_t> tail_{0};
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
+    CACHE_LINE_MEMBER(std::atomic<uint64_t>, head_, {0});
+    CACHE_LINE_MEMBER(std::atomic<uint64_t>, tail_, {0});
     [[no_unique_address]] link_state link_{};
     const std::size_t capacity_;
     cell_type* const cells_;
@@ -187,6 +225,8 @@ private:
 
 } // namespace algo
 
+/// @brief Capabilities of algo::Vyukov as a linked segment. Every field is mandatory:
+/// core::segment_traits has no primary definition, so omitting one is a compile error.
 template <typename T, typename Opt, typename Link>
 struct core::segment_traits<algo::Vyukov<T, Opt, Link>> {
     /// Vyukov re-checks its own closed flag on every loop iteration, so an external
@@ -204,11 +244,13 @@ MPMC_ASSERT_SEGMENT_TRAITS(algo::Vyukov<int*, meta::EmptyOptions, linkage::None>
 namespace queue {
 /// Standalone bounded Vyukov ring.
 template <typename T, typename Opt = meta::EmptyOptions>
+/// Standalone bounded Vyukov ring.
 using Vyukov = algo::Vyukov<T, Opt, linkage::None>;
 } // namespace queue
 
 namespace seg {
 /// Vyukov as a linked segment.
 template <typename T, typename Opt = meta::EmptyOptions, typename HP = mem::PtrHandle>
+/// Vyukov's ring as a linked segment.
 using Vyukov = algo::Vyukov<T, Opt, linkage::Node<HP>>;
 } // namespace seg

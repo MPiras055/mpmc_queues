@@ -1,0 +1,106 @@
+/**
+ * @file Modules.dox
+ * @brief Doxygen module definitions. No code; this file exists only to give the generated
+ *        navigation the same shape as the architecture.
+ *
+ * Grouped by layer rather than by folder, because the layering is the design: each group
+ * depends only on the ones above it, and that acyclic order is what lets an algorithm be
+ * written once and composed four ways. A flat, alphabetical file list would hide it.
+ */
+
+/**
+ * @defgroup meta Meta
+ * @brief Compile-time machinery: option packs, type lists, string literals as template
+ *        parameters.
+ *
+ * Depends on nothing. `meta::OptionsPack` carries two kinds of entry -- flag tags matched by
+ * type, and value options such as `patience<8>` read back with `get<K, Default>` -- and
+ * `meta::AcceptsOnly` is what makes an unrecognised option a compile error rather than a
+ * silently ignored one.
+ */
+
+/**
+ * @defgroup util Utilities
+ * @brief Bit twiddling, cache-line and inlining directives, thread registration, CPU topology.
+ *
+ * @ref util::threading::ThreadRegistry is the substantial one: a lock-free, unbounded registry
+ * of per-thread state that both reclamation sources are built on. Everything else is small.
+ */
+
+/**
+ * @defgroup core Core contracts
+ * @brief Concepts only, no implementation.
+ *
+ * The contracts every other layer is written against: @ref core::Queue, @ref core::LinkedSegment,
+ * @ref core::Proxy, @ref core::SegmentSource, @ref core::AdmissionPolicy, and
+ * @ref core::segment_traits.
+ *
+ * `segment_traits` deliberately has **no primary definition**, so a segment that forgets to
+ * declare its capabilities fails to compile rather than inheriting a default that happens to be
+ * wrong. Note what concepts can and cannot say: they constrain *signatures*, not *obligations* --
+ * "has an `enqueue(T, bool)`" is checkable, "refuses permanently once full" is not. Obligations
+ * are written down in @ref extending and enforced by SegmentLifecycleTest.
+ */
+
+/**
+ * @defgroup mem Memory
+ * @brief Single-block co-allocation, handle types, and the reclamation sources.
+ *
+ * A segment is one allocation: header and cell array in the same block, laid out by
+ * @ref mem::LayoutBuilder and reached through @ref mem::SingleBlock. A source
+ * (@ref mem::source::Hazard, @ref mem::source::Pool) decides where segments come from and when
+ * they may be reused, and carries the proxy's per-thread state alongside its own.
+ */
+
+/**
+ * @defgroup cell Cells and tagging
+ * @brief How one slot is laid out, and how a word encodes empty / consumed / claimed / payload.
+ *
+ * Three segments previously hand-rolled three incompatible encodings for the same problem, two
+ * of which spelled "reserved" the same way and meant different things. @ref cell::Tagging states
+ * the contract positively instead, in terms of what a word *is*.
+ */
+
+/**
+ * @defgroup linkage Linkage
+ * @brief Whether an algorithm carries a successor handle.
+ *
+ * @ref linkage::None is an empty struct, so under `[[no_unique_address]]` a standalone queue
+ * pays nothing for being linkable -- measurably: `sizeof(queue::Vyukov<T*>)` is 384 bytes
+ * against 512 for `seg::Vyukov<T*>`, exactly one padded next-pointer apart.
+ */
+
+/**
+ * @defgroup algo Algorithms
+ * @brief The queue algorithms themselves, each written once and parameterised by linkage.
+ *
+ * Bounded rings usable standalone (`queue::`) or as a linked segment (`seg::`), plus two index
+ * containers -- @ref algo::PhasedBucket and @ref algo::CacheRing -- that exist to serve the
+ * pooled source's epoch rotation rather than to hold user payloads.
+ */
+
+/**
+ * @defgroup proxy Proxies
+ * @brief Composing segments into an unbounded or bounded queue.
+ *
+ * One traversal, @ref proxy::LinkedProxy, over three policy axes: what stops admission, where
+ * segments come from, and which algorithm is inside each. This replaced four near-identical
+ * proxies that had each re-implemented the same Michael-Scott traversal.
+ */
+
+/**
+ * @defgroup registry Registry
+ * @brief The single place that declares which implementations exist.
+ *
+ * One `Entry<"name", Type>` line reaches the benchmark's `--list`, the typed conformance suite
+ * and the concurrency matrix at once. Selection by name is a compile-time fold, so the measured
+ * loop stays monomorphic -- no vtable, no `std::function`, no variant.
+ */
+
+/**
+ * @defgroup tests Tests
+ * @brief What each suite pins down.
+ *
+ * See @ref testing for how to run them, the four build configurations, and the isolation-harness
+ * technique used to find the concurrency bugs.
+ */

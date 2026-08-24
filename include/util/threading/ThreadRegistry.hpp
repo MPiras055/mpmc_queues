@@ -1,5 +1,12 @@
 #pragma once
+/**
+ * @file ThreadRegistry.hpp
+ * @brief Lock-free unbounded registry of per-thread state; the base both reclamation sources build on.
+ * @ingroup util
+ */
+
 #include <meta/OptionsPack.hpp>
+#include <util/align.hpp>
 #include <util/specs.hpp>
 #include <atomic>
 #include <cstddef>
@@ -607,17 +614,13 @@ private:
     /// Present only when retry_scan_on_attach is set, so the default pays neither the counter's
     /// cache line nor its increment.
     struct AttachCounter {
-        ALIGNED_CACHE std::atomic<uint64_t> v{0};
-        CACHE_PAD_TYPES(std::atomic<uint64_t>);
+        CACHE_LINE_MEMBER(std::atomic<uint64_t>, v, {0});
     };
     struct NoCounter {};
 
-    ALIGNED_CACHE std::atomic<Node*> active_head_{nullptr};
-    CACHE_PAD_TYPES(std::atomic<Node*>);
-    ALIGNED_CACHE std::atomic<TaggedPtr> free_head_{};
-    CACHE_PAD_TYPES(std::atomic<TaggedPtr>);
-    ALIGNED_CACHE std::atomic<TaggedPtr> free_tail_{};
-    CACHE_PAD_TYPES(std::atomic<TaggedPtr>);
+    CACHE_LINE_MEMBER(std::atomic<Node*>, active_head_, {nullptr});
+    CACHE_LINE_MEMBER(std::atomic<TaggedPtr>, free_head_, {});
+    CACHE_LINE_MEMBER(std::atomic<TaggedPtr>, free_tail_, {});
 
     [[no_unique_address]] std::conditional_t<kRetryOnAttach, AttachCounter, NoCounter> attaches_{};
 };

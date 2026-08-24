@@ -8,7 +8,7 @@
  * *inside* the object (offset 638 against sizeof 640, overlapping head/tail) and left
  * FAAArray's misaligned by 6.
  *
- * mem::align_up is now the only implementation, and mem::Plan::valid() is checked at
+ * align::align_up is now the only implementation, and mem::Plan::valid() is checked at
  * compile time inside SingleBlock::create, so the class of bug is unrepresentable rather
  * than merely fixed. These tests assert the properties directly as well.
  */
@@ -19,7 +19,7 @@
 #include <algo/PRQ.hpp>
 #include <algo/SCQ.hpp>
 #include <algo/Vyukov.hpp>
-#include <mem/Align.hpp>
+#include <util/align.hpp>
 #include <mem/SingleBlock.hpp>
 
 namespace {
@@ -27,14 +27,14 @@ namespace {
 using Item = int*;
 
 TEST(Align, RoundsUpAndIsIdempotent) {
-    EXPECT_EQ(mem::align_up(0, 8), 0u);
-    EXPECT_EQ(mem::align_up(1, 8), 8u);
-    EXPECT_EQ(mem::align_up(8, 8), 8u);
-    EXPECT_EQ(mem::align_up(384, 128), 384u);
-    EXPECT_EQ(mem::align_up(385, 128), 512u);
+    EXPECT_EQ(align::align_up(0, 8), 0u);
+    EXPECT_EQ(align::align_up(1, 8), 8u);
+    EXPECT_EQ(align::align_up(8, 8), 8u);
+    EXPECT_EQ(align::align_up(384, 128), 384u);
+    EXPECT_EQ(align::align_up(385, 128), 512u);
     for (std::size_t a : {8u, 16u, 64u, 128u})
         for (std::size_t n = 0; n < 300; ++n) {
-            const auto r = mem::align_up(n, a);
+            const auto r = align::align_up(n, a);
             EXPECT_GE(r, n);
             EXPECT_EQ(r % a, 0u);
             EXPECT_LT(r - n, a);
@@ -44,7 +44,7 @@ TEST(Align, RoundsUpAndIsIdempotent) {
 TEST(Align, RejectsTheHistoricalMistake) {
     // The shipped-and-wrong form, kept here so the difference stays visible.
     const auto buggy = [](std::size_t n, std::size_t a) { return (n + a - 1) & (~a - 1); };
-    EXPECT_EQ(mem::align_up(640, 128), 640u);
+    EXPECT_EQ(align::align_up(640, 128), 640u);
     EXPECT_EQ(buggy(640, 128), 638u) << "the old form under-shoots the header";
     EXPECT_LT(buggy(640, 128), 640u) << "which is exactly how the buffer overlapped it";
 }

@@ -1,3 +1,7 @@
+> **Archived.** Diagnosis of the pre-refactor codebase and the proposal that followed. Superseded by docs/notes/As Shipped.md.
+>
+> Kept for the design history; nothing here describes the current tree.
+
 # Architecture Patterns — Current State and Proposal
 
 > **Historical.** Sections 0-3 diagnose the *pre-refactor* code and remain an accurate

@@ -1,0 +1,135 @@
+# Doxygen configuration, filled in by CMake (see the Documentation section of CMakeLists.txt).
+#
+# Deliberately short: this lists the settings worth having an opinion about rather than the
+# ~400-line file `doxygen -g` produces, so what is here is what was chosen. A few of them
+# restate a current default (EXTRACT_ALL, WARN_IF_UNDOCUMENTED, GENERATE_HTML); those are kept
+# because the choice matters and a future Doxygen changing its default underneath us should not
+# silently change the output.
+#
+# Verified against Doxygen 1.14. `doxygen -x <builddir>/Doxyfile` prints exactly the settings
+# that differ from the installed version's defaults, which is the quickest way to see whether a
+# new release has moved under this file.
+
+# ---------------------------------------------------------------------------
+# Project
+# ---------------------------------------------------------------------------
+PROJECT_NAME           = "@PROJECT_NAME@"
+PROJECT_BRIEF          = "Composable, vtable-free MPMC queues"
+OUTPUT_DIRECTORY       = @DOXYGEN_OUTPUT_DIR@
+CREATE_SUBDIRS         = NO
+
+# ---------------------------------------------------------------------------
+# Input
+# ---------------------------------------------------------------------------
+# docs/ is included for the markdown guides and Modules.dox; docs/legacy is not, because it
+# holds superseded designs that would otherwise show up as current documentation.
+INPUT                  = @PROJECT_SOURCE_DIR@/include \
+                         @PROJECT_SOURCE_DIR@/src \
+                         @PROJECT_SOURCE_DIR@/docs \
+                         @PROJECT_SOURCE_DIR@/README.md
+FILE_PATTERNS          = *.hpp *.cpp *.md *.dox
+RECURSIVE              = YES
+EXCLUDE                = @PROJECT_SOURCE_DIR@/cmake/extern \
+                         @PROJECT_SOURCE_DIR@/docs/legacy
+EXCLUDE_PATTERNS       = */build*/*
+STRIP_FROM_PATH        = @PROJECT_SOURCE_DIR@
+STRIP_FROM_INC_PATH    = @PROJECT_SOURCE_DIR@/include
+
+# The README is already the current, accurate overview -- no second front page to keep in sync.
+USE_MDFILE_AS_MAINPAGE = @PROJECT_SOURCE_DIR@/README.md
+MARKDOWN_SUPPORT       = YES
+
+# ---------------------------------------------------------------------------
+# What gets extracted
+# ---------------------------------------------------------------------------
+# EXTRACT_ALL = NO on purpose. With it on, every undocumented entity appears as an empty stub
+# and the documentation looks complete while saying nothing; with it off, a gap is a gap and
+# WARN_IF_UNDOCUMENTED reports it. Private members stay out: this library's contracts are its
+# concepts and its public surface, and the private half is implementation that the in-body
+# comments already explain to anyone reading the header.
+EXTRACT_ALL            = NO
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = YES
+EXTRACT_LOCAL_CLASSES  = NO
+
+# `detail` is the established "not part of the interface" convention in this tree, so its
+# contents are implementation the way a private member is. Excluding it here is what lets
+# WARN_IF_UNDOCUMENTED stay on without demanding prose for every internal helper.
+EXCLUDE_SYMBOLS        = *::detail::* \
+                         detail::*
+HIDE_UNDOC_MEMBERS     = NO
+HIDE_UNDOC_CLASSES     = NO
+INTERNAL_DOCS          = NO
+
+# Templates are the whole design here, so none of this can be hidden.
+HIDE_SCOPE_NAMES       = NO
+SHOW_INCLUDE_FILES     = YES
+SORT_MEMBER_DOCS       = NO
+SORT_BRIEF_DOCS        = NO
+
+# ---------------------------------------------------------------------------
+# C++20
+# ---------------------------------------------------------------------------
+# Doxygen does not evaluate constraints, so requires-clauses and concept bodies are read as
+# ordinary declarations. Nothing here is conditional on the preprocessor in a way that changes
+# the documented interface, so macro expansion stays off apart from the attribute noise below.
+BUILTIN_STL_SUPPORT    = YES
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+# These are layout and inlining directives. Left unexpanded they appear in every signature and
+# bury the declaration; PREDEFINED empties them.
+PREDEFINED             = ALIGNED_CACHE= \
+                         FORCE_INLINE=inline \
+                         CACHE_PAD_TYPES(...)= \
+                         CACHE_PAD(...)= \
+                         SPIN_HINT()= \
+                         MPMC_ASSERT_SEGMENT_TRAITS(...)= \
+                         __attribute__(x)=
+
+# ---------------------------------------------------------------------------
+# Warnings -- the point of the build
+# ---------------------------------------------------------------------------
+QUIET                  = YES
+WARNINGS               = YES
+
+# ON: an entity with no documentation at all is a real gap and should be visible.
+WARN_IF_UNDOCUMENTED   = YES
+# ON: a broken @ref or a @param naming an argument that does not exist is always a mistake.
+WARN_IF_DOC_ERROR      = YES
+
+# OFF, deliberately. It demands a @param for every argument of every *documented* function,
+# which here means `@param item the item` on a dozen `enqueue(T item)` overloads. Worse, it
+# inverts the incentive: adding a @brief without also enumerating every parameter produces
+# *more* warnings than leaving the function undocumented, which is exactly backwards. The
+# parameters that carry non-obvious meaning -- `closed_hint`, `init_full`, `worth_waiting` --
+# are documented individually where they occur.
+WARN_NO_PARAMDOC       = NO
+WARN_AS_ERROR          = NO
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+GENERATE_TREEVIEW      = YES
+DISABLE_INDEX          = NO
+FULL_SIDEBAR           = NO
+HTML_COLORSTYLE        = TOGGLE
+
+# ---------------------------------------------------------------------------
+# Diagrams
+# ---------------------------------------------------------------------------
+# Worth the build time here: the composition is by template parameter, so the collaboration
+# graph of a proxy is the only place the whole assembled stack is visible at once.
+HAVE_DOT               = @DOXYGEN_HAVE_DOT@
+DOT_IMAGE_FORMAT       = svg
+INTERACTIVE_SVG        = YES
+CLASS_GRAPH            = YES
+COLLABORATION_GRAPH    = YES
+TEMPLATE_RELATIONS     = YES
+INCLUDE_GRAPH          = YES
+INCLUDED_BY_GRAPH      = NO
+CALL_GRAPH             = NO
+CALLER_GRAPH           = NO
+DOT_GRAPH_MAX_NODES    = 60

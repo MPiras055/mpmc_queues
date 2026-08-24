@@ -1,3 +1,7 @@
+> **Archived.** The pre-refactor plan for the vtable-free architecture. Superseded by the shipped design: see docs/notes/As Shipped.md and the README.
+>
+> Kept for the design history; nothing here describes the current tree.
+
 # Abstraction Map — Composable, Vtable-Free Queue Architecture
 
 > **This is the plan, not the outcome.** It was written before implementation and several

@@ -1,5 +1,12 @@
 #pragma once
+/**
+ * @file Admission.hpp
+ * @brief The admission policies: unbounded, item-bounded, segment-bounded.
+ * @ingroup proxy
+ */
+
 #include <core/Admission.hpp>
+#include <util/align.hpp>
 #include <util/specs.hpp>
 #include <atomic>
 #include <cstddef>
@@ -19,20 +26,35 @@ struct None {
         return {};
     }
 
+    /// Whether this policy can ever refuse. `if constexpr`-tested, so an unbounded proxy
+    /// emits no admission check at all.
     static constexpr bool bounded = false;
+    /// Never asked, since `bounded` is false; a value is still required by the concept.
+    static constexpr core::AdmitPoint admit_point = core::AdmitPoint::Enqueue;
+
+    /// 0: unbounded, so there is no segment count to split a capacity across. The proxy then
+    /// treats its capacity argument as the size of each segment.
+    static constexpr std::size_t live_segments(std::size_t /*chunks*/) noexcept { return 0; }
 
     constexpr explicit None(Config) noexcept {}
 
+    /// @brief Ask, and reserve where the policy can.
+    /// @return false to refuse the enqueue.
     constexpr bool try_admit() noexcept { return true; }
+    /// Give back a reservation try_admit() took, when the enqueue then failed anyway.
     constexpr void cancel_admit() noexcept {}
+    /// @return The ceiling, in whatever unit this policy counts.
     constexpr std::size_t bound() const noexcept { return 0; } ///< 0 == unbounded
     /// Nothing caps the total, so the useful number is what one segment holds.
     constexpr std::size_t capacity(std::size_t segment) const noexcept { return segment; }
 
+    /// @name Traversal hooks. Called by LinkedProxy as it observes each event.
+    /// @{
     constexpr void on_enqueue() noexcept {}
     constexpr void on_dequeue() noexcept {}
     constexpr void on_segment_linked() noexcept {}
     constexpr void on_segment_retired() noexcept {}
+    /// @}
 };
 
 /**
@@ -51,7 +73,20 @@ public:
         return {segment * chunks};
     }
 
+    /// Whether this policy can ever refuse. `if constexpr`-tested, so an unbounded proxy
+    /// emits no admission check at all.
     static constexpr bool bounded = true;
+    /**
+     * Up front, and it has to be. This policy *reserves*: the ticket is taken before the
+     * traversal commits, so concurrent producers cannot each pass a test and then all commit
+     * past the ceiling. Measured on the check-then-act version, 4 producers against a bound
+     * of 256: peak occupancy 257.
+     */
+    static constexpr core::AdmitPoint admit_point = core::AdmitPoint::Enqueue;
+
+    /// The bound is in items, but the caller still says how many segments to spread them over,
+    /// and that is the divisor.
+    static constexpr std::size_t live_segments(std::size_t chunks) noexcept { return chunks; }
 
     explicit ItemCount(Config c) noexcept : bound_{c.items} {}
 
@@ -73,8 +108,10 @@ public:
         return true;
     }
 
+    /// Give back a reservation try_admit() took, when the enqueue then failed anyway.
     void cancel_admit() noexcept { pushed_.fetch_sub(1, std::memory_order_release); }
 
+    /// @return The ceiling, in whatever unit this policy counts.
     std::size_t bound() const noexcept { return bound_; }
     std::size_t capacity(std::size_t /*segment*/) const noexcept { return bound_; }
 
@@ -83,13 +120,12 @@ public:
     void on_dequeue() noexcept { popped_.fetch_add(1, std::memory_order_release); }
     void on_segment_linked() noexcept {}
     void on_segment_retired() noexcept {}
+    /// @}
 
 private:
     //Two separate counters because of the frequency of the ops
-    ALIGNED_CACHE std::atomic<uint64_t> pushed_{0};
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
-    ALIGNED_CACHE std::atomic<uint64_t> popped_{0};
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
+    CACHE_LINE_MEMBER(std::atomic<uint64_t>, pushed_, {0});
+    CACHE_LINE_MEMBER(std::atomic<uint64_t>, popped_, {0});
     const std::size_t bound_;
 };
 
@@ -110,39 +146,68 @@ public:
         return {chunks};
     }
 
+    /// Whether this policy can ever refuse. `if constexpr`-tested, so an unbounded proxy
+    /// emits no admission check at all.
     static constexpr bool bounded = true;
+
+    /**
+     * At the link, which is what makes this policy structurally different from ItemCount
+     * rather than merely differently parameterised.
+     *
+     * Asked at `Enqueue` it answered the wrong question. Whether an enqueue causes a segment
+     * to be linked is not known until the tail refuses the item, and most enqueues link
+     * nothing -- so an up-front check refuses while the tail still has free slots. Measured
+     * on 64-slot segments: `chunks = 8` held 449 of an advertised 512, and `chunks = 1` held
+     * **zero** of 64, because one segment's worth of bound left no room to link even the
+     * first successor. Asked here, all of them reach their stated capacity.
+     *
+     * It is also strictly less work: at the ceiling the proxy skips the whole
+     * acquire/reopen/discard round trip instead of performing it and undoing it.
+     */
+    static constexpr core::AdmitPoint admit_point = core::AdmitPoint::SegmentLink;
+
+    /// This policy counts segments, so the chunk count is both the bound and the divisor.
+    static constexpr std::size_t live_segments(std::size_t chunks) noexcept { return chunks; }
 
     explicit SegmentCount(Config c) noexcept : bound_{c.segments ? c.segments : 1} {}
 
     /**
-     * Tests rather than reserves.
+     * @brief May one more segment be linked?
+     * @return false once the segment ceiling is reached.
      *
-     * Unlike an item count there is nothing to reserve here: whether this enqueue causes
-     * a segment to be linked is not known until the current tail refuses it, and most
-     * calls link nothing. The ceiling is therefore approximate to within the number of
-     * producers that link concurrently -- which bounds memory, the property this policy
-     * exists for, without pretending to an exactness it cannot provide.
+     * Tests rather than reserves, and at this call site that is sound: the proxy asks
+     * immediately before acquiring, and if it loses the `link_next` race it discards and
+     * asks again. The ceiling is therefore approximate to within the number of producers
+     * linking concurrently -- which bounds memory, the property this policy exists for,
+     * without pretending to an exactness it cannot provide.
+     *
+     * Live segments are `linked_ + 1` counting the sentinel, so linking one more makes
+     * `linked_ + 2`, and keeping that within `bound_` is exactly the expression below.
      */
     bool try_admit() noexcept {
         const uint64_t linked = linked_.load(std::memory_order_relaxed);
         return (linked + 1) < bound_;
     }
 
+    /// Nothing to give back: try_admit() reserves nothing.
     void cancel_admit() noexcept {}
 
+    /// @return The ceiling, in whatever unit this policy counts.
     std::size_t bound() const noexcept { return bound_; }
     std::size_t capacity(std::size_t segment) const noexcept { return bound_ * segment; }
 
+    /// @name Traversal hooks. Called by LinkedProxy as it observes each event.
+    /// @{
     void on_enqueue() noexcept {}
     void on_dequeue() noexcept {}
     void on_segment_linked() noexcept { linked_.fetch_add(1, std::memory_order_release); }
     void on_segment_retired() noexcept { linked_.fetch_sub(1, std::memory_order_release); }
+    /// @}
 
 private:
     const std::size_t bound_;
     //single counter due to the low frequency of updates
-    ALIGNED_CACHE std::atomic<uint64_t> linked_{0};
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
+    CACHE_LINE_MEMBER(std::atomic<uint64_t>, linked_, {0});
 };
 
 static_assert(core::AdmissionPolicy<None>);

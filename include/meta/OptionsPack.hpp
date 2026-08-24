@@ -1,12 +1,50 @@
 #pragma once
+/**
+ * @file OptionsPack.hpp
+ * @brief Compile-time option packs: flag tags and value options, with validation.
+ * @ingroup meta
+ */
+
 #include <type_traits>
 
 namespace meta {
 
+/**
+ * @brief Names a *value* option in an accepts-list.
+ *
+ * Flag options are plain tags, so an accepts-list can name them directly. A value option is a
+ * template -- `patience<2>` and `patience<8>` are different types -- and an accepts-list has no
+ * way to say "any instantiation of this one". This marker is that way:
+ *
+ * @code
+ * requires meta::AcceptsOnly<Opt,
+ *              typename HQOpt::force_cell_padding,        // a flag, named directly
+ *              meta::ValueOption<HQOpt::patience>>        // a value, named as a template
+ * @endcode
+ *
+ * @tparam K the option template, which must take a single `auto` non-type parameter so it can
+ *           also be handed to `OptionsPack::get`.
+ */
+template <template <auto> class K>
+struct ValueOption {};
+
 namespace detail {
-/// Is @p T one of @p Us? Factored out so `accepts` folds over one pack, not two nested.
+/**
+ * @brief Does option @p O satisfy accepts-list entry @p A?
+ *
+ * The primary template is plain type equality, which is what a flag needs. The partial
+ * specialization is what admits value options: `K<V>` matches `ValueOption<K>` for any V.
+ */
+template <typename O, typename A>
+struct option_matches : std::is_same<O, A> {};
+
+template <template <auto> class K, auto V>
+struct option_matches<K<V>, ValueOption<K>> : std::true_type {};
+
+/// Is @p T admitted by any entry of @p Us? Factored out so `accepts` folds over one pack,
+/// not two nested.
 template <typename T, typename... Us>
-inline constexpr bool is_one_of_v = (std::is_same_v<T, Us> || ...);
+inline constexpr bool is_one_of_v = (option_matches<T, Us>::value || ...);
 } // namespace detail
 
     /**
@@ -48,6 +86,9 @@ inline constexpr bool is_one_of_v = (std::is_same_v<T, Us> || ...);
          *
          * An algorithm declares what it accepts and asserts this, so an unrecognised tag
          * becomes an error at the point of instantiation.
+         *
+         * Entries are either a flag tag, named directly, or `meta::ValueOption<K>`, which
+         * admits every instantiation of the option template `K`.
          */
         template <typename... Accepted>
         static constexpr bool accepts = (detail::is_one_of_v<Options, Accepted...> && ...);
@@ -88,12 +129,22 @@ inline constexpr bool is_one_of_v = (std::is_same_v<T, Us> || ...);
          *
          * Usage:
          * @code
-         * template <size_t N> struct BufferSize { static constexpr auto value = N; };
-         * constexpr size_t val = Config::get<BufferSize, 1024>;
+         * struct RingOpt { template <auto N> struct buffer_size {}; };
+         * constexpr std::size_t n = Config::get<RingOpt::buffer_size, std::size_t{1024}>;
          * @endcode
          *
-         * @tparam KeyTemplate The template class to search for (e.g. BufferSize).
-         * @tparam Default The value to return if the option is not found.
+         * @note The option template must take a single **`auto`** parameter. A
+         *       `template <std::size_t N>` is less general than the `template <auto> class`
+         *       parameter here and will not bind.
+         *
+         * @warning **The result type is not stable.** When the option is absent the type comes
+         *          from @p Default; when it is present it comes from however the caller spelled
+         *          the value, so `buffer_size<1024>` yields `int` and `buffer_size<1024u>`
+         *          yields `unsigned`. Cast at the use site rather than relying on it:
+         *          `static_cast<std::size_t>(Opt::template get<K, std::size_t{2}>)`.
+         *
+         * @tparam KeyTemplate The option template to search for.
+         * @tparam Default The value to return if the option is not present.
          */
         template <template <auto> class KeyTemplate, auto Default>
         static constexpr auto get = ValueFinder<KeyTemplate, Default, Options...>::value;

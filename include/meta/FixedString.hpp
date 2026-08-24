@@ -1,4 +1,10 @@
 #pragma once
+/**
+ * @file FixedString.hpp
+ * @brief String literals as non-type template parameters, so a registry entry carries its own name.
+ * @ingroup meta
+ */
+
 #include <cstddef>
 #include <string_view>
 

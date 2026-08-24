@@ -1,10 +1,17 @@
 #pragma once
+/**
+ * @file LFring.hpp
+ * @brief The lock-free index ring SCQ is built from; usable standalone as queue::IndexRing.
+ * @ingroup algo
+ */
+
 #include <cell/PlainCell.hpp>
 #include <core/SegmentTraits.hpp>
 #include <linkage/Linkage.hpp>
 #include <mem/SingleBlock.hpp>
 #include <meta/OptionsPack.hpp>
 #include <util/bit.hpp>
+#include <util/align.hpp>
 #include <util/specs.hpp>
 #include <atomic>
 #include <cassert>
@@ -18,6 +25,12 @@ struct LFringOpt {
      * Removes the fullness pre-check, because the owner guarantees an index is available.
      */
     struct indirect_store {};
+
+    /// Inner-loop iterations a consumer spends on one cell before claiming it regardless.
+    template <auto N> struct max_dequeue_retries {};
+
+    /// How often that loop re-reads the shared tail, in iterations. **Power of two.**
+    template <auto N> struct tail_reload_period {};
 };
 
 /**
@@ -34,7 +47,10 @@ struct LFringOpt {
  * @note Not a linked segment on its own. SCQ is the segment; this is its component.
  */
 template <typename Opt = meta::EmptyOptions, typename Link = linkage::None>
-    requires meta::AcceptsOnly<Opt, typename LFringOpt::no_cell_padding, typename LFringOpt::indirect_store>
+    requires meta::AcceptsOnly<Opt, typename LFringOpt::no_cell_padding,
+                               typename LFringOpt::indirect_store,
+                               meta::ValueOption<LFringOpt::max_dequeue_retries>,
+                               meta::ValueOption<LFringOpt::tail_reload_period>>
 class LFring : public mem::SingleBlock<LFring<Opt, Link>> {
     using Self = LFring<Opt, Link>;
 
@@ -44,10 +60,23 @@ class LFring : public mem::SingleBlock<LFring<Opt, Link>> {
     /// Only a direct-store ring must check fullness; an index ring is bounded by its owner.
     static constexpr bool full_check = direct_store;
 
-    static constexpr uint64_t kReloadTailMask = (1ull << 8) - 1;
-    static constexpr size_t kMaxRetry = 1024 * 10;
+    static constexpr uint64_t kTailReloadPeriod = static_cast<uint64_t>(
+        Opt::template get<LFringOpt::tail_reload_period, uint64_t{1ull << 8}>);
+    static_assert(kTailReloadPeriod != 0 && (kTailReloadPeriod & (kTailReloadPeriod - 1)) == 0,
+                  "LFringOpt::tail_reload_period must be a power of two: the dequeue loop "
+                  "tests it as a mask");
+    static constexpr uint64_t kReloadTailMask = kTailReloadPeriod - 1;
+
+    static constexpr size_t kMaxRetry = static_cast<size_t>(
+        Opt::template get<LFringOpt::max_dequeue_retries, std::size_t{1024 * 10}>);
 
 public:
+    /// @name Tuning in effect
+    /// @{
+    static constexpr std::size_t max_dequeue_retries = kMaxRetry;
+    static constexpr uint64_t tail_reload_period = kTailReloadPeriod;
+    /// @}
+
     using cell_type = cell::PlainCell<uint64_t, pad_cells>;
     using link_state = typename Link::template state<Self>;
     using handle_type = typename link_state::handle;
@@ -62,6 +91,8 @@ public:
     }
 
     // -- single-block layout (standalone use) -------------------------------
+    /// @brief Where the co-allocated regions go. See @ref block-construction.
+    /// @param n requested capacity; the only thing the layout may depend on.
     static constexpr auto plan(std::size_t n) noexcept {
         mem::LayoutBuilder b{sizeof(Self), alignof(Self)};
         mem::Plan<1> p{};
@@ -88,6 +119,8 @@ public:
 
     // -- queue ---------------------------------------------------------------
 
+    /// @brief Add an item.
+    /// @return false if the queue is full, or closed.
     FORCE_INLINE bool enqueue(size_t item) noexcept {
         const size_t half = virtual_size(order_), n = half << 1;
         item ^= (n - 1); // fold the cycle bits in
@@ -128,6 +161,8 @@ public:
         }
     }
 
+    /// @brief Take the oldest item.
+    /// @return false if the queue is empty.
     FORCE_INLINE bool dequeue(size_t& out) noexcept {
         const size_t half = virtual_size(order_), n = half << 1;
         if (threshold_.load(std::memory_order_seq_cst) < 0) return false; // known empty
@@ -187,12 +222,14 @@ public:
         }
     }
 
+    /// @return Items currently held. Approximate under concurrency, exact when quiescent.
     std::size_t size() const noexcept {
         const uint64_t t = bit::clear_msb(tail_.load(std::memory_order_acquire));
         const uint64_t h = head_.load(std::memory_order_acquire);
         return t <= h ? 0 : static_cast<std::size_t>(t - h);
     }
 
+    /// @return Items this queue can hold.
     std::size_t capacity() const noexcept { return virtual_size(order_); }
 
     /**
@@ -207,8 +244,10 @@ public:
         threshold_.store(static_cast<int64_t>(half + (half << 1) - 1), std::memory_order_release);
     }
 
+    /// @brief Refuse all further enqueues, permanently.
     void close() noexcept { tail_.fetch_or(bit::set_msb<uint64_t>(0), std::memory_order_release); }
 
+    /// @return true once closed; a closed segment still drains.
     bool is_closed() const noexcept {
         return bit::get_msb(tail_.load(std::memory_order_acquire)) != 0;
     }
@@ -255,12 +294,9 @@ private:
 
     const size_t order_;
     cell_type* const cells_;
-    ALIGNED_CACHE std::atomic<uint64_t> head_{0};
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
-    ALIGNED_CACHE std::atomic<uint64_t> tail_{0};
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
-    ALIGNED_CACHE std::atomic<int64_t> threshold_{0};
-    CACHE_PAD_TYPES(std::atomic<int64_t>);
+    CACHE_LINE_MEMBER(std::atomic<uint64_t>, head_, {0});
+    CACHE_LINE_MEMBER(std::atomic<uint64_t>, tail_, {0});
+    CACHE_LINE_MEMBER(std::atomic<int64_t>, threshold_, {0});
 };
 
 } // namespace algo
@@ -270,5 +306,6 @@ namespace queue {
 /// Named IndexRing rather than LFring: it carries indices, not user payloads, and the
 /// name LFring is still taken by the legacy header for as long as that tree exists.
 template <typename Opt = meta::EmptyOptions>
+/// Standalone index ring. Named for what it carries: indices, not payloads.
 using IndexRing = algo::LFring<Opt, linkage::None>;
 } // namespace queue

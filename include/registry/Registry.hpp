@@ -39,7 +39,7 @@ struct Entry {
 /// Size of every pooled entry below. Named once because it appears twice per entry -- in
 /// the segment's handle policy and in the proxy alias -- and LinkedProxy static_asserts
 /// that the two agree.
-inline constexpr std::size_t kPoolSize = 8;
+inline constexpr std::size_t kPoolSize = 32;
 
 // Handle-policy shorthands: a pooled source addresses segments by index, not pointer, and
 // the index is sized by the pool so the rest of the word is ABA counter.
@@ -96,21 +96,21 @@ template <typename T>
 using Linked = meta::TypeList<
     Entry<"u-vyukov", proxy::Unbounded<T, seg::Vyukov<T>>>,
     Entry<"u-prq", proxy::Unbounded<T, seg::PRQ<T>>>,
-    Entry<"u-faaarray", proxy::Unbounded<T, seg::FAAArray<T>>>,
+    Entry<"u-faa", proxy::Unbounded<T, seg::FAAArray<T>>>,
     Entry<"u-hq", proxy::Unbounded<T, seg::HQ<T>>>,
     Entry<"u-scq", proxy::Unbounded<T, seg::SCQ<T>>>,
     Entry<"u-mutex", proxy::Unbounded<T, seg::Mutex<T>>>,
 
     Entry<"item-vyukov", proxy::ItemBounded<T, seg::Vyukov<T>>>,
     Entry<"item-prq", proxy::ItemBounded<T, seg::PRQ<T>>>,
-    Entry<"item-faaarray", proxy::ItemBounded<T, seg::FAAArray<T>>>,
+    Entry<"item-faa", proxy::ItemBounded<T, seg::FAAArray<T>>>,
     Entry<"item-hq", proxy::ItemBounded<T, seg::HQ<T>>>,
     Entry<"item-scq", proxy::ItemBounded<T, seg::SCQ<T>>>,
     Entry<"item-mutex", proxy::ItemBounded<T, seg::Mutex<T>>>,
 
     Entry<"chunk-vyukov", proxy::ChunkBounded<T, seg::Vyukov<T>>>,
     Entry<"chunk-prq", proxy::ChunkBounded<T, seg::PRQ<T>>>,
-    Entry<"chunk-faaarray", proxy::ChunkBounded<T, seg::FAAArray<T>>>,
+    Entry<"chunk-faa", proxy::ChunkBounded<T, seg::FAAArray<T>>>,
     Entry<"chunk-hq", proxy::ChunkBounded<T, seg::HQ<T>>>,
     Entry<"chunk-scq", proxy::ChunkBounded<T, seg::SCQ<T>>>,
     Entry<"chunk-mutex", proxy::ChunkBounded<T, seg::Mutex<T>>>,
@@ -201,7 +201,12 @@ template <typename Q, typename... Es>
 constexpr std::string_view lookup_name(meta::TypeList<Es...>) noexcept {
     std::string_view found{};
     // Short-circuits on the match; `found` stays empty for a type that is not registered.
-    ((std::same_as<Q, typename Es::type> ? (found = Es::name.view(), true) : false) || ...);
+    //
+    // The fold's own `bool` is only the short-circuit mechanism -- the answer is `found` -- so
+    // it is discarded, and the cast says so explicitly. Without it clang reports an unused
+    // expression result once per instantiation, and each report reproduces the entire expanded
+    // registry type: sixty warnings, several kilobytes each.
+    (void)((std::same_as<Q, typename Es::type> ? (found = Es::name.view(), true) : false) || ...);
     return found;
 }
 } // namespace detail

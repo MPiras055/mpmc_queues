@@ -1,8 +1,15 @@
 #pragma once
+/**
+ * @file CacheRing.hpp
+ * @brief Bounded MPMC ring of small indices, one word per cell. The pooled source's reuse cache.
+ * @ingroup algo
+ */
+
 #include <cell/PlainCell.hpp>
 #include <mem/Handle.hpp>
 #include <meta/OptionsPack.hpp>
 #include <util/bit.hpp>
+#include <util/align.hpp>
 #include <util/specs.hpp>
 #include <atomic>
 #include <cassert>
@@ -88,6 +95,7 @@ public:
     CacheRing(const CacheRing&) = delete;
     CacheRing& operator=(const CacheRing&) = delete;
 
+    /// @return Items this queue can hold.
     static constexpr std::size_t capacity() noexcept { return kSize; }
 
     /// @return false when the ring is full.
@@ -144,6 +152,7 @@ public:
         }
     }
 
+    /// @return Items currently held. Approximate under concurrency, exact when quiescent.
     std::size_t size() const noexcept {
         const uint64_t t = tail_.load(std::memory_order_acquire);
         const uint64_t h = head_.load(std::memory_order_acquire);
@@ -171,10 +180,8 @@ private:
     }
 
     cell_type cells_[kSize];
-    ALIGNED_CACHE std::atomic<uint64_t> tail_{0};
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
-    ALIGNED_CACHE std::atomic<uint64_t> head_{0};
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
+    CACHE_LINE_MEMBER(std::atomic<uint64_t>, tail_, {0});
+    CACHE_LINE_MEMBER(std::atomic<uint64_t>, head_, {0});
 };
 
 } // namespace algo

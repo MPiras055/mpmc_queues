@@ -22,20 +22,35 @@ namespace proxy {
  * is just `Seg*`. LinkedProxy static_asserts the two agree, so getting this wrong is a
  * diagnosable error rather than a silent layout mismatch.
  */
-template <typename Seg>
-using HazardSource = mem::source::Hazard<Seg, ThreadMeta<Seg*>>;
+template <typename Seg, typename SrcOpt = meta::EmptyOptions>
+using HazardSource = mem::source::Hazard<Seg, ThreadMeta<Seg*>, SrcOpt>;
+
+/**
+ * @name The proxy family
+ *
+ * Every alias takes two trailing option packs, both defaulted so the common spelling is
+ * unchanged: @p SrcOpt tunes the source (mem::source::HazardOpt, mem::source::PoolOpt) and
+ * @p ProxyOpt the traversal (proxy::ProxyOpt -- notably `segment_stats`). They are separate
+ * packs rather than one because an option belongs to whichever component reads it, and
+ * `AcceptsOnly` would reject a foreign tag in either direction.
+ * @{
+ */
 
 /// Grows without limit. Was UnboundedProxy.
-template <typename T, typename Seg>
-using Unbounded = LinkedProxy<T, Seg, admit::None, HazardSource<Seg>>;
+template <typename T, typename Seg, typename SrcOpt = meta::EmptyOptions,
+          typename ProxyOpt = meta::EmptyOptions>
+using Unbounded = LinkedProxy<T, Seg, admit::None, HazardSource<Seg, SrcOpt>, ProxyOpt>;
 
 /// Bounded by live item count. Was BoundedCounterProxy.
-template <typename T, typename Seg>
-using ItemBounded = LinkedProxy<T, Seg, admit::ItemCount, HazardSource<Seg>>;
+template <typename T, typename Seg, typename SrcOpt = meta::EmptyOptions,
+          typename ProxyOpt = meta::EmptyOptions>
+using ItemBounded = LinkedProxy<T, Seg, admit::ItemCount, HazardSource<Seg, SrcOpt>, ProxyOpt>;
 
 /// Bounded by live segment count. Was BoundedChunkProxy.
-template <typename T, typename Seg>
-using ChunkBounded = LinkedProxy<T, Seg, admit::SegmentCount, HazardSource<Seg>>;
+template <typename T, typename Seg, typename SrcOpt = meta::EmptyOptions,
+          typename ProxyOpt = meta::EmptyOptions>
+using ChunkBounded =
+    LinkedProxy<T, Seg, admit::SegmentCount, HazardSource<Seg, SrcOpt>, ProxyOpt>;
 
 /**
  * @brief Bounded by a fixed pool of recycled segments. Was BoundedMemProxy.
@@ -44,9 +59,12 @@ using ChunkBounded = LinkedProxy<T, Seg, admit::SegmentCount, HazardSource<Seg>>
  * the pool running dry -- which is why this needed no policy of its own, and why the
  * whole 288-line proxy collapses into an alias.
  */
-template <typename T, typename Seg, std::size_t N = 4>
+template <typename T, typename Seg, std::size_t N = 4, typename SrcOpt = meta::EmptyOptions,
+          typename ProxyOpt = meta::EmptyOptions>
 using MemBounded =
     LinkedProxy<T, Seg, admit::None,
-                mem::source::Pool<Seg, N, ThreadMeta<mem::VersionedIndex<N>>>>;
+                mem::source::Pool<Seg, N, ThreadMeta<mem::VersionedIndex<N>>, SrcOpt>, ProxyOpt>;
+
+/// @}
 
 } // namespace proxy

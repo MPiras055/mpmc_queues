@@ -130,7 +130,13 @@ private:
 void usage(const char* argv0) {
     std::cerr << "usage: " << argv0
               << " <name> <producers> <consumers> <items> <capacity>"
-                 " [pin] [prod_ticks prod_amp] [cons_ticks cons_amp]\n\nregistered:\n";
+                 " [pin] [prod_ticks prod_amp] [cons_ticks cons_amp]\n\n"
+                 "  <capacity>  total items the queue holds. A linked queue splits it across\n"
+                 "              the segments that will exist -- the chunk count for a bounded\n"
+                 "              proxy, the pool size for a pooled one -- so the per-segment\n"
+                 "              size is capacity/segments, floored at 2 and rounded up by the\n"
+                 "              algorithm. The queue may therefore hold more than asked.\n"
+                 "\nregistered:\n";
     registry::for_each_name(registry::All<TestItem>{},
                             [](std::string_view n) { std::cerr << "  " << n << '\n'; });
 }

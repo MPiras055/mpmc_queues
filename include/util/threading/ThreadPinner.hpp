@@ -1,4 +1,10 @@
 #pragma once
+/**
+ * @file ThreadPinner.hpp
+ * @brief Deciding which cores a producer/consumer split should run on.
+ * @ingroup util
+ */
+
 #include <algorithm>
 #include <charconv>
 #include <cstddef>

@@ -20,8 +20,10 @@
  *       rather than spinning forever, so a livelock fails the test instead of hanging it.
  */
 #include <gtest/gtest.h>
+#include <algo/HQ.hpp>
 #include <registry/Registry.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <barrier>
 #include <thread>
@@ -176,6 +178,75 @@ TYPED_TEST(Mpmc, SingleProducerMultiConsumer) {
 TYPED_TEST(Mpmc, SmallSegmentsForceConstantTurnover) {
     expect_clean<TypeParam>(run_shape<TypeParam>(kShapeItems, 4, 4, /*capacity=*/16),
                             kShapeItems, "4P/4C, 16-slot segments");
+}
+
+/**
+ * @brief HQ's slow path must not destroy capacity when nothing is queued behind the head.
+ *
+ * Not typed: this is a property of one segment's dequeue strategy, not of every registered
+ * queue. HQ splits dequeue on whether a successor exists, and the slow path -- the one
+ * taken while this is the only segment -- is the reason HQ exists at all. Both paths may
+ * overwrite a cell a producer has claimed but not yet written, which permanently costs a
+ * slot in a write-once array; the slow path is supposed to avoid that.
+ *
+ * It did not. A consumer that reached an empty cell waited two loads and then burned it
+ * anyway, even when `tail == head + 1`, i.e. when nothing was published behind the stalled
+ * index and so there was no head-of-line blocking to break. Measured before the fix, one
+ * producer against one hard-polling consumer: 989 of 1024 slots survived, worst trial.
+ *
+ * The segment is used unlinked and directly, not through a proxy, because a proxy would
+ * link a successor the moment the segment refused an item -- which is exactly the
+ * condition that switches HQ to the fast path and hides this.
+ */
+TEST(HQSlowPath, DoesNotBurnCapacityWithNothingQueuedBehind) {
+    using Seg = seg::HQ<Item>;
+    constexpr std::size_t kCapacity = 1024;
+    constexpr int kTrials = 10;
+
+    std::size_t placed_total = 0, taken_total = 0, worst = kCapacity;
+
+    for (int trial = 0; trial < kTrials; ++trial) {
+        Seg* s = mem::SingleBlock<Seg>::create(kCapacity);
+        std::vector<Data> store(kCapacity);
+        for (std::size_t i = 0; i < kCapacity; ++i) store[i] = {i + 1, 0};
+
+        std::atomic<std::size_t> placed{0};
+        std::atomic<bool> done{false};
+
+        // The gap is what makes this test bite, and it has to be a real delay -- a
+        // compiler barrier is not one. It keeps the queue near-empty so the consumer
+        // polls many times per item and is therefore usually sitting on the head cell
+        // when the producer fetch-adds, which is the window the burn happens in.
+        std::thread producer{[&] {
+            for (std::size_t i = 0; i < kCapacity; ++i) {
+                if (!s->enqueue(&store[i])) break; // refused: capacity was destroyed
+                placed.fetch_add(1, std::memory_order_relaxed);
+                for (int k = 0; k < 200; ++k) SPIN_HINT();
+            }
+            done.store(true, std::memory_order_release);
+        }};
+
+        std::size_t taken = 0;
+        std::thread consumer{[&] {
+            Item out = nullptr;
+            while (!done.load(std::memory_order_acquire))
+                if (s->dequeue(out)) ++taken;
+            while (s->dequeue(out)) ++taken;
+        }};
+
+        producer.join();
+        consumer.join();
+
+        placed_total += placed.load();
+        taken_total += taken;
+        worst = std::min(worst, placed.load());
+        mem::SingleBlock<Seg>::destroy(s);
+    }
+
+    EXPECT_EQ(placed_total, kCapacity * kTrials)
+        << "the consumer burned slots a producer had claimed with nothing queued behind "
+           "them; worst trial placed " << worst << " of " << kCapacity;
+    EXPECT_EQ(taken_total, placed_total) << "items were lost";
 }
 
 } // namespace

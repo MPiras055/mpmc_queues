@@ -1,4 +1,10 @@
 #pragma once
+/**
+ * @file SegmentTraits.hpp
+ * @brief Per-segment capability declarations.
+ * @ingroup core
+ */
+
 #include <concepts>
 #include <type_traits>
 
@@ -8,18 +14,7 @@ namespace core {
  * @brief Per-segment capability block.
  *
  * @warning The primary template is deliberately left **undefined**. A segment with no
- *          specialization fails to compile at first use, naming the missing
- *          specialization. This replaces three mechanisms that all failed *silently*:
- *
- *          - `ILinkedSegment::info_required`, inherited with a `false` default, so a
- *            segment that needed the hint and forgot simply got the slow path — or the
- *            livelock the flag exists to prevent.
- *          - a `requires(Segment s){ s.prepareDequeueAfterNextLinked(); }` probe,
- *            copy-pasted into all four proxies, which silently did nothing if the
- *            method was ever renamed.
- *          - `void_t` tag traits, which answered `false` on a misspelled tag.
- *
- * Every flag here must carry the reason it exists, next to the flag.
+ *          specialization fails to compile at first use
  */
 template <typename S>
 struct segment_traits;

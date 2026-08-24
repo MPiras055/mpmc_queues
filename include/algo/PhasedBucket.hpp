@@ -1,5 +1,12 @@
 #pragma once
+/**
+ * @file PhasedBucket.hpp
+ * @brief Fill-then-drain index bucket, one fetch-add per end. Serves the pooled source's epoch rotation.
+ * @ingroup algo
+ */
+
 #include <meta/OptionsPack.hpp>
+#include <util/align.hpp>
 #include <util/specs.hpp>
 #include <atomic>
 #include <cassert>
@@ -111,6 +118,7 @@ public:
     PhasedBucket(const PhasedBucket&) = delete;
     PhasedBucket& operator=(const PhasedBucket&) = delete;
 
+    /// @return Items this queue can hold.
     static constexpr std::size_t capacity() noexcept { return Capacity; }
 
     /**
@@ -183,8 +191,7 @@ public:
 private:
     /// One word for both ends, so a fill and a drain never touch separate lines and the
     /// reset of one half is a single masked read-modify-write on the other's line.
-    ALIGNED_CACHE std::atomic<uint64_t> state_;
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
+    CACHE_LINE_MEMBER(std::atomic<uint64_t>, state_);
     /// Aligning the buffer pads `state_` out to its own line as a side effect.
     std::atomic<value_type> buffer_[Capacity];
 };

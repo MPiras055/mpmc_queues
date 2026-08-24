@@ -1,3 +1,7 @@
+> **Archived.** A raw source dump of an early co-allocation experiment. Superseded by mem::SingleBlock and the block-construction section of docs/Extending.md.
+>
+> Kept for the design history; nothing here describes the current tree.
+
 #pragma once
 #include <atomic>
 #include <cstdint>

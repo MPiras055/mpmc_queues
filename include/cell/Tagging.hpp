@@ -1,4 +1,10 @@
 #pragma once
+/**
+ * @file Tagging.hpp
+ * @brief How a cell word encodes empty, consumed, claimed and payload.
+ * @ingroup cell
+ */
+
 #include <util/bit.hpp>
 #include <atomic>
 #include <concepts>
@@ -90,16 +96,22 @@ constexpr T from_word(W w) noexcept {
  */
 template <typename T>
 struct MsbTag {
+    /// The machine word a cell holds.
     using word = uintptr_t;
 
     /// A null payload encodes to 0, which has no MSB, so it is an ordinary payload.
     static constexpr bool can_store_null = true;
 
+    /// @return The word meaning "never written".
     static constexpr word empty() noexcept { return bit::set_msb<word>(0); }
+    /// @return The word meaning "written and taken".
     static constexpr word consumed() noexcept { return bit::set_msb<word>(1); }
 
+    /// @return true if @p w is the empty sentinel.
     static constexpr bool is_empty(word w) noexcept { return w == empty(); }
+    /// @return true if @p w is the consumed sentinel.
     static constexpr bool is_consumed(word w) noexcept { return w == consumed(); }
+    /// @return true if @p w carries a user item rather than a sentinel.
     static constexpr bool is_payload(word w) noexcept { return bit::get_msb<word>(w) == 0; }
     /// Words 0 and 1 above the MSB are taken by empty/consumed; claims start at 2.
     static constexpr bool is_claim(word w) noexcept {
@@ -115,7 +127,9 @@ struct MsbTag {
         return token;
     }
 
+    /// @return @p v as a cell word.
     static constexpr word encode(T v) noexcept { return detail::to_word<T, word>(v); }
+    /// @return the item in @p w. Undefined unless is_payload(w).
     static constexpr T decode(word w) noexcept { return detail::from_word<T, word>(w); }
 };
 
@@ -133,19 +147,27 @@ struct MsbTag {
  */
 template <typename T>
 struct LowTag {
+    /// The machine word a cell holds.
     using word = uintptr_t;
 
     /// 0 means empty, so a null item is indistinguishable from an unwritten cell.
     static constexpr bool can_store_null = false;
 
+    /// @return The word meaning "never written".
     static constexpr word empty() noexcept { return 0; }
+    /// @return The word meaning "written and taken".
     static constexpr word consumed() noexcept { return 1; }
 
+    /// @return true if @p w is the empty sentinel.
     static constexpr bool is_empty(word w) noexcept { return w == 0; }
+    /// @return true if @p w is the consumed sentinel.
     static constexpr bool is_consumed(word w) noexcept { return w == 1; }
+    /// @return true if @p w carries a user item rather than a sentinel.
     static constexpr bool is_payload(word w) noexcept { return w > 1; }
 
+    /// @return @p v as a cell word.
     static constexpr word encode(T v) noexcept { return detail::to_word<T, word>(v); }
+    /// @return the item in @p w. Undefined unless is_payload(w).
     static constexpr T decode(word w) noexcept { return detail::from_word<T, word>(w); }
 };
 

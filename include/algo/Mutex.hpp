@@ -1,4 +1,10 @@
 #pragma once
+/**
+ * @file Mutex.hpp
+ * @brief Lock-based bounded ring. The control every lock-free algorithm here is measured against.
+ * @ingroup algo
+ */
+
 #include <core/SegmentTraits.hpp>
 #include <linkage/Linkage.hpp>
 #include <mem/SingleBlock.hpp>
@@ -25,6 +31,18 @@ public:
     using link_state = typename Link::template state<Self>;
     using handle_type = typename link_state::handle;
 
+    /**
+     * @brief What a capacity request of @p n actually yields.
+     * @return the capacity a segment built with @p n will report.
+     *
+     * Static so a caller can size a split before anything is constructed: LinkedProxy divides
+     * its total across the segments that will exist, and has to know what each one rounds to
+     * before it can report a capacity the queue can genuinely reach.
+     */
+    static constexpr std::size_t capacity_for(std::size_t n) noexcept { return n; }
+
+    /// @brief Where the co-allocated regions go. See @ref block-construction.
+    /// @param n requested capacity; the only thing the layout may depend on.
     static constexpr auto plan(std::size_t n) noexcept {
         mem::LayoutBuilder b{sizeof(Self), alignof(Self)};
         mem::Plan<1> p{};
@@ -39,6 +57,8 @@ public:
         assert(n != 0 && "Mutex: capacity must be non-null");
     }
 
+    /// @brief Add an item.
+    /// @return false if the queue is full, or closed.
     bool enqueue(T item) noexcept {
         std::lock_guard<std::mutex> g(mu_);
         if (closed_) return false;
@@ -64,8 +84,14 @@ public:
         return true;
     }
 
+    /// @brief Add an item, skipping the attempt when the caller already knows it is closed.
+    /// @param closed_hint the caller believes this segment is closed; see
+    ///        core::segment_traits::needs_close_hint.
+    /// @return false if the queue is full, or closed.
     bool enqueue(T item, bool /*closed_hint*/) noexcept { return enqueue(item); }
 
+    /// @brief Take the oldest item.
+    /// @return false if the queue is empty.
     bool dequeue(T& out) noexcept {
         std::lock_guard<std::mutex> g(mu_);
         if (count_ == 0) return false;
@@ -75,13 +101,16 @@ public:
         return true;
     }
 
+    /// @return Items currently held. Approximate under concurrency, exact when quiescent.
     std::size_t size() const noexcept {
         std::lock_guard<std::mutex> g(mu_);
         return count_;
     }
 
+    /// @return Items this queue can hold.
     std::size_t capacity() const noexcept { return capacity_; }
 
+    /// @brief Refuse all further enqueues, permanently.
     void close() noexcept
         requires(Link::is_linked)
     {
@@ -89,6 +118,7 @@ public:
         closed_ = true;
     }
 
+    /// @return true once closed; a closed segment still drains.
     bool is_closed() const noexcept
         requires(Link::is_linked)
     {
@@ -106,16 +136,21 @@ public:
         return true;
     }
 
+    /// @return The successor handle, or nil if this is the tail.
     handle_type next() const noexcept
         requires(Link::is_linked)
     {
         return link_.next();
     }
 
-    bool link_next(handle_type h) noexcept
+    /// @brief Publish @p h as the successor.
+    /// @param current set to the successor now installed -- @p h if we won, the winner's
+    ///        handle if we lost, so a losing caller need not re-read next().
+    /// @return true for exactly one caller; the loser must discard its segment.
+    bool link_next(handle_type h, handle_type& current) noexcept
         requires(Link::is_linked)
     {
-        return link_.link_next(h);
+        return link_.link_next(h, current);
     }
 
 private:
@@ -129,6 +164,8 @@ private:
 
 } // namespace algo
 
+/// @brief Capabilities of algo::Mutex as a linked segment. Every field is mandatory:
+/// core::segment_traits has no primary definition, so omitting one is a compile error.
 template <typename T, typename Opt, typename Link>
 struct core::segment_traits<algo::Mutex<T, Opt, Link>> {
     static constexpr bool needs_close_hint = false;
@@ -142,10 +179,12 @@ MPMC_ASSERT_SEGMENT_TRAITS(algo::Mutex<int*, meta::EmptyOptions, linkage::None>)
 
 namespace queue {
 template <typename T, typename Opt = meta::EmptyOptions>
+/// Standalone lock-based ring. The control the lock-free algorithms are measured against.
 using Mutex = algo::Mutex<T, Opt, linkage::None>;
 }
 
 namespace seg {
 template <typename T, typename Opt = meta::EmptyOptions, typename HP = mem::PtrHandle>
+/// The lock-based ring as a linked segment.
 using Mutex = algo::Mutex<T, Opt, linkage::Node<HP>>;
 }

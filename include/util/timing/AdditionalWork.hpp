@@ -1,4 +1,10 @@
 #pragma once
+/**
+ * @file AdditionalWork.hpp
+ * @brief Simulated per-operation work, so the benchmark can vary contention.
+ * @ingroup util
+ */
+
 #include <cstdlib>
 #include <random>
 #include "TicksWait.h"

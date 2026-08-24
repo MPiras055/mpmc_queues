@@ -169,6 +169,23 @@ if(BUILD_TESTING_MPMC)
     # Recorded for the .clangd template below, which has to name the header directory
     # explicitly. All three layouts put the headers in the same place under their root.
     set(MPMC_GTEST_INCLUDE "${MPMC_GTEST_ROOT}/googletest/include")
+
+    # Third-party headers must not warn into this build. gtest-printers.h does an implicit
+    # char8_t -> char32_t conversion that clang 21 diagnoses, which is upstream's business and
+    # not something to work around in our sources.
+    #
+    # Applied here rather than inside any GoogleTest tree so it holds whichever of the three
+    # tiers above supplied the target -- including the in-tree checkout, which is not ours to
+    # edit.
+    foreach(_gt gtest gtest_main)
+        if(TARGET ${_gt})
+            get_target_property(_gt_inc ${_gt} INTERFACE_INCLUDE_DIRECTORIES)
+            if(_gt_inc)
+                set_target_properties(${_gt} PROPERTIES
+                    INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${_gt_inc}")
+            endif()
+        endif()
+    endforeach()
 endif()
 
 # ============================================================
@@ -210,6 +227,7 @@ if(BUILD_TESTING_MPMC)
         ThreadRegistryTest        # the lock-free thread registry both sources are built on
         ThreadPinnerTest          # core placement rule and topology parsing
         ProxyAccountingTest       # size() across threads that join and leave
+        OptionsTest               # option packs, value options, and segment stats
         BucketTest                # the phased and cache index buckets
     )
 
@@ -247,6 +265,39 @@ if(BUILD_TESTING_MPMC)
         # The concurrency suite runs every implementation several times over.
         set_tests_properties(${test_name} PROPERTIES TIMEOUT 900)
     endforeach()
+endif()
+
+# ============================================================
+# Documentation
+# ============================================================
+# `cmake --build build --target docs` -> build/docs/html/index.html
+#
+# Entirely optional, and deliberately quiet about it: a machine without Doxygen must still
+# configure and build everything else. The same reasoning as the topology generator and the
+# .clangd template above -- a documentation tool is not a build dependency.
+find_package(Doxygen QUIET OPTIONAL_COMPONENTS dot)
+
+if(DOXYGEN_FOUND)
+    set(DOXYGEN_OUTPUT_DIR ${CMAKE_BINARY_DIR}/docs)
+    # Diagrams need graphviz, which is a separate package from doxygen itself.
+    if(TARGET Doxygen::dot)
+        set(DOXYGEN_HAVE_DOT YES)
+    else()
+        set(DOXYGEN_HAVE_DOT NO)
+    endif()
+
+    configure_file(${PROJECT_SOURCE_DIR}/docs/Doxyfile.in ${CMAKE_BINARY_DIR}/Doxyfile @ONLY)
+
+    add_custom_target(docs
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${DOXYGEN_OUTPUT_DIR}
+        COMMAND Doxygen::doxygen ${CMAKE_BINARY_DIR}/Doxyfile
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMENT "Doxygen -> ${DOXYGEN_OUTPUT_DIR}/html/index.html"
+        VERBATIM)
+
+    message(STATUS "MPMCQueue: docs target available (dot=${DOXYGEN_HAVE_DOT})")
+else()
+    message(STATUS "MPMCQueue: Doxygen not found; the `docs` target is unavailable")
 endif()
 
 # ============================================================

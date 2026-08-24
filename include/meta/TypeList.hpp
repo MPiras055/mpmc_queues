@@ -1,4 +1,10 @@
 #pragma once
+/**
+ * @file TypeList.hpp
+ * @brief A type list and the folds over it that the registry is built on.
+ * @ingroup meta
+ */
+
 #include <cstddef>
 #include <type_traits>
 

@@ -1,4 +1,10 @@
 #pragma once
+/**
+ * @file VyukovDCAS.hpp
+ * @brief Vyukov's ring updating value and sequence in one double-width CAS; a comparator for what that instruction costs.
+ * @ingroup algo
+ */
+
 #include <cell/SequencedCell.hpp>
 #include <core/SegmentTraits.hpp>
 #include <linkage/Linkage.hpp>
@@ -6,6 +12,7 @@
 #include <meta/OptionsPack.hpp>
 #include <util/atomic/cas2.hpp>
 #include <util/bit.hpp>
+#include <util/align.hpp>
 #include <util/specs.hpp>
 #include <atomic>
 #include <cassert>
@@ -51,6 +58,8 @@ public:
         return bit::round_to_next_pow2(n < 2 ? 2 : n);
     }
 
+    /// @brief Where the co-allocated regions go. See @ref block-construction.
+    /// @param n requested capacity; the only thing the layout may depend on.
     static constexpr auto plan(std::size_t n) noexcept {
         mem::LayoutBuilder b{sizeof(Self), alignof(Self)};
         mem::Plan<1> p{};
@@ -69,6 +78,8 @@ public:
         }
     }
 
+    /// @brief Add an item.
+    /// @return false if the queue is full, or closed.
     bool enqueue(T item) noexcept {
         uint64_t t = tail_.load(std::memory_order_relaxed);
         for (;;) {
@@ -77,7 +88,7 @@ public:
             if (t == seq) {
                 uint64_t expect_val = 0, expect_seq = seq;
                 // Install payload and next sequence as one indivisible update.
-                const bool installed = p_atomic::cas2(&c, expect_val, expect_seq,
+                const bool installed = p_atomic::dcas(&c, expect_val, expect_seq,
                                                           reinterpret_cast<uint64_t>(item), t + 1);
                 uint64_t tt = t;
                 const bool moved = tail_.compare_exchange_weak(tt, t + 1, std::memory_order_relaxed);
@@ -94,6 +105,8 @@ public:
         }
     }
 
+    /// @brief Take the oldest item.
+    /// @return false if the queue is empty.
     bool dequeue(T& out) noexcept {
         uint64_t h = head_.load(std::memory_order_relaxed);
         for (;;) {
@@ -102,7 +115,7 @@ public:
             T value = c.val.load(std::memory_order_acquire);
             if (seq == h + 1) {
                 uint64_t expect_val = reinterpret_cast<uint64_t>(value), expect_seq = seq;
-                const bool took = p_atomic::cas2(&c, expect_val, expect_seq, 0, h + capacity_);
+                const bool took = p_atomic::dcas(&c, expect_val, expect_seq, 0, h + capacity_);
                 uint64_t hh = h;
                 const bool moved = head_.compare_exchange_weak(hh, h + 1, std::memory_order_relaxed);
                 if (took) {
@@ -120,26 +133,27 @@ public:
         }
     }
 
+    /// @return Items currently held. Approximate under concurrency, exact when quiescent.
     std::size_t size() const noexcept {
         const uint64_t t = tail_.load(std::memory_order_acquire);
         const uint64_t h = head_.load(std::memory_order_acquire);
         return t > h ? static_cast<std::size_t>(t - h) : 0;
     }
 
+    /// @return Items this queue can hold.
     std::size_t capacity() const noexcept { return capacity_; }
 
 private:
     const std::size_t capacity_;
     cell_type* const cells_;
-    ALIGNED_CACHE std::atomic<uint64_t> tail_{0};
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
-    ALIGNED_CACHE std::atomic<uint64_t> head_{0};
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
+    CACHE_LINE_MEMBER(std::atomic<uint64_t>, tail_, {0});
+    CACHE_LINE_MEMBER(std::atomic<uint64_t>, head_, {0});
 };
 
 } // namespace algo
 
 namespace queue {
 template <typename T, typename Opt = meta::EmptyOptions>
+/// Standalone ring updating value and sequence in one double-width CAS.
 using VyukovDCAS = algo::VyukovDCAS<T, Opt, linkage::None>;
 }

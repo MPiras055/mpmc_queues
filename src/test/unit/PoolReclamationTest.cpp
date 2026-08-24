@@ -20,10 +20,14 @@
 
 #include <algo/FAAArray.hpp>
 #include <algo/Vyukov.hpp>
+#include <core/Source.hpp>
+#include <mem/source/Hazard.hpp>
 #include <mem/source/Pool.hpp>
 
+#include <atomic>
 #include <optional>
 #include <set>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -307,8 +311,178 @@ TEST_F(Fixture, DerefIsStableForAGivenIndex) {
 
     auto b = take_one();
     ASSERT_TRUE(b);
-    if (b->index() == a->index())
+    // Braced deliberately: EXPECT_EQ with a streamed message expands to an if/else, so an
+    // unbraced enclosing `if` leaves that `else` ambiguously bound. Harmless today only
+    // because this `if` has no else of its own -- adding one later would attach it wrongly.
+    if (b->index() == a->index()) {
         EXPECT_EQ(pool.deref(*b), first) << "the same index resolved to a different segment";
+    }
+}
+
+/**
+ * @brief renew() moves a pinned thread forward, and does nothing when it is already current.
+ *
+ * The reason it exists: a pin taken at pin() and never moved holds try_advance back for the
+ * whole traversal, and the traversal is longest exactly when the queue is contended -- so the
+ * thread that most needs the rotation to turn is the one preventing it. Before renew() the only
+ * way to move a thread's stage was to drop the pin entirely.
+ *
+ * Both halves matter. That it advances is the point; that it is a no-op when already current is
+ * what keeps it off the fast path, since LinkedProxy calls it on every retry.
+ */
+TEST_F(Fixture, RenewMovesAPinnedThreadToTheCurrentStage) {
+    auto g = pool.pin();
+    const uint8_t pinned_at = g.stage();
+
+    // Nothing has moved, so renew must not either.
+    pool.renew(g);
+    EXPECT_EQ(g.stage(), pinned_at) << "renew republished while already current";
+
+    // Advance the rotation underneath this thread. It is the only pinned thread and it is
+    // published at the current stage, so the advance is permitted.
+    ASSERT_TRUE(pool.try_advance_epoch());
+    ASSERT_NE(pool.epoch(), pinned_at) << "the fixture could not move the stage";
+
+    pool.renew(g);
+    EXPECT_EQ(g.stage(), pool.epoch())
+        << "renew left the thread behind: it would keep blocking every other advance";
+}
+
+/**
+ * @brief A thread that never renews still holds the rotation back -- the behaviour renew fixes.
+ *
+ * Kept as the counterpart to the test above so the mechanism is pinned from both sides: with a
+ * stale pin outstanding, try_advance must refuse.
+ */
+TEST_F(Fixture, AStalePinBlocksTheRotation) {
+    auto g = pool.pin();
+    ASSERT_TRUE(pool.try_advance_epoch());   // first advance: this thread is current
+    // Now this thread is a stage behind and has not renewed.
+    EXPECT_FALSE(pool.try_advance_epoch())
+        << "the rotation moved past a thread still pinned at an older stage";
+    pool.renew(g);
+    EXPECT_TRUE(pool.try_advance_epoch()) << "renewing did not unblock the rotation";
+}
+
+/**
+ * @brief The reuse cache is serviceable when the rotation cannot move at all.
+ *
+ * This is the invariant that lets `acquire()` check the cache *before* taking a pin. The cache
+ * sits outside the rotation, so a slot in it is owed no grace period by anybody, and reaching
+ * it must not depend on the epoch making progress. Deliberately structured so the rotation is
+ * genuinely frozen -- a second thread holds a stale pin, because `pin()` republishes at the
+ * current stage and a nested pin on *this* thread would quietly unfreeze it.
+ *
+ * The `EXPECT_FALSE` before the discard is what gives the test its teeth: it establishes that
+ * the buckets have nothing to give, so the acquire that follows can only have come from the
+ * cache.
+ */
+TEST_F(Fixture, ACacheHitIsServiceableWhileTheRotationIsFrozen) {
+    auto all = take_all();
+    ASSERT_EQ(all.size(), kPool);
+
+    std::atomic<bool> pinned{false}, release{false};
+    std::thread stale{[&] {
+        auto s = pool.join();
+        ASSERT_TRUE(s);
+        auto g = pool.pin();
+        pinned.store(true, std::memory_order_release);
+        while (!release.load(std::memory_order_acquire)) std::this_thread::yield();
+        (void) g;   // held, and never renewed, for the whole body below
+    }};
+    while (!pinned.load(std::memory_order_acquire)) std::this_thread::yield();
+
+    // One advance succeeds -- both threads are current. That leaves the helper a stage behind,
+    // and with it still pinned there the rotation is stuck until it goes away.
+    ASSERT_TRUE(pool.try_advance_epoch());
+    ASSERT_FALSE(pool.try_advance_epoch()) << "the rotation moved past a stale pin";
+
+    // Nothing in the buckets is reachable, and no rotation can make anything reachable.
+    EXPECT_FALSE(take_one().has_value()) << "the buckets gave up a slot with the rotation frozen";
+
+    // A discard goes straight to the cache, bypassing the rotation entirely...
+    give_back(all.back());
+    all.pop_back();
+    ASSERT_EQ(pool.cache_count(), 1u) << "a discarded slot entered the rotation";
+
+    // ...so it is available immediately, frozen rotation or not.
+    EXPECT_TRUE(take_one().has_value())
+        << "a cached slot was unreachable because the epoch could not advance";
+
+    release.store(true, std::memory_order_release);
+    stale.join();
+}
+
+/**
+ * @brief renew() reports whether protection actually moved.
+ *
+ * The bool is not cosmetic: LinkedProxy::enqueue gates its retry on it, using false to mean
+ * "this thread was not the one holding the rotation back, so an empty pool is the real memory
+ * bound rather than a convoy". A renew() that always claimed to have moved would turn every
+ * genuine exhaustion into a wasted re-traversal; one that never did would disable the retry.
+ */
+TEST_F(Fixture, RenewReportsWhetherProtectionMoved) {
+    auto g = pool.pin();
+    EXPECT_FALSE(pool.renew(g)) << "a pin taken at the current stage claimed to have moved";
+
+    ASSERT_TRUE(pool.try_advance_epoch());   // leaves this thread a stage behind
+    EXPECT_TRUE(pool.renew(g)) << "a stale pin was not reported as moved";
+    EXPECT_FALSE(pool.renew(g)) << "renewing twice claimed to move the second time";
+}
+
+/// The other half of the contract: a renew that returns false changed nothing, so whatever the
+/// caller was already holding is still good. This is what lets the proxy skip the re-read that a
+/// true return obliges it to do.
+TEST_F(Fixture, ANoOpRenewLeavesExistingHandlesUsable) {
+    auto g = pool.pin();
+    auto h = pool.acquire();
+    ASSERT_TRUE(h);
+    const auto* before = pool.deref(*h);
+
+    ASSERT_FALSE(pool.renew(g)) << "precondition: this thread is already current";
+    EXPECT_EQ(pool.deref(*h), before) << "a no-op renew invalidated a live handle";
+}
+
+/**
+ * @brief A hint left pointing at a departed thread must not wedge the rotation shut.
+ *
+ * try_advance remembers whoever refused it last and asks that thread first, which is what keeps
+ * the common case off the full registry walk. Reading a payload directly bypasses the
+ * is_active() filter ThreadRegistry::all_of applies, and detached nodes keep their payload -- so
+ * if a node could be left reading "pinned at an older stage" after its thread was gone, the hint
+ * would refuse every rotation forever and a pooled proxy would refuse every enqueue with the
+ * pool sitting idle.
+ *
+ * What rules that out is that ~guard stores 0 unconditionally, so a departed thread always reads
+ * unpinned and the hint falls through to the scan. That is an invariant of two components at
+ * once, which is why it is tested rather than argued.
+ */
+TEST_F(Fixture, AHintNamingADepartedThreadDoesNotWedgeTheRotation) {
+    std::atomic<bool> pinned{false}, release{false}, gone{false};
+    std::thread straggler{[&] {
+        {
+            auto s = pool.join();
+            ASSERT_TRUE(s);
+            auto g = pool.pin();
+            pinned.store(true, std::memory_order_release);
+            while (!release.load(std::memory_order_acquire)) std::this_thread::yield();
+        }   // guard first, then session: the thread is unpinned and detached from here
+        gone.store(true, std::memory_order_release);
+    }};
+    while (!pinned.load(std::memory_order_acquire)) std::this_thread::yield();
+
+    ASSERT_TRUE(pool.try_advance_epoch());   // both current; leaves the straggler behind
+    // Refused, and in refusing the straggler is recorded as the hint.
+    ASSERT_FALSE(pool.try_advance_epoch());
+
+    release.store(true, std::memory_order_release);
+    while (!gone.load(std::memory_order_acquire)) std::this_thread::yield();
+    straggler.join();
+
+    // The hint still names that thread's node. If it were trusted blindly the rotation would
+    // now be shut for good.
+    EXPECT_TRUE(pool.try_advance_epoch())
+        << "the rotation stayed blocked by a thread that has already gone";
 }
 
 /// The pool only accepts segments that can actually be reset; see segment_traits.
@@ -321,6 +495,17 @@ TEST(PoolConstraints, EverySegmentOfferedToThePoolDeclaresItselfRecyclable) {
     // guard at. The static_assert in Pool is still there; it simply cannot be exercised
     // positively without a negative-compilation harness.
     static_assert(core::segment_traits<seg::FAAArray<Item>>::recyclable);
+    SUCCEED();
+}
+
+/// Both sources still satisfy core::SegmentSource, which is where `renew() -> bool` is spelled.
+/// Hazard's is a constant false -- per-handle protection has no epoch to move -- and this is
+/// what keeps that from silently drifting back to void.
+TEST(PoolConstraints, BothSourcesSatisfyTheRenewContract) {
+    using HazSeg = seg::Vyukov<Item>;
+    using Haz = mem::source::Hazard<HazSeg, mem::source::NoPayload>;
+    static_assert(core::SegmentSource<Haz, HazSeg>);
+    static_assert(core::SegmentSource<TestPool, Seg>);
     SUCCEED();
 }
 

@@ -1,5 +1,12 @@
 #pragma once
-#include <mem/Align.hpp>
+/**
+ * @file Layout.hpp
+ * @brief Computing a single-block layout: where each co-allocated region starts.
+ * @ingroup mem
+ */
+
+#include <util/align.hpp>
+#include <util/bit.hpp>
 #include <util/specs.hpp>
 #include <array>
 #include <cstddef>
@@ -43,7 +50,7 @@ struct Plan {
             if (r.end() > total) return false;     // runs off the end of the block
             prev_end = r.end();
         }
-        return block_align != 0 && is_pow2(block_align) && total % block_align == 0;
+        return block_align != 0 && bit::is_pow2(block_align) && total % block_align == 0;
     }
 };
 
@@ -60,7 +67,7 @@ public:
 
     /// Append a region of @p bytes at alignment @p a, advancing the cursor.
     constexpr Region add(std::size_t bytes, std::size_t a) noexcept {
-        cursor_ = align_up(cursor_, a);
+        cursor_ = align::align_up(cursor_, a);
         if (a > align_) align_ = a;
         const Region r{cursor_, bytes};
         cursor_ += bytes;
@@ -73,7 +80,7 @@ public:
     }
 
     /// Total block size. Rounded to block_align, which std::aligned_alloc requires.
-    constexpr std::size_t total() const noexcept { return align_up(cursor_, block_align()); }
+    constexpr std::size_t total() const noexcept { return align::align_up(cursor_, block_align()); }
 };
 
 /// A raw block, ready to have its regions addressed.

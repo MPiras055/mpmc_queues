@@ -1,6 +1,13 @@
 #pragma once
+/**
+ * @file SequencedCell.hpp
+ * @brief A payload word beside a sequence word, for the algorithms that version each slot.
+ * @ingroup cell
+ */
+
 
 #include <atomic>
+#include <util/align.hpp>
 #include <util/specs.hpp>  // defines CACHE_LINE
 
 
@@ -37,7 +44,7 @@ template <typename T>
 struct alignas(CACHE_LINE) SequencedCell<T, true> {
     std::atomic<T>        val;  ///< Stored value.
     std::atomic<uint64_t> seq;  ///< Sequence index.
-    CACHE_PAD_TYPES(std::atomic<T>,std::atomic<uint64_t>);
+    CACHE_PAD(std::atomic<T>,std::atomic<uint64_t>);
 };
 
 // -----------------------------------------------------------------------------
@@ -48,7 +55,7 @@ struct alignas(CACHE_LINE) SequencedCell<T, true> {
  * @brief A compact sequenced cell with minimal alignment.
  *
  * This specialization avoids padding and minimizes memory usage. It should be
- * used when false sharing is not a concern (e.g., single-producer/single-consumer).
+ * used when false sharing is not a concern or when memory usage is of the essence
  *
  * @tparam T Type of the stored value.
  */

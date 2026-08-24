@@ -1,4 +1,10 @@
 #pragma once
+/**
+ * @file PRQ.hpp
+ * @brief Fetch-add indexed ring with per-cell sequence numbers and an unsafe bit for consumer/producer races.
+ * @ingroup algo
+ */
+
 #include <cell/SequencedCell.hpp>
 #include <cell/Tagging.hpp>
 #include <core/SegmentTraits.hpp>
@@ -6,6 +12,7 @@
 #include <mem/SingleBlock.hpp>
 #include <meta/OptionsPack.hpp>
 #include <util/bit.hpp>
+#include <util/align.hpp>
 #include <util/specs.hpp>
 #include <atomic>
 #include <cassert>
@@ -15,6 +22,23 @@ namespace algo {
 struct PRQOpt {
     struct force_pow2 {};
     struct no_cell_padding {};
+
+    /**
+     * @brief Inner-loop iterations a consumer spends on one cell before stealing it.
+     *
+     * Bounds the obstruction-free wait: past this the consumer claims the cell whether or not
+     * the producer has published, which invalidates the slot and makes the producer retry
+     * with a fresh ticket. Lower trades throughput for latency under a stalled producer.
+     */
+    template <auto N> struct max_dequeue_retries {};
+
+    /**
+     * @brief How often that inner loop re-reads the shared tail, in iterations.
+     *
+     * The tail is a contended line, so it is sampled periodically rather than every pass.
+     * **Must be a power of two** -- the loop tests it as a mask.
+     */
+    template <auto N> struct tail_reload_period {};
 };
 
 /**
@@ -40,7 +64,10 @@ struct PRQOpt {
  */
 template <typename T, typename Opt, typename Link,
           typename Tag = cell::MsbTag<T>>
-    requires meta::AcceptsOnly<Opt, typename PRQOpt::force_pow2, typename PRQOpt::no_cell_padding> && linkage::Linked<Link> && cell::ClaimingTag<Tag, T>
+    requires meta::AcceptsOnly<Opt, typename PRQOpt::force_pow2, typename PRQOpt::no_cell_padding,
+                               meta::ValueOption<PRQOpt::max_dequeue_retries>,
+                               meta::ValueOption<PRQOpt::tail_reload_period>> &&
+             linkage::Linked<Link> && cell::ClaimingTag<Tag, T>
 class PRQ : public mem::SingleBlock<PRQ<T, Opt, Link, Tag>> {
     using Self = PRQ<T, Opt, Link, Tag>;
 
@@ -49,20 +76,58 @@ class PRQ : public mem::SingleBlock<PRQ<T, Opt, Link, Tag>> {
     static constexpr bool pad_cells = !Opt::template has<typename PRQOpt::no_cell_padding>;
     static constexpr bool force_pow2 = Opt::template has<typename PRQOpt::force_pow2>;
 
-    static constexpr uint64_t kMaxRetryDeq = 4 * 1024;
-    static constexpr uint64_t kReloadTailMask = (1u << 8) - 1;
+    static constexpr uint64_t kMaxRetryDeq = static_cast<uint64_t>(
+        Opt::template get<PRQOpt::max_dequeue_retries, uint64_t{4 * 1024}>);
+
+    /// Expressed as a period rather than a mask: `(retry & mask) == 0` means "every Nth
+    /// iteration", and saying so directly is what makes the power-of-two requirement checkable.
+    static constexpr uint64_t kTailReloadPeriod = static_cast<uint64_t>(
+        Opt::template get<PRQOpt::tail_reload_period, uint64_t{1u << 8}>);
+    static_assert(kTailReloadPeriod != 0 && (kTailReloadPeriod & (kTailReloadPeriod - 1)) == 0,
+                  "PRQOpt::tail_reload_period must be a power of two: the dequeue loop tests "
+                  "it as a mask");
+    static constexpr uint64_t kReloadTailMask = kTailReloadPeriod - 1;
 
 public:
+    /// @name Tuning in effect
+    /// Read back what the option pack resolved to. Public because a caller that can set these
+    /// can reasonably ask what they ended up as, and because it is what makes the defaults
+    /// assertable -- see OptionsTest.
+    /// @{
+    static constexpr uint64_t max_dequeue_retries = kMaxRetryDeq;
+    static constexpr uint64_t tail_reload_period = kTailReloadPeriod;
+    /// @}
+
     using tag_type = Tag;
     using cell_type = cell::SequencedCell<word, pad_cells>;
     using link_state = typename Link::template state<Self>;
     using handle_type = typename link_state::handle;
 
+    /**
+     * @note The floor of two is not cosmetic. These cells distinguish laps by `seq == t +
+     *       capacity`, and at capacity 1 that aliases with the very next ticket: a one-slot
+     *       ring never reports itself full, accepts unboundedly, and overwrites its own cell.
+     *       Measured directly: `create(1)` accepted three items and reported `size() == 3`.
+     *       A linked segment that never closes also never gets a successor, so the proxy
+     *       spins there for ever.
+     */
     static constexpr std::size_t round_size(std::size_t n) noexcept {
         if constexpr (force_pow2) return bit::round_to_next_pow2(n > 1 ? n : 2);
-        else return n;
+        else return n > 1 ? n : 2;
     }
 
+    /**
+     * @brief What a capacity request of @p n actually yields.
+     * @return the capacity a segment built with @p n will report.
+     *
+     * Static so a caller can size a split before anything is constructed: LinkedProxy divides
+     * its total across the segments that will exist, and has to know what each one rounds to
+     * before it can report a capacity the queue can genuinely reach.
+     */
+    static constexpr std::size_t capacity_for(std::size_t n) noexcept { return round_size(n); }
+
+    /// @brief Where the co-allocated regions go. See @ref block-construction.
+    /// @param n requested capacity; the only thing the layout may depend on.
     static constexpr auto plan(std::size_t n) noexcept {
         mem::LayoutBuilder b{sizeof(Self), alignof(Self)};
         mem::Plan<1> p{};
@@ -133,6 +198,8 @@ public:
         }
     }
 
+    /// @brief Take the oldest item.
+    /// @return false if the queue is empty.
     FORCE_INLINE bool dequeue(T& out) noexcept {
         for (;;) {
             const uint64_t h = head_.fetch_add(1, std::memory_order_acq_rel);
@@ -213,20 +280,24 @@ public:
         }
     }
 
+    /// @return Items currently held. Approximate under concurrency, exact when quiescent.
     std::size_t size() const noexcept {
         const uint64_t t = bit::clear_msb(tail_.load(std::memory_order_acquire));
         const uint64_t h = head_.load(std::memory_order_acquire);
         return t > h ? static_cast<std::size_t>(t - h) : 0;
     }
 
+    /// @return Items this queue can hold.
     std::size_t capacity() const noexcept { return capacity_; }
 
+    /// @brief Refuse all further enqueues, permanently.
     void close() noexcept
         requires(Link::is_linked)
     {
         tail_.fetch_or(bit::set_msb<uint64_t>(0), std::memory_order_release);
     }
 
+    /// @return true once closed; a closed segment still drains.
     bool is_closed() const noexcept
         requires(Link::is_linked)
     {
@@ -242,16 +313,21 @@ public:
         return true;
     }
 
+    /// @return The successor handle, or nil if this is the tail.
     handle_type next() const noexcept
         requires(Link::is_linked)
     {
         return link_.next();
     }
 
-    bool link_next(handle_type h) noexcept
+    /// @brief Publish @p h as the successor.
+    /// @param current set to the successor now installed -- @p h if we won, the winner's
+    ///        handle if we lost, so a losing caller need not re-read next().
+    /// @return true for exactly one caller; the loser must discard its segment.
+    bool link_next(handle_type h, handle_type& current) noexcept
         requires(Link::is_linked)
     {
-        return link_.link_next(h);
+        return link_.link_next(h, current);
     }
 
 private:
@@ -262,10 +338,8 @@ private:
         else return bit::clear_msb(i) % capacity_;
     }
 
-    ALIGNED_CACHE std::atomic<uint64_t> tail_{0};
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
-    ALIGNED_CACHE std::atomic<uint64_t> head_{0};
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
+    CACHE_LINE_MEMBER(std::atomic<uint64_t>, tail_, {0});
+    CACHE_LINE_MEMBER(std::atomic<uint64_t>, head_, {0});
     [[no_unique_address]] link_state link_{};
     const std::size_t capacity_;
     cell_type* const cells_;
@@ -273,6 +347,8 @@ private:
 
 } // namespace algo
 
+/// @brief Capabilities of algo::PRQ as a linked segment. Every field is mandatory:
+/// core::segment_traits has no primary definition, so omitting one is a compile error.
 template <typename T, typename Opt, typename Link, typename Tag>
 struct core::segment_traits<algo::PRQ<T, Opt, Link, Tag>> {
     /**
@@ -293,5 +369,6 @@ MPMC_ASSERT_SEGMENT_TRAITS(algo::PRQ<int*, meta::EmptyOptions, linkage::Node<mem
 
 namespace seg {
 template <typename T, typename Opt = meta::EmptyOptions, typename HP = mem::PtrHandle>
+/// PRQ as a linked segment. There is no standalone alias: see the class note.
 using PRQ = algo::PRQ<T, Opt, linkage::Node<HP>>;
 }

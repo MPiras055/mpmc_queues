@@ -215,6 +215,73 @@ it goes straight to an `algo::CacheRing` and `acquire()` looks there first. The 
 MPMC with no phase discipline, which is why it is a ring and not a fifth bucket — its single-word
 ABA-safe CAS, with the lap folded into every cell, is what makes that cheap.
 
+**The cache is read before the pin, not under it.** Everything in it is either a discard, never
+published and so never reachable by another thread, or a slot the rotation swept out of the
+flipping bucket — and that sweep only runs once the scan has established no pin can still name it.
+Neither case is made safer by a pin, so requiring one charged the common path a thread-local lookup
+and a stage read for a guarantee it was not using. A cache hit is now a single CAS, and it no
+longer publishes a pin that another thread's `try_advance` would have to wait behind.
+`PoolReclamationTest.ACacheHitIsServiceableWhileTheRotationIsFrozen` holds this down: with a stale
+pin freezing the rotation, a discarded slot must still come back.
+
+`try_advance` also **remembers whoever refused it last** and asks that thread before asking
+everybody. A straggler stays a straggler for its whole traversal while every other thread hammers
+the function, so one load usually settles it. Three things make the hint sound, and the third is
+the subtle one: reading a payload directly bypasses the `is_active()` filter that
+`ThreadRegistry::all_of` applies, and detached nodes keep their payload — but `~guard` stores 0
+unconditionally, so a departed thread always reads *unpinned* and the hint falls through to the
+real scan. A hint that does read pinned-at-an-older-stage therefore names a live pin, possibly a
+different thread that has since taken the node over, which is an equally genuine blocker. The
+hint can only refuse; the scan alone ever permits a rotation.
+`PoolReclamationTest.AHintNamingADepartedThreadDoesNotWedgeTheRotation` holds that down — it
+fails the moment `~guard` stops clearing the state byte.
+
+`try_advance` takes two early-outs ahead of its scan — the stage already moved past the caller's
+pinned stage, or somebody else holds the rotation. Both are re-checked under the claim, so neither
+changes which rotations are legal; they exist because the scan reads one `seq_cst` line per
+registered thread and every thread in `acquire()` runs it in a loop. Instrumented at 4 producers
+and 4 consumers, the pool was doing roughly **61 scans per successful acquire**, the bulk of them
+after a rotation had already invalidated the caller's stage.
+
+`LinkedProxy::enqueue` closes the loop from the other side. When the source comes up empty it
+renews and restarts the traversal rather than reporting exhaustion immediately — because under an
+epoch source "empty" is frequently self-inflicted: only a rotation can free a slot, and the
+rotation is refused while any thread sits pinned at an older stage, this one included. Renewing
+rather than unpinning is what makes it safe: `s` is used after `acquire()` returns, for
+`link_next`, so protection has to stay live across the call. The retry is gated on `renew()`
+reporting that it actually moved, which distinguishes a convoy from the real memory bound, and
+bounded by `ProxyOpt::acquire_retries` (default 2) so a genuinely full pool still refuses.
+
+### What this cost, measured
+
+Counters are the honest instrument here — this machine's 400–2500 MHz range puts wall-clock
+differences below the noise floor. At 2M items, 4 producers / 4 consumers, `mem-faa`:
+
+| | full scans | retries | acquire failures |
+| --- | ---: | ---: | ---: |
+| baseline, cap 1024 | 433,589 | — | 125,096 |
+| hint + ungated retry | 16,955 | 73,101 | 127,812 |
+| **hint + gated retry** | **16,611** | **1,365** | 122,931 |
+| baseline, cap 262144 | 3,750 | — | 1,046 |
+| **hint + gated retry** | **71** | **39** | **84** |
+
+**Throughput did not move.** The scan was real work but not the bottleneck. What the pooled
+source actually pays for, when saturated, is the *cost of discovering it is full*: a traversal
+plus a failing `acquire()`, against one counter load for `admit::ItemCount`. Interleaved
+measurement (reps rotated between variants — running all of one variant's reps before the next
+hands the later one the whole frequency ramp, which fabricated a 2.3× "win" until it was fixed):
+
+| capacity | chunk-faa | mem-faa pool=4 | mem-faa pool=32 |
+| --- | ---: | ---: | ---: |
+| 1,024 | 6.1–7.1 | 3.5 | 2.8–3.0 |
+| 262,144 | 7.0–7.4 | 6.5–7.5 | 6.7–8.0 |
+
+So pooling costs nothing when there is room and roughly 2× when saturated, and **a bigger pool
+does not help** — at a fixed total capacity more slots means smaller segments (1024/32 = 32
+slots each), so links get more frequent, not less. FAAArray's O(1) `reopen()` does not show up as
+a throughput win: when roomy, links are rare enough that a fresh allocation is amortised away
+anyway. Pooling buys a hard memory bound and no allocator traffic, not speed.
+
 `ThreadData::state` is a single byte: bit 7 pinned, bits 0-1 the stage. The scan only ever asks
 "pinned, and at my stage?", and the pin bounds the shift to one stage, so the 64-bit epoch it used
 to carry was never read. The stage itself wraps — EBR has no ABA to guard against here, because a

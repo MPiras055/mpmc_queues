@@ -1,4 +1,10 @@
 #pragma once
+/**
+ * @file PSCQ.hpp
+ * @brief PRQ's cell protocol plus SCQ's threshold counter, storing payloads directly. A benchmark comparator.
+ * @ingroup algo
+ */
+
 #include <cell/SequencedCell.hpp>
 #include <cell/Tagging.hpp>
 #include <core/SegmentTraits.hpp>
@@ -6,6 +12,7 @@
 #include <mem/SingleBlock.hpp>
 #include <meta/OptionsPack.hpp>
 #include <util/bit.hpp>
+#include <util/align.hpp>
 #include <util/specs.hpp>
 #include <atomic>
 #include <cassert>
@@ -14,6 +21,13 @@ namespace algo {
 
 struct PSCQOpt {
     struct no_cell_padding {};
+
+    /// Inner-loop iterations a consumer spends on one cell before stealing it. See
+    /// PRQOpt::max_dequeue_retries -- this is the same cell protocol.
+    template <auto N> struct max_dequeue_retries {};
+
+    /// How often that loop re-reads the shared tail, in iterations. **Power of two.**
+    template <auto N> struct tail_reload_period {};
 };
 
 /**
@@ -31,7 +45,10 @@ struct PSCQOpt {
  */
 template <typename T, typename Opt = meta::EmptyOptions, typename Link = linkage::None,
           typename Tag = cell::MsbTag<T>>
-    requires meta::AcceptsOnly<Opt, typename PSCQOpt::no_cell_padding> && cell::ClaimingTag<Tag, T>
+    requires meta::AcceptsOnly<Opt, typename PSCQOpt::no_cell_padding,
+                               meta::ValueOption<PSCQOpt::max_dequeue_retries>,
+                               meta::ValueOption<PSCQOpt::tail_reload_period>> &&
+             cell::ClaimingTag<Tag, T>
 class PSCQ : public mem::SingleBlock<PSCQ<T, Opt, Link, Tag>> {
     using Self = PSCQ<T, Opt, Link, Tag>;
 
@@ -39,10 +56,23 @@ class PSCQ : public mem::SingleBlock<PSCQ<T, Opt, Link, Tag>> {
     static_assert(Link::is_linked == false, "PSCQ is a standalone comparator only");
 
     static constexpr bool pad_cells = !Opt::template has<typename PSCQOpt::no_cell_padding>;
-    static constexpr uint64_t kTailSnapshotMask = (1ull << 8) - 1;
-    static constexpr size_t kMaxRetry = 4 * 1024;
+    static constexpr uint64_t kTailReloadPeriod = static_cast<uint64_t>(
+        Opt::template get<PSCQOpt::tail_reload_period, uint64_t{1ull << 8}>);
+    static_assert(kTailReloadPeriod != 0 && (kTailReloadPeriod & (kTailReloadPeriod - 1)) == 0,
+                  "PSCQOpt::tail_reload_period must be a power of two: the dequeue loop tests "
+                  "it as a mask");
+    static constexpr uint64_t kTailSnapshotMask = kTailReloadPeriod - 1;
+
+    static constexpr size_t kMaxRetry = static_cast<size_t>(
+        Opt::template get<PSCQOpt::max_dequeue_retries, std::size_t{4 * 1024}>);
 
 public:
+    /// @name Tuning in effect
+    /// @{
+    static constexpr std::size_t max_dequeue_retries = kMaxRetry;
+    static constexpr uint64_t tail_reload_period = kTailReloadPeriod;
+    /// @}
+
     using tag_type = Tag;
     using cell_type = cell::SequencedCell<word, pad_cells>;
     using link_state = typename Link::template state<Self>;
@@ -53,6 +83,8 @@ public:
         return 2 * bit::round_to_next_pow2(n < 2 ? 2 : n);
     }
 
+    /// @brief Where the co-allocated regions go. See @ref block-construction.
+    /// @param n requested capacity; the only thing the layout may depend on.
     static constexpr auto plan(std::size_t n) noexcept {
         mem::LayoutBuilder b{sizeof(Self), alignof(Self)};
         mem::Plan<1> p{};
@@ -73,6 +105,8 @@ public:
         threshold_.store(max_threshold_, std::memory_order_relaxed);
     }
 
+    /// @brief Add an item.
+    /// @return false if the queue is full, or closed.
     bool enqueue(T item) noexcept {
         {   // cheap fullness pre-check, sampled twice to avoid a torn read
             const uint64_t t = tail_.load(std::memory_order_acquire);
@@ -116,6 +150,8 @@ public:
         }
     }
 
+    /// @brief Take the oldest item.
+    /// @return false if the queue is empty.
     bool dequeue(T& out) noexcept {
         for (;;) {
             if (threshold_.load(std::memory_order_acquire) <= 0) return false; // known empty
@@ -185,6 +221,7 @@ public:
     /// Usable capacity: half the physical ring.
     std::size_t capacity() const noexcept { return size_ >> 1; }
 
+    /// @return Items currently held. Approximate under concurrency, exact when quiescent.
     std::size_t size() const noexcept {
         const uint64_t t = tail_.load(std::memory_order_acquire);
         const uint64_t h = head_.load(std::memory_order_acquire);
@@ -203,17 +240,15 @@ private:
     const std::size_t mask_;
     const int64_t max_threshold_;
     cell_type* const cells_;
-    ALIGNED_CACHE std::atomic<uint64_t> tail_{0};
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
-    ALIGNED_CACHE std::atomic<uint64_t> head_{0};
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
-    ALIGNED_CACHE std::atomic<int64_t> threshold_{0};
-    CACHE_PAD_TYPES(std::atomic<int64_t>);
+    CACHE_LINE_MEMBER(std::atomic<uint64_t>, tail_, {0});
+    CACHE_LINE_MEMBER(std::atomic<uint64_t>, head_, {0});
+    CACHE_LINE_MEMBER(std::atomic<int64_t>, threshold_, {0});
 };
 
 } // namespace algo
 
 namespace queue {
 template <typename T, typename Opt = meta::EmptyOptions>
+/// Standalone PSCQ: PRQ's cell protocol with SCQ's threshold. A comparator.
 using PSCQ = algo::PSCQ<T, Opt, linkage::None>;
 }

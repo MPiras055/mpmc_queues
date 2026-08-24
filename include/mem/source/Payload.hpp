@@ -1,4 +1,10 @@
 #pragma once
+/**
+ * @file Payload.hpp
+ * @brief The empty default for a source's per-thread caller state.
+ * @ingroup mem
+ */
+
 
 namespace mem::source {
 

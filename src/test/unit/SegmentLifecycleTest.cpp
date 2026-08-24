@@ -34,6 +34,10 @@ class SegmentLifecycle : public ::testing::Test {
 protected:
     static constexpr std::size_t kCapacity = 64;
 
+    /// Every segment here is built with mem::PtrHandle, so this is `S*`; named rather than
+    /// spelled out so the link_next out-parameter does not hard-code the handle policy.
+    using Handle = typename S::handle_type;
+
     S* make() { return S::create(kCapacity); }
     static void drop(S* s) { mem::SingleBlock<S>::destroy(s); }
 
@@ -99,9 +103,19 @@ TYPED_TEST(SegmentLifecycle, LinkNextSucceedsExactlyOnce) {
     auto* b = this->make();
     auto* c = this->make();
 
-    EXPECT_TRUE(a->link_next(b));
+    // The out-parameter carries the CAS's `expected`, so it is meaningful on *failure*: the
+    // loser is handed whoever won and needs no second read of next(). LinkedProxy would
+    // otherwise pay a contended acquire load on exactly the path where producers are racing.
+    // It must be passed nil -- the segment asserts that -- and a winner leaves it untouched.
+    typename TestFixture::Handle installed{};
+
+    EXPECT_TRUE(a->link_next(b, installed));
+    EXPECT_EQ(installed, nullptr) << "a successful link leaves the out-parameter alone";
     EXPECT_EQ(a->next(), b);
-    EXPECT_FALSE(a->link_next(c)) << "a successor may only be installed once";
+
+    installed = {};
+    EXPECT_FALSE(a->link_next(c, installed)) << "a successor may only be installed once";
+    EXPECT_EQ(installed, b) << "the loser should be handed the winner, not its own candidate";
     EXPECT_EQ(a->next(), b);
 
     this->drop(a);
@@ -167,7 +181,8 @@ TYPED_TEST(SegmentLifecycle, ReopenClearsTheSuccessor) {
     } else {
         auto* a = this->make();
         auto* b = this->make();
-        ASSERT_TRUE(a->link_next(b));
+        typename TestFixture::Handle installed{};
+        ASSERT_TRUE(a->link_next(b, installed));
         ASSERT_TRUE(a->reopen());
         // A recycled segment carrying a stale successor would splice a dead node back
         // into the list.

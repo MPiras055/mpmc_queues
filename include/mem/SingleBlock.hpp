@@ -1,4 +1,10 @@
 #pragma once
+/**
+ * @file SingleBlock.hpp
+ * @brief CRTP base giving an object one allocation for itself and its arrays.
+ * @ingroup mem
+ */
+
 #include <mem/Layout.hpp>
 #include <cstdlib>
 #include <memory>

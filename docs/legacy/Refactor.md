@@ -1,3 +1,7 @@
+> **Archived.** A working note requesting the extension guide and the Hazard/Pool/thread-ticket rework. All of it is done; the guide it asked for is docs/Extending.md.
+>
+> Kept for the design history; nothing here describes the current tree.
+
 I need you to better document the project, I need a standard example way on how to add a new thing of everything:
 - adding a new algorithm
 - adding new policies

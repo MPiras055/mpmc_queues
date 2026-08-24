@@ -1,101 +1,173 @@
 #pragma once
+/**
+ * @file LinkedProxy.hpp
+ * @brief Michael Scott traversal proxy with enhanced capabilities
+ *
+ * @ingroup proxy
+ */
+
 #include <core/Admission.hpp>
 #include <core/Proxy.hpp>
 #include <core/Segment.hpp>
 #include <core/SegmentTraits.hpp>
 #include <core/Source.hpp>
+#include <meta/OptionsPack.hpp>
 #include <proxy/Admission.hpp>
+#include <util/align.hpp>
 #include <util/specs.hpp>
 #include <atomic>
 #include <cassert>
 #include <concepts>
 #include <cstdint>
+#include <type_traits>
 #include <utility>
 
 namespace proxy {
 
+struct ProxyOpt {
+    /**
+     * @brief Count segments entering and leaving service.
+     * @note: off by default
+     */
+    struct segment_stats {};
+
+    /**
+     * @brief How many times enqueue() will renew and retry after the source comes up empty.
+     *
+     * Bounded, and it has to be: under a pooled source "empty" is also how the memory bound is
+     * reported, so an unbounded retry here would spin forever on a genuinely full queue instead
+     * of refusing. Default 2 -- enough to cover a rotation this thread was itself blocking,
+     * which is the case it exists for.
+     * @note value option: `ProxyOpt::acquire_retries<4>`
+     */
+    template <auto N> struct acquire_retries {};
+};
+
+namespace detail {
+
+/// Disabled stat
+struct SegmentStatsOff {
+    static constexpr bool enabled = false;
+    constexpr void on_link() const noexcept {}
+    constexpr void on_retire() const noexcept {}
+    constexpr void on_discard() const noexcept {}
+};
+
 /**
- * @brief The proxy's per-thread bookkeeping, stored in the source's registry node.
- *
- * At namespace scope rather than nested in LinkedProxy, because the alias has to name it to
- * build the source, and the source is one of LinkedProxy's own template parameters -- nesting
- * it would be circular.
- *
- * Not over-aligned: it lives inside the source's `ThreadData`, which already carries the
- * cache-line alignment. Aligning it again would make each node two lines wider for nothing.
- *
+ * @brief Enabled: three monotonic counters, relaxed.
+ * @note: counters explicitly not aligned to keep the memory footprint low
+ */
+struct SegmentStatsOn {
+    static constexpr bool enabled = true;
+
+    void on_link() noexcept { linked_.fetch_add(1, std::memory_order_relaxed); }
+    void on_retire() noexcept { retired_.fetch_add(1, std::memory_order_relaxed); }
+    void on_discard() noexcept { discarded_.fetch_add(1, std::memory_order_relaxed); }
+
+    uint64_t linked() const noexcept { return linked_.load(std::memory_order_relaxed); }
+    uint64_t retired() const noexcept { return retired_.load(std::memory_order_relaxed); }
+    uint64_t discarded() const noexcept { return discarded_.load(std::memory_order_relaxed); }
+
+private:
+    std::atomic<uint64_t>
+        linked_{0},retired_{0},discarded_{0};
+};
+
+} // namespace detail
+
+/**
+ * @brief per-thread bookkeeping, stored in the source's registry node.
+ * @note: it's explicitly not aligned since it is stored inside the source's `ThreadData`,
+ * which is anyway padded
  * @tparam H the source's handle type.
  */
 template <typename H>
 struct ThreadMeta {
-    /// Signed: a thread may dequeue more than it enqueued. The sum across threads is the size.
+    /// signed counter to accurately track the size of the queue across concurrent threads
     std::atomic<int64_t> ops{0};
-    /// Last tail this thread found closed; feeds the close hint.
+    /// last tail (handle type) the thread found closed
     H last_seen{};
 };
 
 /**
  * @brief A queue built from linked bounded segments. One traversal, three policies.
- *
- * This replaces UnboundedProxy, BoundedCounterProxy, BoundedChunkProxy and
- * BoundedMemProxy -- roughly 1133 lines across four files, each of which had
- * independently re-implemented the same Michael-Scott traversal, ticket handling and
- * per-thread size accounting. The genuine variation was only ever three-dimensional:
- *
  *   - **Admit**  what stops us admitting another item
- *   - **Source** where segments come from and go back to (which also carries the
- *                handle type: a raw pointer, or an index into a fixed pool)
+ *   - **Source** where segments go to and come from (may also implement an implicit admission policy
+ *      see: `source/Pool.hpp`)
  *   - **Segment** the algorithm inside each node
- *
- * @note There is no virtual dispatch anywhere on this path. Every call below is
- *       statically bound, and the per-segment capability checks are `if constexpr` over
- *       core::segment_traits, so a segment that does not need the close hint does not
- *       branch on it at runtime.
  */
-template <typename T, typename Segment, typename Admit, typename Source>
+template <typename T, typename Segment, typename Admit, typename Source,
+          typename Opt = meta::EmptyOptions>
     requires core::LinkedSegment<Segment, T> && core::AdmissionPolicy<Admit> &&
-             core::SegmentSource<Source, Segment>
+             core::SegmentSource<Source, Segment> &&
+             meta::AcceptsOnly<Opt, typename ProxyOpt::segment_stats,
+                               meta::ValueOption<ProxyOpt::acquire_retries>>
 class LinkedProxy {
     using Tr = core::segment_traits<Segment>;
     using H = typename Source::handle;
 
-    /// The segment stores its successor as `handle_type`; the source hands out `handle`.
-    /// Under a pooled source both are mem::VersionedIndex<N>, and N appears twice -- once
-    /// in the segment's IndexHandle<N>, once in the proxy alias -- so a mismatch would
-    /// otherwise mean the segment reading the index out of the wrong bits.
+    /**
+     * @name Where the admission policy is asked
+     *
+     * Exactly one of these is true for a bounded policy, so one call site compiles away
+     * entirely. See core::AdmitPoint: a policy that reserves must be asked before the
+     * traversal commits, while one that counts segments cannot answer until the tail has
+     * actually refused an item.
+     * @{
+     */
+    /// @see ProxyOpt::acquire_retries
+    static constexpr unsigned kAcquireRetries = static_cast<unsigned>(
+        Opt::template get<ProxyOpt::acquire_retries, unsigned{2}>);
+
+    static constexpr bool admits_up_front =
+        Admit::bounded && Admit::admit_point == core::AdmitPoint::Enqueue;
+    static constexpr bool admits_on_link =
+        Admit::bounded && Admit::admit_point == core::AdmitPoint::SegmentLink;
+    /// @}
+
+    /// Check if stats are enabled
+    static constexpr bool stats_enabled = Opt::template has<typename ProxyOpt::segment_stats>;
+    using Stats = std::conditional_t<stats_enabled, detail::SegmentStatsOn,
+                                     detail::SegmentStatsOff>;
+
+    ///static check for mem-proxy handle type and source
     static_assert(std::same_as<typename Segment::handle_type, H>,
                   "the segment's handle_type is not the source's handle: a pooled proxy "
                   "must be given a segment built for the same pool size, e.g. "
                   "MemBounded<T, seg::Vyukov<T, Opt, mem::IndexHandle<N>>, N>");
+
+    //static check for the segment to be recyclable if the source demands it
     static_assert(!Source::recycles || Tr::recyclable,
                   "this source reuses segments, but this segment type cannot be reopened "
                   "(see segment_traits<Segment>::recyclable)");
+
+    //check that the segment implements it the close_hint overload
     static_assert(!Tr::needs_close_hint || core::HintedSegment<Segment, T>,
                   "segment_traits says this segment needs the close hint, but it has no "
                   "enqueue(T, bool) overload");
 
     using Meta = ThreadMeta<H>;
 
-    /// The proxy's per-thread state rides in the source's registry node, so `pin()`'s
-    /// thread-local lookup serves both and the operation path does only one.
+    /// check that the source was given the ThreadMeta as payload
     static_assert(std::same_as<typename Source::thread_payload, Meta>,
                   "the source was not given this proxy's ThreadMeta as its payload: build it "
                   "as e.g. mem::source::Hazard<Segment, proxy::ThreadMeta<Segment*>>");
 
 public:
+    /// Tuning, exposed the way the sources expose theirs: so a test can assert an option
+    /// actually reached the member it names. @see ProxyOpt::acquire_retries
+    static constexpr unsigned acquire_retries = kAcquireRetries;
+
     /**
      * @brief A scope in which the calling thread may use this queue; see join().
      *
-     * Wraps the source's session so that a departing thread's tally is not lost with it.
-     * `size()` folds over *attached* threads, so a producer that enqueued and then left used
-     * to take its count away with it and the queue under-reported for the rest of its life.
-     * On the way out this folds the thread's `ops` into a queue-wide total and clears the
-     * payload, so whoever inherits the recycled node starts from zero rather than from the
-     * last owner's tally and stale close hint.
+     * @note: some methods, specifically `size()` keeps quiescent data in thread_local memory.
+     * When thread stops referencing the queue (detachment), it has to update the queue shared
+     * state, in order to do this we rely on `session`
      */
     class session {
         LinkedProxy* q_ = nullptr;
-        Meta* me_ = nullptr; ///< stable while this thread is attached
+        Meta* me_ = nullptr;
         typename Source::session inner_{};
 
     public:
@@ -103,9 +175,11 @@ public:
         session(LinkedProxy* q, Meta* me, typename Source::session inner) noexcept
             : q_{q}, me_{me}, inner_{std::move(inner)} {}
 
+        /// Delete copy constructor and copy assignment
         session(const session&) = delete;
         session& operator=(const session&) = delete;
 
+        /// Move constructor
         session(session&& o) noexcept
             : q_{std::exchange(o.q_, nullptr)}, me_{std::exchange(o.me_, nullptr)},
               inner_{std::move(o.inner_)} {}
@@ -120,21 +194,30 @@ public:
             return *this;
         }
 
-        /// The body runs before `inner_` is destroyed, so the payload is cleaned while this
-        /// thread still owns the node -- and only then does the node become reusable.
-        ~session() { hand_back(); }
+        /// Session destructor
+        ~session() noexcept {
+            hand_back();
+        }
 
+        /// Check if session was correctly initialized
         explicit operator bool() const noexcept { return static_cast<bool>(inner_); }
 
     private:
+        /// @brief: cleanup method
+        ///
+        /// records all the operations of the session holder in the proxy internal
+        /// counter and re-initializes the ThreadMeta assoicated to the session holder
+        /// for future reuse
         void hand_back() noexcept {
-            if (q_ && me_) {
-                q_->departed_ops_.fetch_add(me_->ops.exchange(0, std::memory_order_relaxed),
-                                            std::memory_order_relaxed);
+            if(q_ && me_) {
+                q_-> departed_ops_.fetch_add(
+                    me_->ops.exchange(0,std::memory_order_relaxed),
+                    std::memory_order_relaxed
+                );
                 me_->last_seen = Source::nil();
+                q_   = nullptr;
+                me_  = nullptr;
             }
-            q_ = nullptr;
-            me_ = nullptr;
         }
     };
 
@@ -145,40 +228,78 @@ public:
      * @note There is no thread count. The source's registry sizes itself, so a participant
      *       limit would be a number the queue does not need and could only get wrong.
      */
-    explicit LinkedProxy(std::size_t segment_capacity, std::size_t chunks = 4)
-        : seg_capacity_{segment_capacity},
-          source_{segment_capacity},
-          admit_{Admit::config(segment_capacity, chunks)} {
-        assert(segment_capacity != 0 && "LinkedProxy: segment capacity must be non-null");
+    /**
+     * @brief How many segments will be live at once, and therefore the capacity divisor.
+     *
+     * Neither component knows this alone: for a chunk-bounded queue the admission policy caps
+     * it, for a pooled one the source does, and for an unbounded one neither. Each answers 0
+     * for "I do not bound this", so the binding limit is the smaller non-zero of the two.
+     */
+    static constexpr std::size_t split_across(std::size_t chunks) noexcept {
+        const std::size_t a = Admit::live_segments(chunks);
+        const std::size_t b = Source::live_segments();
+        if (a == 0 && b == 0) return 1;   // unbounded: the argument is the segment size
+        if (a == 0) return b;
+        if (b == 0) return a;
+        return a < b ? a : b;
+    }
 
-        // The sentinel. Joining is required because the source hands out segments per thread.
+    /// The per-segment size a total of @p capacity resolves to, after the segment's rounding.
+    static constexpr std::size_t per_segment(std::size_t capacity, std::size_t chunks) noexcept {
+        const std::size_t d = split_across(chunks);
+        const std::size_t share = (capacity + d - 1) / d;   // ceil: never rounds to zero
+        // Floored at two before the segment sees it. A ring that distinguishes laps by
+        // `seq == t + capacity` degenerates at capacity 1 -- it never reports itself full, so
+        // a linked segment never gets a successor and the traversal spins. The segments floor
+        // themselves too; this keeps the proxy from ever asking in the first place, and is why
+        // capacity() can exceed a request smaller than 2 * split_across().
+        return Segment::capacity_for(share < 2 ? 2 : share);
+    }
+
+    /**
+     * @param capacity total items the queue should hold, **split across the segments that will
+     *        exist** -- `chunks` of them for a bounded policy, the pool size for a pooled
+     *        source, one for an unbounded queue (where it is simply the segment size).
+     * @param chunks   how many segments to spread the capacity over; ignored by `admit::None`
+     *        over an allocating source, which has no segment count to divide by.
+     *
+     * @note `capacity()` may exceed @p capacity. Segments round their own size up -- SCQ and
+     *       LFring always to a power of two -- so the split is computed, handed to the segment,
+     *       and then read back through `Segment::capacity_for`. Reporting the *achievable*
+     *       figure is what keeps `capacity()` a number the queue can actually reach.
+     */
+    explicit LinkedProxy(std::size_t capacity, std::size_t chunks = 4)
+        : seg_capacity_{per_segment(capacity, chunks)},
+          source_{seg_capacity_},
+          admit_{Admit::config(seg_capacity_, chunks)} {
+        assert(capacity != 0 && "LinkedProxy: capacity must be non-null");
+
+        // source session
         auto s = source_.join();
         assert(s && "LinkedProxy: could not register the constructing thread");
-        // A pooled source reclaims by epoch, so acquiring a segment is only meaningful under
-        // a pin. Nothing else runs yet, but the precondition is asserted rather than assumed.
+        //pin the caller to the source (unnecessary but good practice)
         auto g = source_.pin();
         auto sentinel = source_.acquire();
         assert(sentinel && "LinkedProxy: could not obtain a sentinel segment");
+        //initialize head and tail
         head_.store(*sentinel, std::memory_order_relaxed);
         tail_.store(*sentinel, std::memory_order_relaxed);
+        stats_.on_link();   //record the segment as linked
     }
 
+    /// Delete copy constructor and copy assignment
     LinkedProxy(const LinkedProxy&) = delete;
     LinkedProxy& operator=(const LinkedProxy&) = delete;
 
     ~LinkedProxy() {
-        // Destroyed before `source_`, since it is a local in this body and members go after.
+        /// join the source
         [[maybe_unused]] auto guard = source_.join();
         T ignore{};
-        while (dequeue(ignore)) {}
-        // Whatever the traversal left linked is now unreachable; hand it back.
-        //
-        // The pin covers the discard loop only, and starts after the drain: `dequeue()` pins
-        // internally, and a pooled source's pin is *not* re-entrant -- an inner guard's
-        // destructor clears the published epoch outright, which would leave this loop
-        // running unpinned with no diagnostic.
-        auto g = source_.pin();
+        //drain all the segments (potentially returns them to the source)
+        while (dequeue(ignore));
+        auto g = source_.pin();     //pin the caller as active
         H h = head_.load(std::memory_order_relaxed);
+        //loop body executed only once (almost to all cases)
         while (h != Source::nil()) {
             Segment* s = source_.deref(h);
             const H nx = s->next();
@@ -188,95 +309,132 @@ public:
     }
 
     bool enqueue(T item) noexcept {
-        auto g = source_.pin(); // RAII: protection drops on every exit path below
-        Meta& me = g.payload(); // same lookup the pin already did
+        auto g = source_.pin(); // RAII protection for source memory reclamation
+        Meta& me = g.payload();
 
-        if constexpr (Admit::bounded) {
-            // Reserves where the policy can, so concurrent producers cannot each pass a
-            // check and then all commit past the ceiling.
+        if constexpr (admits_up_front) {
+            // try admit policy which may reseve a slot for the calling thread
+            // a reserving policy has to claim here, before the traversal commits
             if (!admit_.try_admit()) return false;
         }
 
+        //protect the current tail
         H tail = source_.protect(g, tail_.load(std::memory_order_relaxed));
+        unsigned retries = 0;   //renew-and-retry budget after the source comes up empty
 
         for (;;) {
+            //update protection on stale tail
             const H observed = tail_.load(std::memory_order_acquire);
             if (tail != observed) { // tail moved under us; re-protect and restart
-                tail = source_.protect(g, observed);
+                //abandoning `tail`, so move forward first and then re-read the anchor
+                source_.renew(g);
+                tail = source_.protect(g, tail_.load(std::memory_order_acquire));
                 continue;
             }
 
             Segment* s = source_.deref(tail);
 
+            //advance the tail to next pointer if exist and update protection
             if (const H nx = s->next(); nx != Source::nil()) {
-                H expect = tail; // a successor exists: help publish it, then retry there
-                (void)tail_.compare_exchange_strong(expect, nx, std::memory_order_acq_rel,
+                H expect = tail;
+                (void) tail_.compare_exchange_strong(expect, nx, std::memory_order_acq_rel,
                                                     std::memory_order_acquire);
-                tail = source_.protect(g, nx);
+                //moving off this segment for good, so renew and re-anchor rather than
+                //carrying `nx` -- which was read at the old epoch -- across the bump
+                source_.renew(g);
+                tail = source_.protect(g, tail_.load(std::memory_order_acquire));
+                //recheck for tail stale reference
                 continue;
             }
 
+            // try enqueue on the current segment, fails if the segment is closed
             if (try_enqueue(s, tail, me, item)) break;
 
-            // This segment is full or closed. Get another.
-            //
-            // "The tail I decided to extend is still the tail, and still has no successor."
-            // While that holds, this producer is the one who has to make progress, so waiting
-            // for a segment is the right thing to do -- a source that came up empty may only
-            // have done so because another producer took the last one and is about to link
-            // it, which is a lost race and not a full queue. Once it stops holding there may
-            // be no need for a new segment at all, so stop waiting and re-traverse.
-            //
-            // Safe to deref `s` in here: the pin covers this whole scope and `tail` was
-            // published through protect(), which is what the loop above already relies on.
+            //lambda which is checked while trying to get a new segment
+            //aims to prevent unnecessary contention in the source.acquire()
+            //path, if we're sure that the segment is going to be throwed out
+            //anyway
             const auto unchanged = [&]() noexcept {
+                //tail has changed or a new next pointer has been linked
+                //new segment would be throwed anyway
                 return tail_.load(std::memory_order_acquire) == tail &&
                        s->next() == Source::nil();
             };
+            if constexpr (admits_on_link) {
+                if (!admit_.try_admit()) return false;  //segment ceiling reached
+            }
 
             auto fresh = source_.acquire(unchanged);
-            if (!fresh) {
-                if (!unchanged()) { // lost a race, not out of memory
+            if (!fresh) {   //no segment could have been got
+                if (!unchanged()) { //another segment was successfuly linked
                     tail = source_.protect(g, tail_.load(std::memory_order_acquire));
                     continue;
                 }
-                if constexpr (Admit::bounded) admit_.cancel_admit();
-                return false; // genuinely exhausted: this *is* the memory bound
+                // Coming up empty under an epoch source is frequently self-inflicted: the only
+                // thing that can free a slot is a rotation, and a rotation is refused while any
+                // thread sits pinned at an older stage -- this one included, since it has been
+                // holding the stage it pinned at since the top of enqueue(). Retrying from here
+                // without renewing just re-asks a question whose answer this thread is itself
+                // preventing.
+                //
+                // So renew, which drops the stale stage and republishes at the current one, and
+                // start the traversal over. The thread stops blocking everybody else's
+                // try_advance, and the segments it was holding back become reclaimable.
+                //
+                // Renewing rather than unpinning outright is what makes this safe. `s` is used
+                // after acquire() returns -- link_next() is called on it -- so protection has
+                // to stay live across the call; dropping it would leave `s` free to be recycled
+                // underneath the link. Renewal keeps the thread protected while releasing what
+                // it was protecting, hence the mandatory re-read of the anchor below, and hence
+                // `continue` rather than falling through to `s`.
+                //
+                // Gated on renew() reporting that it actually moved, which is what separates
+                // the two cases the source cannot distinguish for us. If this thread was
+                // already at the current stage it was blocking nothing, so the empty pool is
+                // the real memory bound and retrying would just re-walk the queue to be told
+                // so again -- measured at 73k pointless retries per 2M items before the gate.
+                // A no-op renew also leaves `tail` protected, so falling through is safe.
+                if (retries < kAcquireRetries && source_.renew(g)) {
+                    ++retries;
+                    tail = source_.protect(g, tail_.load(std::memory_order_acquire));
+                    continue;
+                }
+                //only a reserving policy has anything outstanding; a link-point one tested
+                if constexpr (admits_up_front) admit_.cancel_admit();
+                return false; // genuinely exhausted: stop try and fail fast
             }
 
-            // No reopen here. Recycling is the source's business -- a source that hands back
-            // a used segment is the one that knows it needs resetting, and the proxy should
-            // not have to ask. See mem::source::Pool::acquire.
             Segment* ns = source_.deref(*fresh);
+            //enqueue item in isolation
             const bool placed = ns->enqueue(item);
             assert(placed && "LinkedProxy: a fresh segment refused the first item");
             (void)placed;
 
-            if (s->link_next(*fresh)) {
+            //installed reference which is to be setted if `link_next` fails
+            H installed{};
+            if (s->link_next(*fresh, installed)) { //try to link segment
                 H expect = tail;
+                //link was successful so try to update the global tail segment
                 (void)tail_.compare_exchange_strong(expect, *fresh, std::memory_order_acq_rel,
                                                     std::memory_order_acquire);
+                //signal on the admission policy
                 admit_.on_segment_linked();
+                stats_.on_link();
                 break;
             }
 
-            // Someone else linked first. Nobody ever saw ours, so it needs no scan -- but
-            // `item` is already *in* it, and the retry below will place `item` again. Take
-            // the copy back out before handing the segment over, or the queue holds two.
-            //
-            // Under an allocating source that is invisible: discard destroys the segment and
-            // the stray goes with it. Under a pooled source the segment comes straight back,
-            // and whether the stray survives depends on how much of itself that segment's
-            // reopen() rebuilds -- SCQ, FAAArray and HQ happen to wipe their cells, PRQ
-            // realigns indices only and delivers the stray a second time. Measured on
-            // mem-prq at capacity 8: 200048 items consumed against 200000 produced.
-            //
-            // This segment is ours alone, so the dequeue is uncontended and cannot fail.
-            T stray{};
-            [[maybe_unused]] const bool drained = ns->dequeue(stray);
-            assert(drained && "LinkedProxy: the segment we alone hold refused the item back");
-            source_.discard(*fresh);
-            tail = source_.protect(g, s->next());
+            if constexpr (Source::recycles) {
+                //if source recycles segments we need to discard the previous enqueue
+                //to keep the segment consistent
+                T stray{};
+                [[maybe_unused]] const bool drained = ns->dequeue(stray);
+                assert(drained && "LinkedProxy: the segment we alone hold refused the item back");
+            }
+
+            source_.discard(*fresh);                //discard the previously acquired segment
+            stats_.on_discard();                    //update the discard stats
+            source_.renew(g);                       //renew protection on the tail
+            tail = source_.protect(g, installed);
         }
 
         admit_.on_enqueue();
@@ -285,42 +443,47 @@ public:
     }
 
     bool dequeue(T& out) noexcept {
-        auto g = source_.pin();
+        auto g = source_.pin(); //RAII protection for the source memeory reclamation
         Meta& me = g.payload();
 
+        //protect the current global head
         H head = source_.protect(g, head_.load(std::memory_order_relaxed));
         for (;;) {
+            //update protection on stale head
             const H observed = head_.load(std::memory_order_acquire);
             if (head != observed) {
-                head = source_.protect(g, observed);
+                source_.renew(g);
+                head = source_.protect(g, head_.load(std::memory_order_acquire));
                 continue;
             }
 
             Segment* s = source_.deref(head);
             if (s->dequeue(out)) {
+                //fast path: dequeue happened on the current segment
                 took_one(me);
                 return true;
             }
 
+            //check if successor exists and try to advance it
             const H nx = s->next();
-            if (nx == Source::nil()) return false; // no successor: genuinely empty
+            if (nx == Source::nil()) return false; //empty
 
-            // A successor exists, so this segment will never grow again and must be
-            // drained exhaustively before it can be unlinked.
             if constexpr (Tr::needs_dequeue_prepare) {
+                //some segments require special treatment when a successor is found
                 static_assert(core::PreparableSegment<Segment>,
                               "segment_traits says this segment needs dequeue preparation, "
                               "but it has no prepare_dequeue_after_link()");
                 s->prepare_dequeue_after_link();
             }
+
+            //retry dequeue on the current segment to assert
+            // the segment is truly empty and nobody will link again
             if (s->dequeue(out)) {
                 took_one(me);
                 return true;
             }
 
-            // A segment whose insert is not atomic may hold an item that has been
-            // claimed but not yet published; unlinking now would strand it. Retrying is
-            // bounded -- the producer is a few instructions from publishing.
+            //static check for segments which don't support lock-free enqueue/dequeue
             if constexpr (Tr::needs_inflight_drain) {
                 static_assert(core::DrainableSegment<Segment>,
                               "segment_traits says this segment needs an in-flight drain, "
@@ -328,29 +491,32 @@ public:
                 if (s->has_inflight()) continue;
             }
 
+            //try to unlink the current head (make it unreachable for future threads)
             H expect = head;
             if (head_.compare_exchange_strong(expect, nx, std::memory_order_acq_rel,
                                               std::memory_order_acquire)) {
-                head = source_.protect(g, nx);
-                source_.retire(expect); // was published; defer until unobserved
+                //Retire first, then renew: `expect` is only passed by value here, never
+                //dereferenced, so handing it over before moving epoch is safe -- and renewing
+                //first would let this thread's own advance free it under a slower reader.
+                source_.retire(expect); // retire the current head
                 admit_.on_segment_retired();
+                stats_.on_retire();
+                source_.renew(g);
+                head = source_.protect(g, head_.load(std::memory_order_acquire));
             } else {
-                head = source_.protect(g, expect);
+                source_.renew(g);
+                head = source_.protect(g, head_.load(std::memory_order_acquire));
             }
         }
     }
 
     /**
-     * @brief Approximate under concurrency; exact when quiescent.
+     * @brief: size method (estimate)
      *
-     * Two parts, because a per-thread counter stops being reachable when its thread leaves:
-     * the running total of everyone who has departed, plus a fold over the threads still
-     * attached. A scan only visits attached threads, so without the first part a producer
-     * that enqueued and then detached took its count with it and the queue under-reported
-     * permanently -- see ProxyAccountingTest.
+     * @note: performs a reduction on thread-local memory over all the threads attached
      *
-     * The fold is over threads that actually attached rather than a fixed array sized for
-     * the worst case, so its cost tracks real concurrency.
+     * @warning: this is an under-approximation over concurrent threads but becomes exact
+     * if no threads are currently performing enqueue/dequeue
      */
     std::size_t size() const noexcept {
         int64_t total = departed_ops_.load(std::memory_order_relaxed);
@@ -360,21 +526,66 @@ public:
         return total > 0 ? static_cast<std::size_t>(total) : 0;
     }
 
-    /// Item ceiling. What that means is the policy's business, not the traversal's.
-    std::size_t capacity() const noexcept { return admit_.capacity(seg_capacity_); }
+    /// @brief: get a conservative item ceiling bound
+    /// @warning: this value is only an estimation, it is really possible
+    /// that under extreme contention the queue may accept far less items or a few
+    /// more (generally a fraction of the bound capacity)
+    /**
+     * @brief Items this queue can hold.
+     *
+     * Three cases, because the ceiling can come from either side. A bounded policy knows it.
+     * An unbounded policy over a *pooled* source does not -- the ceiling there is the pool
+     * running dry, which is the source's business -- so ask the source instead; before this,
+     * a pooled proxy reported one segment's worth as its entire capacity. With neither
+     * bounding anything, one segment's worth is the only meaningful figure.
+     */
+    std::size_t capacity() const noexcept {
+        if constexpr (Admit::bounded) return admit_.capacity(seg_capacity_);
+        else if constexpr (Source::live_segments() != 0)
+            return Source::live_segments() * seg_capacity_;
+        else return seg_capacity_;
+    }
+
+    /*
+     * @brief: get the number of segments successfuly linked
+     * @note: this method is only enabled if segments_stat options are enabled
+     */
+    uint64_t segments_linked() const noexcept
+        requires(stats_enabled)
+    {
+        return stats_.linked();
+    }
+
+    /*
+     * @brief: get the number of segments that were linked to the queue and given back to the source
+     * @note: this method is only enabled if segments_stat options are enabled
+     */
+    uint64_t segments_retired() const noexcept
+        requires(stats_enabled)
+    {
+        return stats_.retired();
+    }
+
+    /*
+     * @brief: get the number of segments unsuccessfuly linked
+     * @note: this method is only enabled if segments_stat options are enabled
+     * @note: a thread may get a segment and try to link it and then give it back to the source
+     */
+    uint64_t segments_discarded() const noexcept
+        requires(stats_enabled)
+    {
+        return stats_.discarded();
+    }
+    /// @}
 
     /**
-     * @brief Attach the calling thread for the duration of the returned scope.
-     *
-     * Replaces a manual acquire/release pair, which had already grown an early-return path
-     * that skipped the release. It also un-collides two names: the source's `acquire()`
-     * hands out a *segment*, which is a different thing entirely.
+     * @brief: attach the calling thread to the queue
+     * @returns: a session RAII object which gets destroyed at hte end of scope
      */
     [[nodiscard]] session join() {
         auto inner = source_.join();
         if (!inner) return session{};
-        // One lookup, here rather than on every operation: the payload's address is fixed
-        // for as long as this thread holds the node.
+        //lookup of the per-thread metadata
         Meta* me = nullptr;
         {
             auto g = source_.pin();
@@ -384,19 +595,24 @@ public:
     }
 
 private:
+
+    /**
+     * @brief: what to do when an item is successfuly dequeued
+     */
     void took_one(Meta& me) noexcept {
         admit_.on_dequeue();
         me.ops.fetch_sub(1, std::memory_order_relaxed);
     }
 
+
     /**
-     * @brief Enqueue, supplying the close hint when the segment wants it.
+     * @brief: try enqueue, consitent with segment policy
      *
-     * Re-entering some segments' enqueue loops after they have closed is not merely
-     * wasted work: for PRQ it drives consumers down the unsafe-cell path and can
-     * livelock both sides on one segment. The hint is "you told me you were full last
-     * time and the tail has not moved since", which is exactly what the per-thread
-     * last_seen records.
+     * @note: for some segments, trying to enqueue an item on a previously closed
+     * segment continously may result in livelock.
+     *
+     * @note: threads record the last tail handle they found closed and feed it
+     * to the segment enqueue method if the segment needs a close_hint
      */
     FORCE_INLINE bool try_enqueue(Segment* s, H h, Meta& me, T item) noexcept {
         if constexpr (Tr::needs_close_hint) {
@@ -410,19 +626,17 @@ private:
         }
     }
 
-    ALIGNED_CACHE std::atomic<H> head_{};
-    CACHE_PAD_TYPES(std::atomic<H>);
-    ALIGNED_CACHE std::atomic<H> tail_{};
-    CACHE_PAD_TYPES(std::atomic<H>);
+    CACHE_LINE_MEMBER(std::atomic<H>, head_, {});
+    CACHE_LINE_MEMBER(std::atomic<H>, tail_, {});
 
     /// Everything counted by threads that have since left. Kept apart from the per-thread
     /// counters because those become unreachable the moment their thread detaches.
-    ALIGNED_CACHE std::atomic<int64_t> departed_ops_{0};
-    CACHE_PAD_TYPES(std::atomic<int64_t>);
+    CACHE_LINE_MEMBER(std::atomic<int64_t>, departed_ops_, {0});
 
     const std::size_t seg_capacity_;
     Source source_;
-    [[no_unique_address]] Admit admit_;
+    [[no_unique_address]] Admit admit_; //may be optimized out if source implements an admission policy internally
+    [[no_unique_address]] mutable Stats stats_{};
 };
 
 } // namespace proxy

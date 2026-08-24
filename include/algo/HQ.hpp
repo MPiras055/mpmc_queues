@@ -1,10 +1,17 @@
 #pragma once
+/**
+ * @file HQ.hpp
+ * @brief FAAArray's array with a non-destructive dequeue for the tail segment.
+ * @ingroup algo
+ */
+
 #include <cell/PlainCell.hpp>
 #include <cell/Tagging.hpp>
 #include <core/SegmentTraits.hpp>
 #include <linkage/Linkage.hpp>
 #include <mem/SingleBlock.hpp>
 #include <meta/OptionsPack.hpp>
+#include <util/align.hpp>
 #include <util/specs.hpp>
 #include <atomic>
 #include <cassert>
@@ -13,6 +20,16 @@ namespace algo {
 
 struct HQOpt {
     struct force_cell_padding {};
+
+    /**
+     * @brief Loads a consumer spends waiting for a straggling producer before claiming a cell.
+     *
+     * Only reached when something *is* queued behind the stalled index, so the cell has to be
+     * passed one way or the other; this decides how hard to try for the payload first. Each
+     * iteration is one load plus a `SPIN_HINT()`, so the useful range is small -- a producer
+     * that has not landed within a few dozen cycles is descheduled, not merely behind.
+     */
+    template <auto N> struct patience {};
 };
 
 /**
@@ -26,6 +43,30 @@ struct HQOpt {
  *    consumer that arrives at an empty cell does *not* burn the slot. On a
  *    near-empty queue this is what keeps a producer/consumer pair from destroying
  *    capacity, at the cost of a heavier loop.
+ *
+ * ## What the destructive exchange is for, and when it is not needed
+ *
+ * Both paths can overwrite a cell a producer has claimed but not yet written. That is not
+ * about impatience with stragglers -- it is the only cure for **head-of-line blocking**.
+ * A producer claims index `h` and stalls; another publishes at `h + 1`. A consumer that
+ * refused to pass `h` would report empty while a published item sat behind it, which is
+ * the linearizability violation the burn exists to prevent.
+ *
+ * It follows that when nothing is queued behind `h` -- `tail == h + 1` -- the burn buys
+ * nothing, and the slow path now says empty instead. That is linearizable at the load of
+ * the cell: the producer's enqueue linearizes at the CAS that publishes its payload, so
+ * before that the queue really is empty. It is also the whole point of the slow path,
+ * which previously destroyed the cell anyway after two loads.
+ *
+ * ## Progress
+ *
+ * Lock-free, and bounded-wait-free but for spurious `compare_exchange_weak` failures.
+ * `kPatience` is sometimes mistaken for a blocking wait; it is not. Every loop here is
+ * bounded by something monotone: patience by a compile-time constant, the enqueue retry by
+ * a distinct `tail_` ticket per iteration, and every slow-path `continue` by `head_`
+ * having advanced -- and both indices are capped at `capacity_`. No operation can be
+ * delayed indefinitely by another thread stalling. What `kPatience` trades is capacity,
+ * not liveness.
  *
  * This is the segment the README describes as trading throughput for a better memory
  * footprint. It had been dead since the interface moved out from under it.
@@ -45,21 +86,41 @@ struct HQOpt {
  */
 template <typename T, typename Opt, typename Link,
           typename Tag = cell::LowTag<T>>
-    requires meta::AcceptsOnly<Opt, typename HQOpt::force_cell_padding> && linkage::Linked<Link> && cell::Tagging<Tag, T>
+    requires meta::AcceptsOnly<Opt, typename HQOpt::force_cell_padding,
+                               meta::ValueOption<HQOpt::patience>> &&
+             linkage::Linked<Link> && cell::Tagging<Tag, T>
 class HQ : public mem::SingleBlock<HQ<T, Opt, Link, Tag>> {
     using Self = HQ<T, Opt, Link, Tag>;
 
     using word = typename Tag::word;
 
     static constexpr bool pad_cells = Opt::template has<typename HQOpt::force_cell_padding>;
-    static constexpr std::size_t kPatience = 4 * 1024; 
+    /// Cast rather than trusted: `get` returns the option's own type when one is present, so
+    /// `patience<8>` would otherwise arrive as `int`. See OptionsPack::get.
+    static constexpr std::size_t kPatience =
+        static_cast<std::size_t>(Opt::template get<HQOpt::patience, std::size_t{2}>);
 
 public:
+    /// Loads a consumer spends on a straggling producer; see HQOpt::patience.
+    static constexpr std::size_t patience = kPatience;
+
     using tag_type = Tag;
     using cell_type = cell::PlainCell<word, pad_cells>;
     using link_state = typename Link::template state<Self>;
     using handle_type = typename link_state::handle;
 
+    /**
+     * @brief What a capacity request of @p n actually yields.
+     * @return the capacity a segment built with @p n will report.
+     *
+     * Static so a caller can size a split before anything is constructed: LinkedProxy divides
+     * its total across the segments that will exist, and has to know what each one rounds to
+     * before it can report a capacity the queue can genuinely reach.
+     */
+    static constexpr std::size_t capacity_for(std::size_t n) noexcept { return n; }
+
+    /// @brief Where the co-allocated regions go. See @ref block-construction.
+    /// @param n requested capacity; the only thing the layout may depend on.
     static constexpr auto plan(std::size_t n) noexcept {
         mem::LayoutBuilder b{sizeof(Self), alignof(Self)};
         mem::Plan<1> p{};
@@ -76,6 +137,8 @@ public:
             cells_[i].val.store(empty_w(), std::memory_order_relaxed);
     }
 
+    /// @brief Add an item.
+    /// @return false if the queue is full, or closed.
     FORCE_INLINE bool enqueue(T item) noexcept {
         assert((Tag::can_store_null || Tag::is_payload(Tag::encode(item))) &&
                "HQ: this tagging policy cannot store that value (see can_store_null)");
@@ -93,12 +156,19 @@ public:
         }
     }
 
+    /// @brief Add an item, skipping the attempt when the caller already knows it is closed.
+    /// @param closed_hint the caller believes this segment is closed; see
+    ///        core::segment_traits::needs_close_hint.
+    /// @return false if the queue is full, or closed.
     FORCE_INLINE bool enqueue(T item, bool /*closed_hint*/) noexcept { return enqueue(item); }
 
+    /// @brief Take the oldest item.
+    /// @return false if the queue is empty.
     FORCE_INLINE bool dequeue(T& out) noexcept {
         return has_successor() ? fast_dequeue(out) : slow_dequeue(out);
     }
 
+    /// @return Items currently held. Approximate under concurrency, exact when quiescent.
     std::size_t size() const noexcept {
         const uint64_t t = tail_.load(std::memory_order_acquire);
         const uint64_t h = head_.load(std::memory_order_acquire);
@@ -106,14 +176,17 @@ public:
         return capped > h ? static_cast<std::size_t>(capped - h) : 0;
     }
 
+    /// @return Items this queue can hold.
     std::size_t capacity() const noexcept { return capacity_; }
 
+    /// @brief Refuse all further enqueues, permanently.
     void close() noexcept
         requires(Link::is_linked)
     {
         tail_.fetch_add(capacity_, std::memory_order_release);
     }
 
+    /// @return true once closed; a closed segment still drains.
     bool is_closed() const noexcept
         requires(Link::is_linked)
     {
@@ -153,23 +226,6 @@ public:
      * @note `gen_` is a plain bool: reopen is single-threaded by that precondition, and
      *       the segment is published afterwards by a release CAS (`link_next`) that every
      *       reader reaches through an acquire load.
-     *
-     * @debug: Implementation Hint
-     * Each segment starts with all cells `empty` and after closure and full drain ends up
-     * with all cells as `consumed`. The segment would have to store an additional flag which
-     * simply flips the consumed cells and treats them as opened. Furthermore everytime enqueing
-     * an item each thread should check for `empty/consumed` cells based on the flag, in this way
-     * the reopen only has to flip the instance flag (can be done via CAS with no retry). This would
-     * also need to rework a bit how the whole segment uses the flags, the most simple way is to have
-     * a ternary check for each time a tag is evaluated or stored. The tag can be also benefit from not
-     * relying on padding since is setted only once per segment lifetime. We only need one bit for encoding
-     * and both enqueue and dequeue read from the capacity counter, so we could encode it as the LSB or MSB
-     * depending on the data type, else we can use explicit encoding
-     * 
-     * @debug: Implementation 02:
-     * the reopen method has to be executed in isolation so no need to be MT-safe: 
-     * The reopen method has also to set the handle so that no successor is set, and i was
-     * fixating on the interleaving while it's not needed
      */
     bool reopen() noexcept
         requires(Link::is_linked)
@@ -180,8 +236,14 @@ public:
         const uint64_t t = tail_.exchange(0,std::memory_order_relaxed);
 
 
-        if (h == 0 && t == 0);  //no cell used
-        else if (h >= capacity_) {  //all cells used
+        // Pristine: this slot has never been handed out, so every cell is already empty for
+        // the current generation and there is nothing to undo. Returned early rather than
+        // written as `if (...);` with an empty body -- a semicolon-terminated `if` is the
+        // classic silent-bug shape, and these three branches decide whether a recycled
+        // segment is left alone, flipped, or swept.
+        if (h == 0 && t == 0) return true;
+
+        if (h >= capacity_) {  //all cells used
 #ifndef NDEBUG
             for (std::size_t i = 0; i < capacity_; ++i)
                 assert(is_consumed_w(cells_[i].val.load(std::memory_order_relaxed)) &&
@@ -197,16 +259,21 @@ public:
         return true;
     }
 
+    /// @return The successor handle, or nil if this is the tail.
     handle_type next() const noexcept
         requires(Link::is_linked)
     {
         return link_.next();
     }
 
-    bool link_next(handle_type h) noexcept
+    /// @brief Publish @p h as the successor.
+    /// @param current set to the successor now installed -- @p h if we won, the winner's
+    ///        handle if we lost, so a losing caller need not re-read next().
+    /// @return true for exactly one caller; the loser must discard its segment.
+    bool link_next(handle_type h, handle_type& current) noexcept
         requires(Link::is_linked)
     {
-        return link_.link_next(h);
+        return link_.link_next(h, current);
     }
 
 private:
@@ -240,8 +307,15 @@ private:
             const uint64_t h = head_.fetch_add(1, std::memory_order_acq_rel);
             if (h >= capacity_) return false;
             cell_type& c = cells_[h];
-            for (std::size_t i = 0; i < kPatience; ++i)
+            // A pure delay, and deliberately so: the exchange below re-reads the cell, so
+            // this loop's value is never used. Its only job is to give a producer that is
+            // a few cycles behind time to land, because once the head has fetch-added past
+            // this index the slot is gone either way. Without the hint two dependent loads
+            // of an already-hot line retire in a handful of cycles and the wait is noise.
+            for (std::size_t i = 0; i < kPatience; ++i) {
                 if (!is_empty_w(c.val.load(std::memory_order_acquire))) break;
+                SPIN_HINT();
+            }
             const word w = c.val.exchange(consumed_w(), std::memory_order_acq_rel);
             if (Tag::is_payload(w)) {
                 out = Tag::decode(w);
@@ -268,14 +342,27 @@ private:
                 continue;
             }
 
-            if (is_empty_w(w)) { // producer has not published yet
-                bool resolved = false;
+            if (is_empty_w(w)) { // producer claimed this index but has not published
+                // Nothing is queued behind it, so there is no head-of-line blocking to
+                // break -- and breaking it is the *only* thing the destructive exchange
+                // below buys. Burning the cell here would cost capacity for nothing,
+                // which on a near-empty queue is precisely the pathology the slow path
+                // exists to avoid, and the old code still walked into it after two loads.
+                //
+                // Reporting empty is linearizable: it linearizes at the load of `w`
+                // above, and at that instant the producer's enqueue had not yet
+                // linearized -- it does so at the CAS that publishes the payload -- so
+                // the queue genuinely held no item.
+                if (t == h + 1) return false;
+
+                // Something *is* published behind this index, so the head has to get
+                // past it. Give the producer a bounded chance to land first.
                 for (std::size_t i = 0; i < kPatience; ++i) {
                     w = c.val.load(std::memory_order_acquire);
-                    if (is_consumed_w(w)) break;
-                    if (!is_empty_w(w)) { resolved = true; break; }
+                    if (!is_empty_w(w)) break; // resolved, either payload or consumed
+                    SPIN_HINT();
                 }
-                if (!resolved && is_consumed_w(w)) {
+                if (is_consumed_w(w)) { // another consumer got there; help head along
                     (void)head_.compare_exchange_weak(h, h + 1, std::memory_order_relaxed);
                     continue;
                 }
@@ -292,10 +379,8 @@ private:
         }
     }
 
-    ALIGNED_CACHE std::atomic<uint64_t> head_{0};
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
-    ALIGNED_CACHE std::atomic<uint64_t> tail_{0};
-    CACHE_PAD_TYPES(std::atomic<uint64_t>);
+    CACHE_LINE_MEMBER(std::atomic<uint64_t>, head_, {0});
+    CACHE_LINE_MEMBER(std::atomic<uint64_t>, tail_, {0});
     [[no_unique_address]] link_state link_{};
     const std::size_t capacity_;
     cell_type* const cells_;
@@ -306,6 +391,8 @@ private:
 
 } // namespace algo
 
+/// @brief Capabilities of algo::HQ as a linked segment. Every field is mandatory:
+/// core::segment_traits has no primary definition, so omitting one is a compile error.
 template <typename T, typename Opt, typename Link, typename Tag>
 struct core::segment_traits<algo::HQ<T, Opt, Link, Tag>> {
     static constexpr bool needs_close_hint = false;
@@ -320,5 +407,6 @@ MPMC_ASSERT_SEGMENT_TRAITS(algo::HQ<int*, meta::EmptyOptions, linkage::Node<mem:
 
 namespace seg {
 template <typename T, typename Opt = meta::EmptyOptions, typename HP = mem::PtrHandle>
+/// Hybrid write-once array as a linked segment. Linked-only by construction.
 using HQ = algo::HQ<T, Opt, linkage::Node<HP>>;
 }
