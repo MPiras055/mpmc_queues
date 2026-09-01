@@ -2,6 +2,7 @@
 #include <algo/FAAArray.hpp>
 #include <core/Construction.hpp>
 #include <algo/HQ.hpp>
+#include <algo/Spin.hpp>
 #include <algo/LFring.hpp>
 #include <algo/Mutex.hpp>
 #include <algo/PRQ.hpp>
@@ -39,7 +40,16 @@ struct Entry {
 /// Size of every pooled entry below. Named once because it appears twice per entry -- in
 /// the segment's handle policy and in the proxy alias -- and LinkedProxy static_asserts
 /// that the two agree.
-inline constexpr std::size_t kPoolSize = 32;
+/**
+ * @brief Segments a bounded queue may have live at once, for *every* bounded family.
+ *
+ * Read by the pooled entries as the pool size and by the item- and chunk-bounded ones as their
+ * segment count, so the three are always the same geometry and a comparison between them is
+ * measuring the algorithm rather than the layout. Previously the chunk count was a defaulted
+ * constructor argument nothing passed, so it stayed at 4 while this constant moved -- and the
+ * families silently diverged.
+ */
+inline constexpr std::size_t kPoolSize = 4;
 
 // Handle-policy shorthands: a pooled source addresses segments by index, not pointer, and
 // the index is sized by the pool so the rest of the word is ABA counter.
@@ -55,6 +65,14 @@ template <typename T, std::size_t N = kPoolSize>
 using IdxHQ = seg::HQ<T, meta::EmptyOptions, mem::IndexHandle<N>>;
 template <typename T, std::size_t N = kPoolSize>
 using IdxMutex = seg::Mutex<T, meta::EmptyOptions, mem::IndexHandle<N>>;
+template <typename T, std::size_t N = kPoolSize>
+using IdxSpin = seg::Spin<T, meta::EmptyOptions, mem::IndexHandle<N>>;
+template <typename T, std::size_t N = kPoolSize>
+using IdxPSCQ = seg::PSCQ<T, meta::EmptyOptions, mem::IndexHandle<N>>;
+template <typename T, std::size_t N = kPoolSize>
+using IdxDCAS = seg::VyukovDCAS<T, meta::EmptyOptions, mem::IndexHandle<N>>;
+template <typename T, std::size_t N = kPoolSize>
+using IdxNoABA = seg::VyukovNoABA<T, meta::EmptyOptions, mem::IndexHandle<N>>;
 
 
 /**
@@ -78,7 +96,9 @@ using Standalone = meta::TypeList<
     Entry<"vyukov-dcas", queue::VyukovDCAS<T>>,
     Entry<"scq", queue::SCQ<T>>,
     Entry<"pscq", queue::PSCQ<T>>,
-    Entry<"mutex", queue::Mutex<T>>>;
+    Entry<"mutex", queue::Mutex<T>>,
+    Entry<"spin",queue::Spin<T>>
+>;
 
 /**
  * @brief Linked queues: proxy x segment. Everything here models core::Proxy.
@@ -100,20 +120,32 @@ using Linked = meta::TypeList<
     Entry<"u-hq", proxy::Unbounded<T, seg::HQ<T>>>,
     Entry<"u-scq", proxy::Unbounded<T, seg::SCQ<T>>>,
     Entry<"u-mutex", proxy::Unbounded<T, seg::Mutex<T>>>,
+    Entry<"u-spin", proxy::Unbounded<T, seg::Spin<T>>>,
+    Entry<"u-pscq", proxy::Unbounded<T, seg::PSCQ<T>>>,
+    Entry<"u-dcas", proxy::Unbounded<T, seg::VyukovDCAS<T>>>,
+    Entry<"u-noaba", proxy::Unbounded<T, seg::VyukovNoABA<T>>>,
 
-    Entry<"item-vyukov", proxy::ItemBounded<T, seg::Vyukov<T>>>,
-    Entry<"item-prq", proxy::ItemBounded<T, seg::PRQ<T>>>,
-    Entry<"item-faa", proxy::ItemBounded<T, seg::FAAArray<T>>>,
-    Entry<"item-hq", proxy::ItemBounded<T, seg::HQ<T>>>,
-    Entry<"item-scq", proxy::ItemBounded<T, seg::SCQ<T>>>,
-    Entry<"item-mutex", proxy::ItemBounded<T, seg::Mutex<T>>>,
+    Entry<"item-vyukov", proxy::ItemBounded<T, seg::Vyukov<T>, kPoolSize>>,
+    Entry<"item-prq", proxy::ItemBounded<T, seg::PRQ<T>, kPoolSize>>,
+    Entry<"item-faa", proxy::ItemBounded<T, seg::FAAArray<T>, kPoolSize>>,
+    Entry<"item-hq", proxy::ItemBounded<T, seg::HQ<T>, kPoolSize>>,
+    Entry<"item-scq", proxy::ItemBounded<T, seg::SCQ<T>, kPoolSize>>,
+    Entry<"item-mutex", proxy::ItemBounded<T, seg::Mutex<T>, kPoolSize>>,
+    Entry<"item-spin", proxy::ItemBounded<T, seg::Spin<T>, kPoolSize>>,
+    Entry<"item-pscq", proxy::ItemBounded<T, seg::PSCQ<T>, kPoolSize>>,
+    Entry<"item-dcas", proxy::ItemBounded<T, seg::VyukovDCAS<T>, kPoolSize>>,
+    Entry<"item-noaba", proxy::ItemBounded<T, seg::VyukovNoABA<T>, kPoolSize>>,
 
-    Entry<"chunk-vyukov", proxy::ChunkBounded<T, seg::Vyukov<T>>>,
-    Entry<"chunk-prq", proxy::ChunkBounded<T, seg::PRQ<T>>>,
-    Entry<"chunk-faa", proxy::ChunkBounded<T, seg::FAAArray<T>>>,
-    Entry<"chunk-hq", proxy::ChunkBounded<T, seg::HQ<T>>>,
-    Entry<"chunk-scq", proxy::ChunkBounded<T, seg::SCQ<T>>>,
-    Entry<"chunk-mutex", proxy::ChunkBounded<T, seg::Mutex<T>>>,
+    Entry<"chunk-vyukov", proxy::ChunkBounded<T, seg::Vyukov<T>, kPoolSize>>,
+    Entry<"chunk-prq", proxy::ChunkBounded<T, seg::PRQ<T>, kPoolSize>>,
+    Entry<"chunk-faa", proxy::ChunkBounded<T, seg::FAAArray<T>, kPoolSize>>,
+    Entry<"chunk-hq", proxy::ChunkBounded<T, seg::HQ<T>, kPoolSize>>,
+    Entry<"chunk-scq", proxy::ChunkBounded<T, seg::SCQ<T>, kPoolSize>>,
+    Entry<"chunk-mutex", proxy::ChunkBounded<T, seg::Mutex<T>, kPoolSize>>,
+    Entry<"chunk-spin", proxy::ChunkBounded<T, seg::Spin<T>, kPoolSize>>,
+    Entry<"chunk-pscq", proxy::ChunkBounded<T, seg::PSCQ<T>, kPoolSize>>,
+    Entry<"chunk-dcas", proxy::ChunkBounded<T, seg::VyukovDCAS<T>, kPoolSize>>,
+    Entry<"chunk-noaba", proxy::ChunkBounded<T, seg::VyukovNoABA<T>, kPoolSize>>,
 
     // Pooled: the bound is the pool running dry, so the admission policy is None. FAAArray
     // and HQ are here now that their reopen() flips a generation flag instead of failing;
@@ -123,7 +155,11 @@ using Linked = meta::TypeList<
     Entry<"mem-scq", proxy::MemBounded<T, IdxSCQ<T>, kPoolSize>>,
     Entry<"mem-faa", proxy::MemBounded<T, IdxFAAArray<T>, kPoolSize>>,
     Entry<"mem-hq", proxy::MemBounded<T, IdxHQ<T>, kPoolSize>>,
-    Entry<"mem-mutex", proxy::MemBounded<T, IdxMutex<T>, kPoolSize>>
+    Entry<"mem-mutex", proxy::MemBounded<T, IdxMutex<T>, kPoolSize>>,
+    Entry<"mem-spin", proxy::MemBounded<T, IdxSpin<T>, kPoolSize>>,
+    Entry<"mem-pscq", proxy::MemBounded<T, IdxPSCQ<T>, kPoolSize>>,
+    Entry<"mem-dcas", proxy::MemBounded<T, IdxDCAS<T>, kPoolSize>>,
+    Entry<"mem-noaba", proxy::MemBounded<T, IdxNoABA<T>, kPoolSize>>
     >;
 
 /// Everything, for the benchmark.

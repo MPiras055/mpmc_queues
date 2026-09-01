@@ -10,6 +10,7 @@
 #include <util/specs.hpp>
 #include <atomic>
 #include <cstddef>
+#include <type_traits>
 
 namespace proxy::admit {
 
@@ -22,9 +23,7 @@ namespace proxy::admit {
  */
 struct None {
     struct Config {};
-    static constexpr Config config(std::size_t /*segment*/, std::size_t /*chunks*/) noexcept {
-        return {};
-    }
+    static constexpr Config config(std::size_t /*segment*/) noexcept { return {}; }
 
     /// Whether this policy can ever refuse. `if constexpr`-tested, so an unbounded proxy
     /// emits no admission check at all.
@@ -32,9 +31,10 @@ struct None {
     /// Never asked, since `bounded` is false; a value is still required by the concept.
     static constexpr core::AdmitPoint admit_point = core::AdmitPoint::Enqueue;
 
-    /// 0: unbounded, so there is no segment count to split a capacity across. The proxy then
-    /// treats its capacity argument as the size of each segment.
-    static constexpr std::size_t live_segments(std::size_t /*chunks*/) noexcept { return 0; }
+    /// 0: unbounded, so there is no segment count to split a capacity across. The proxy falls
+    /// back on the source's own limit, which is the pool size for a pooled source and 1 for an
+    /// allocating one.
+    static constexpr std::size_t live_segments() noexcept { return 0; }
 
     constexpr explicit None(Config) noexcept {}
 
@@ -45,8 +45,15 @@ struct None {
     constexpr void cancel_admit() noexcept {}
     /// @return The ceiling, in whatever unit this policy counts.
     constexpr std::size_t bound() const noexcept { return 0; } ///< 0 == unbounded
-    /// Nothing caps the total, so the useful number is what one segment holds.
-    constexpr std::size_t capacity(std::size_t segment) const noexcept { return segment; }
+    /**
+     * @brief 0, meaning *no opinion* -- ask the structure instead.
+     *
+     * Not "zero capacity". This policy imposes no ceiling, so the real one comes from how many
+     * segments can be live at once, which only the proxy can work out (it is the smaller of this
+     * policy's limit and the source's). Answering with one segment's worth here, as this used
+     * to, was wrong for a pooled source and forced `LinkedProxy::capacity()` to special-case it.
+     */
+    constexpr std::size_t capacity(std::size_t /*segment*/) const noexcept { return 0; }
 
     /// @name Traversal hooks. Called by LinkedProxy as it observes each event.
     /// @{
@@ -63,15 +70,17 @@ struct None {
  * Two counters rather than one, so producers and consumers touch different cache lines;
  * the difference is the occupancy. Replaces BoundedCounterProxy.
  */
+template <std::size_t Chunks = 4>
 class ItemCount {
 public:
+    static_assert(Chunks != 0, "admit::ItemCount: a queue spread over zero segments holds nothing");
+
     struct Config {
         std::size_t items;
     };
-    /// A chunk count times the segment capacity is how many items fit.
-    static constexpr Config config(std::size_t segment, std::size_t chunks) noexcept {
-        return {segment * chunks};
-    }
+    /// The segment count times what a segment actually holds is how many items fit. Taken from
+    /// the *rounded* segment capacity, so the bound is a figure the queue can really reach.
+    static constexpr Config config(std::size_t segment) noexcept { return {segment * Chunks}; }
 
     /// Whether this policy can ever refuse. `if constexpr`-tested, so an unbounded proxy
     /// emits no admission check at all.
@@ -84,9 +93,8 @@ public:
      */
     static constexpr core::AdmitPoint admit_point = core::AdmitPoint::Enqueue;
 
-    /// The bound is in items, but the caller still says how many segments to spread them over,
-    /// and that is the divisor.
-    static constexpr std::size_t live_segments(std::size_t chunks) noexcept { return chunks; }
+    /// The bound is in items, but the segments it is spread over are still the divisor.
+    static constexpr std::size_t live_segments() noexcept { return Chunks; }
 
     explicit ItemCount(Config c) noexcept : bound_{c.items} {}
 
@@ -136,15 +144,16 @@ private:
  * counters move once per segment rather than once per item, so the hot path is untouched.
  * Replaces BoundedChunkProxy.
  */
+template <std::size_t Chunks = 4>
 class SegmentCount {
 public:
+    static_assert(Chunks != 0, "admit::SegmentCount: a bound of zero segments admits nothing");
+
     struct Config {
         std::size_t segments;
     };
-    /// This policy counts segments, so the chunk count *is* the bound.
-    static constexpr Config config(std::size_t /*segment*/, std::size_t chunks) noexcept {
-        return {chunks};
-    }
+    /// This policy counts segments, so the segment count *is* the bound.
+    static constexpr Config config(std::size_t /*segment*/) noexcept { return {Chunks}; }
 
     /// Whether this policy can ever refuse. `if constexpr`-tested, so an unbounded proxy
     /// emits no admission check at all.
@@ -166,8 +175,8 @@ public:
      */
     static constexpr core::AdmitPoint admit_point = core::AdmitPoint::SegmentLink;
 
-    /// This policy counts segments, so the chunk count is both the bound and the divisor.
-    static constexpr std::size_t live_segments(std::size_t chunks) noexcept { return chunks; }
+    /// This policy counts segments, so the count is both the bound and the divisor.
+    static constexpr std::size_t live_segments() noexcept { return Chunks; }
 
     explicit SegmentCount(Config c) noexcept : bound_{c.segments ? c.segments : 1} {}
 
@@ -211,7 +220,10 @@ private:
 };
 
 static_assert(core::AdmissionPolicy<None>);
-static_assert(core::AdmissionPolicy<ItemCount>);
-static_assert(core::AdmissionPolicy<SegmentCount>);
+static_assert(core::AdmissionPolicy<ItemCount<>>);
+static_assert(core::AdmissionPolicy<SegmentCount<>>);
+/// Empty on purpose: [[no_unique_address]] then erases the policy hook entirely from an
+/// unbounded or pooled proxy, where the ceiling is the source's business rather than a rule.
+static_assert(std::is_empty_v<None>);
 
 } // namespace proxy::admit

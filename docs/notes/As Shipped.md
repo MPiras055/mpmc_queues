@@ -423,6 +423,196 @@ destructor were adjusted to satisfy it rather than the assertion being weakened.
 > with nothing to report it. The proxy's destructor is written around this: its pin covers the
 > discard loop only, after the drain, because `dequeue()` pins internally.
 
+## Capacity means one thing now
+
+Every algorithm rounds a capacity request **up to the next power of two by default**, so
+"capacity 1000" is the same 1024 cells whichever one you pick. Before this the tree disagreed
+three ways: `LFring`, `SCQ`, `PSCQ` and the two Vyukov comparators always rounded; `Vyukov` and
+`PRQ` rounded only when asked; `FAAArray`, `HQ` and `Mutex` never did. A benchmark across
+families was therefore comparing geometries as much as algorithms.
+
+The opt-out is spelled `no_pow2` in every options struct that offers it, and `PSCQ`,
+`VyukovDCAS` and `VyukovNoABA` grew modulo fallbacks so it is real for them rather than
+decorative — `VyukovNoABA` most awkwardly, since it derives its *lap number* from the ticket and
+so trades a shift for a division as well as a mask for a modulo.
+
+`LFring` and `SCQ` deliberately offer no opt-out: `LFring` stores its size as an *order* and
+`SCQ` is built on two of them, so a non-power-of-two is not expressible there rather than merely
+slower. Passing them the tag is a compile error through `meta::AcceptsOnly`.
+
+`RegistryConformanceTest.CapacityRoundsUpToAPowerOfTwo` checks the property across all 30
+registered entries at sizes 3, 100 and 1000 — chosen because they are *not* powers of two.
+Everything else in the tree builds queues at 64 or 8, which satisfies the property without
+exercising any rounding at all, and is why the old suite could not have caught this.
+
+> **Benchmark rows recorded before this are not comparable** for `vyukov`, `prq`, `faa`, `hq`
+> and `mutex`, whose reported capacity now rounds up where it previously did not.
+
+### Known deviation: PSCQ does not honour its own capacity()
+
+`PSCQ::enqueue` tests fullness against `size_`, the physical ring, while `capacity()` reports
+`size_ >> 1` — so it advertises 128 and accepts 256. Its own header states that "the physical
+ring is twice the usable capacity", which makes the fullness check the wrong one of the two.
+
+**Pre-existing and unrelated to the rounding**: it behaves identically with the default. It
+surfaced only because the new capacity tests are the first to compare items admitted against
+`capacity()` — `RefusesBeyondCapacityThenDrainsExactly` checks that a queue drains what it
+accepted, never that it accepted what it advertised.
+
+Left as-is deliberately. Correcting the check would halve `pscq`'s effective capacity and
+invalidate every benchmark number recorded for it, which is a bigger change than the
+inconsistency warrants. Two consequences worth knowing:
+
+- **`pscq` benchmark rows are taken at twice their stated capacity.** Comparing `pscq` against
+  another algorithm at "capacity N" is comparing N against 2N.
+- `PSCQ` is verified correct *up to* its advertised capacity — the new tests fill it to
+  `capacity()`, drain it in FIFO order, and wrap a 3-slot ring 100 times. Whether filling it to
+  the full `size_` preserves FIFO and the threshold invariant is **untested and unknown**, so the
+  extra headroom should not be relied on.
+
+`OptionsTest`'s `exact_size_round_trips` call site carries the same explanation, next to the one
+assertion it skips for `PSCQ`.
+
+---
+
+## Two lock-based controls, and four more linked segments
+
+`algo::Mutex` was the only control, and it answered one question badly: it measured
+`std::mutex` acquisition *and* the try-and-fail loop a caller does when the queue is full,
+mixed together. There are now two controls, differing in exactly one thing:
+
+| | lock | on full / empty |
+| --- | --- | --- |
+| `algo::Mutex` | `std::mutex` | parks on one of two condition variables |
+| `algo::Spin` | three-state futex spinlock | refuses immediately |
+
+**`Mutex` gained two condition variables and a single mutex.** `not_empty_` and `not_full_`,
+signalled with `notify_one()` — one item can be taken by exactly one consumer, so waking the
+rest only to have them find an empty queue is the thundering herd the split exists to avoid.
+The notify happens after the lock is released, since a woken thread would otherwise immediately
+block on it.
+
+The wait is **bounded** (`MutexOpt::wait_micros`, default 50) and that bound is load-bearing
+rather than a tuning choice:
+
+- `dequeue()` must still answer `false` on an empty queue. Every drain in the tree — the
+  benchmark's, `ConcurrencyTest`'s — ends on `while (q.dequeue(out))`, so an unbounded wait
+  would hang rather than fail.
+- A **linked** segment must still refuse the instant it is full, because the proxy reads that
+  refusal as "link a successor". Waiting there waits for room this segment is never going to
+  have. So parking is disabled outright when `Link::is_linked`, exposed as
+  `parks_when_blocked` and asserted in `OptionsTest.OnlyAStandaloneMutexParks` — a
+  static_assert, so a regression is a build failure rather than a stall.
+
+**`algo::Spin`** is the same ring with a spinlock that bounds its spinning
+(`SpinOpt::spins_before_park`, default 64) and then parks on `std::atomic::wait`. The lock is
+the three-state futex — free / held / held-and-contended — so an uncontended unlock is a plain
+store with no `notify_one()`. It never waits on the queue's *state*, only on the lock, which is
+what makes the pair separable: whatever `Spin` differs from `Mutex` by is blocking policy, not
+lock cost.
+
+### PSCQ, VyukovDCAS and VyukovNoABA are segments now
+
+All three were standalone comparators. They now carry the full linkage surface and appear in all
+four proxy families, so the registry is **47 entries**. Three details worth keeping:
+
+- **How each closes.** `VyukovDCAS` steals the top bit of its tail ticket, as `Vyukov` does.
+  The other two cannot: `VyukovNoABA` derives its *lap number* from the ticket, and `PSCQ`
+  advances its tail with `fetch_add` while the sequence words already use their top bit as the
+  `unsafe` marker. Both use a separate flag, read only on the linked path.
+- **`PSCQ::reopen()` is O(ring)**, alone among the segments, which recycle by realigning
+  indices. A drained PSCQ cell can carry the `unsafe` bit into the next lap and its threshold is
+  spent by empty dequeues rather than by position, so neither is a function of the head alone.
+  Rebuilding restores the one state the algorithm is demonstrably correct from.
+- **`PSCQ` needs both `prepare_dequeue_after_link()` and `has_inflight()`.** The first for the
+  same reason as `SCQ` — an empty dequeue spends the threshold, and a post-link retry needs it
+  back. The second because it claims a cell with a token and publishes the payload in a *later*
+  CAS, so unlike `PRQ` a cell can genuinely be seen mid-insert.
+
+`LFring` and `CacheRing` and `PhasedBucket` are deliberately untouched: the first is a ring of
+*indices* with an order-based size, and the other two are internals of the pooled source rather
+than queues in their own right.
+
+---
+
+## A close has to live in the tail, not in a flag
+
+`ConcurrencyTest` found seven failures in the segments that had just been made linkable. The
+cause was one mistake, made twice: `PSCQ` and `VyukovNoABA` were given a `std::atomic<bool>` as
+their closed flag.
+
+`LinkedProxy::dequeue` unlinks and **retires** a segment on nothing more than *dequeue said empty
+twice and a successor exists*. So the design rests on an invariant:
+
+> once a segment refuses an enqueue, it must refuse for ever.
+
+A flag cannot provide it. A producer reads `closed_ == false`, is descheduled, and commits its
+cell CAS arbitrarily later — after the drain, the unlink and the retire. The item is counted as
+enqueued and never traversed again. What the healthy segments do instead is put the marker **in
+the tail counter**, so it invalidates tickets that are already in flight:
+
+| | close() | the ticket is the permission |
+| --- | --- | --- |
+| `Vyukov` | MSB of the tail; commit *is* the tail CAS | ✅ |
+| `PRQ` | MSB of the tail; `fetch_add` ticket | ✅ |
+| `FAAArray` | `tail_ = capacity_` | ✅ |
+| `HQ` | `tail_ += capacity_` | ✅ |
+| `Mutex`, `Spin` | set under the lock that guards the insert | ✅ |
+
+`PSCQ` is now a direct port of PRQ's scheme: `fetch_or` the top bit, check it on the ticket the
+`fetch_add` returns, and route every arithmetic use of a ticket through one `clean()` helper —
+`mod()`, the sequence CAS, both fullness comparisons, `size()` and `fix_state()`. It also takes
+`needs_close_hint`, as PRQ does, since it inherits the same unsafe-cell path.
+
+### Two things the harness found that the failure list did not
+
+**`VyukovDCAS` had the same bug and was passing.** Its close already set the tail MSB, but the
+double-CAS on the cell decided success while the tail CAS was best-effort — so the close
+invalidated nothing. At 4 producers / 4 consumers on 16-slot segments it lost items in **12 of
+25 trials**; it simply never tripped in the run that reported the seven failures. Fixing it
+preemptively was the right call.
+
+**Reserving the ticket is necessary but not sufficient.** With the reservation in place `DCAS`
+still lost items in 4 of 25 trials, because reserving and publishing are two steps: in between,
+the cell still reads as the previous lap, a consumer calls the segment empty, and the proxy
+retires it under the reservation. That is what `has_inflight()` is for, and both `VyukovDCAS`
+and `VyukovNoABA` now declare `needs_inflight_drain` and answer it in O(1) — `head != tail`
+means a publish is outstanding, which is exact now that every reserved ticket is published.
+
+`VyukovNoABA` additionally had a **pre-existing hole**: its tail advanced even when the cell CAS
+failed, so a ticket could be skipped and its cell left unfilled behind a head that had moved
+past it. The mandatory reservation closes that too. The cost is that its commit protocol is now
+Vyukov's; what stays distinctive is the single-word cell with the lap folded in, which is what it
+exists to measure. **Its benchmark numbers are not comparable with earlier ones.**
+
+### Measured, before and after
+
+4P/4C, capacity 16 (4-slot segments), 20k items, 25 trials, counting trials that lost items:
+
+| | before | after |
+| --- | ---: | ---: |
+| `item-pscq` | 13/25 | **0/25** |
+| `chunk-noaba` | 20/25 | **0/25** |
+| `item-dcas` | 12/25 | **0/25** |
+| `item-vyukov` (control) | 0/25 | 0/25 |
+
+All fifteen proxy configurations, including the untouched controls, are clean afterwards, and
+clean again under TSan with no races reported.
+
+`SegmentLifecycleTest.AClosedSegmentRefusesEveryEnqueue` pins the single-threaded half of the
+contract across all ten segment types. It is deliberately weak — an advisory flag passes it too
+— and says so, because the enforcing half only shows under contention.
+
+### Still worth knowing
+
+`Vyukov` reserves its ticket and *then* writes the cell and sequence, which is the same two-step
+shape, yet it declares `needs_inflight_drain = false` on the grounds that "a single atomic step
+publishes the item". That claim does not hold literally. It shows no losses in any harness here,
+so it has been left alone, but it is the next thing to look at if a loss ever appears in the
+Vyukov family.
+
+---
+
 ## Still open, and left as notes in the source
 
 `Pool` carries `@debug` notes for a larger rework that wants measurement rather than a

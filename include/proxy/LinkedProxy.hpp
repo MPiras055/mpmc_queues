@@ -222,31 +222,29 @@ public:
     };
 
     /**
-     * @param segment_capacity capacity of each segment
-     * @param chunks           bound, in segments, for a bounded Admit; ignored by None
-     *
-     * @note There is no thread count. The source's registry sizes itself, so a participant
-     *       limit would be a number the queue does not need and could only get wrong.
-     */
-    /**
      * @brief How many segments will be live at once, and therefore the capacity divisor.
      *
      * Neither component knows this alone: for a chunk-bounded queue the admission policy caps
      * it, for a pooled one the source does, and for an unbounded one neither. Each answers 0
      * for "I do not bound this", so the binding limit is the smaller non-zero of the two.
      */
-    static constexpr std::size_t split_across(std::size_t chunks) noexcept {
-        const std::size_t a = Admit::live_segments(chunks);
-        const std::size_t b = Source::live_segments();
-        if (a == 0 && b == 0) return 1;   // unbounded: the argument is the segment size
-        if (a == 0) return b;
-        if (b == 0) return a;
-        return a < b ? a : b;
+    static constexpr std::size_t split_across() noexcept {
+        constexpr std::size_t a = Admit::live_segments();
+        constexpr std::size_t b = Source::live_segments();
+        if constexpr (a == 0 && b == 0) return 1;   // unbounded: the argument is the segment size
+        else if constexpr (a == 0) return b;
+        else if constexpr (b == 0) return a;
+        else return a < b ? a : b;
     }
 
+    /// How many segments this queue can have live at once. Compile-time, because both sides now
+    /// declare it as a template parameter -- which is the point: a chunk-bounded queue and a
+    /// pooled one built from the same constant can no longer disagree about their geometry.
+    static constexpr std::size_t live_segments = split_across();
+
     /// The per-segment size a total of @p capacity resolves to, after the segment's rounding.
-    static constexpr std::size_t per_segment(std::size_t capacity, std::size_t chunks) noexcept {
-        const std::size_t d = split_across(chunks);
+    static constexpr std::size_t per_segment(std::size_t capacity) noexcept {
+        constexpr std::size_t d = live_segments;
         const std::size_t share = (capacity + d - 1) / d;   // ceil: never rounds to zero
         // Floored at two before the segment sees it. A ring that distinguishes laps by
         // `seq == t + capacity` degenerates at capacity 1 -- it never reports itself full, so
@@ -256,22 +254,31 @@ public:
         return Segment::capacity_for(share < 2 ? 2 : share);
     }
 
+    /// What one segment actually holds. Read back from the source, which is what built them at
+    /// that size, rather than kept as a second copy here.
+    std::size_t segment_capacity() const noexcept { return source_.segment_capacity(); }
+
     /**
      * @param capacity total items the queue should hold, **split across the segments that will
-     *        exist** -- `chunks` of them for a bounded policy, the pool size for a pooled
-     *        source, one for an unbounded queue (where it is simply the segment size).
-     * @param chunks   how many segments to spread the capacity over; ignored by `admit::None`
-     *        over an allocating source, which has no segment count to divide by.
+     *        exist** -- `live_segments` of them, which is a template parameter of the admission
+     *        policy or of the source, whichever binds.
+     *
+     * One argument, deliberately. The segment count used to be a second, defaulted one, and
+     * because nothing ever passed it a chunk-bounded queue quietly took 4 while a pooled one
+     * took its pool size. Making it part of the type removes the thing there was to forget.
      *
      * @note `capacity()` may exceed @p capacity. Segments round their own size up -- SCQ and
      *       LFring always to a power of two -- so the split is computed, handed to the segment,
      *       and then read back through `Segment::capacity_for`. Reporting the *achievable*
      *       figure is what keeps `capacity()` a number the queue can actually reach.
+     *
+     * @note There is no thread count either. The source's registry sizes itself, so a
+     *       participant limit would be a number the queue does not need and could only get
+     *       wrong.
      */
-    explicit LinkedProxy(std::size_t capacity, std::size_t chunks = 4)
-        : seg_capacity_{per_segment(capacity, chunks)},
-          source_{seg_capacity_},
-          admit_{Admit::config(seg_capacity_, chunks)} {
+    explicit LinkedProxy(std::size_t capacity)
+        : source_{per_segment(capacity)},
+          admit_{Admit::config(source_.segment_capacity())} {
         assert(capacity != 0 && "LinkedProxy: capacity must be non-null");
 
         // source session
@@ -442,6 +449,12 @@ public:
         return true;
     }
 
+    /// @copydoc core::Queue::try_enqueue
+    /// A proxy never blocks: it refuses, or links a successor and retries. Same operation.
+    bool try_enqueue(T item) noexcept { return enqueue(item); }
+    /// @copydoc core::Queue::try_dequeue
+    bool try_dequeue(T& out) noexcept { return dequeue(out); }
+
     bool dequeue(T& out) noexcept {
         auto g = source_.pin(); //RAII protection for the source memeory reclamation
         Meta& me = g.payload();
@@ -533,17 +546,17 @@ public:
     /**
      * @brief Items this queue can hold.
      *
-     * Three cases, because the ceiling can come from either side. A bounded policy knows it.
-     * An unbounded policy over a *pooled* source does not -- the ceiling there is the pool
-     * running dry, which is the source's business -- so ask the source instead; before this,
-     * a pooled proxy reported one segment's worth as its entire capacity. With neither
-     * bounding anything, one segment's worth is the only meaningful figure.
+     * Ask the policy; if it has no opinion, the ceiling is structural. A policy that counts
+     * items answers exactly, one that counts segments answers in segments, and `admit::None`
+     * answers 0 -- at which point how many segments can be live is the only bound there is.
+     *
+     * The pooled case needs no branch of its own: `live_segments` already took the smaller of
+     * the policy's limit and the source's, so `admit::None` over a `Pool<N>` gives `N` segments'
+     * worth and over an allocating source gives one.
      */
     std::size_t capacity() const noexcept {
-        if constexpr (Admit::bounded) return admit_.capacity(seg_capacity_);
-        else if constexpr (Source::live_segments() != 0)
-            return Source::live_segments() * seg_capacity_;
-        else return seg_capacity_;
+        const std::size_t stated = admit_.capacity(segment_capacity());
+        return stated != 0 ? stated : live_segments * segment_capacity();
     }
 
     /*
@@ -633,7 +646,6 @@ private:
     /// counters because those become unreachable the moment their thread detaches.
     CACHE_LINE_MEMBER(std::atomic<int64_t>, departed_ops_, {0});
 
-    const std::size_t seg_capacity_;
     Source source_;
     [[no_unique_address]] Admit admit_; //may be optimized out if source implements an admission policy internally
     [[no_unique_address]] mutable Stats stats_{};

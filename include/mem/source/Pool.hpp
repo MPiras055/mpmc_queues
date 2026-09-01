@@ -204,7 +204,7 @@ public:
      * that can be in flight. The slot arrays are sized by the template parameter, so they
      * are members rather than allocations and nothing here needs a length argument.
      */
-    explicit Pool(std::size_t segment_capacity) {
+    explicit Pool(std::size_t segment_capacity) : seg_capacity_{segment_capacity} {
         assert(segment_capacity != 0);
 
         for (std::size_t i = 0; i < N; ++i) {
@@ -229,6 +229,13 @@ public:
     /// The pool size: this is the memory bound, and the divisor when a proxy splits a total
     /// capacity across the segments that will exist.
     static constexpr std::size_t live_segments() noexcept { return N; }
+
+    /// @copydoc core::SegmentSource::segment_capacity
+    ///
+    /// Kept even though nothing here needs it after construction: the proxy reads its segment
+    /// size back from the source rather than holding a second copy, and a pooled source is the
+    /// one that decides how big the N preallocated segments are.
+    std::size_t segment_capacity() const noexcept { return seg_capacity_; }
 
     /**
      * @brief No-op: the epoch pin already covers every slot.
@@ -364,7 +371,7 @@ public:
                 if (try_advance(p)) continue;
             }
             if (spin >= kMaxSpins || !worth_waiting()) break;
-            SPIN_HINT();
+            // SPIN_HINT(); we don't spin-wait
         }
 
         if (!got) return std::nullopt;
@@ -719,6 +726,8 @@ private:
     /// Discarded indices, outside the rotation entirely. Genuinely MPMC, hence a ring rather
     /// than a fifth phased bucket.
     mutable Cache cache_;
+    /// What each of the N segments was built to hold; see segment_capacity().
+    const std::size_t seg_capacity_;
     /// Per-slot reuse counters, feeding the version half of every handle.
     std::atomic<uint64_t> versions_[N]{};
     /// The pooled segments themselves. N is a template parameter, so these are members

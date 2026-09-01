@@ -236,8 +236,24 @@ is plausible — see `mem::PtrHandle` and `mem::IndexHandle<N>`, which are three
 
 ### Admission — what stops a proxy admitting an item
 
-Model `core::AdmissionPolicy`: a `Config`, a static `config(segment, chunks)`, `bounded`,
-`try_admit()` / `cancel_admit()`, the four `on_*` hooks, `bound()` and `capacity(segment)`.
+Model `core::AdmissionPolicy`: a `Config`, a static `config(segment)`, `bounded`,
+`live_segments()`, `try_admit()` / `cancel_admit()`, the four `on_*` hooks, `bound()` and
+`capacity(segment)`.
+
+**The segment count is a template parameter, not a constructor argument.**
+`admit::ItemCount<N>` and `admit::SegmentCount<N>` take it the same way a pooled source takes
+its size, and `LinkedProxy`'s constructor therefore has exactly one argument — the total
+capacity. It used to be a second, defaulted argument, which nothing ever passed: every
+chunk-bounded queue silently ran at 4 segments while a pooled one ran at its pool size, so the
+two could not be compared without the caller remembering to keep a runtime argument in step with
+a template one. `LinkedProxy::live_segments` is now a compile-time constant, and
+`AdmissionTest.ChunkAndPoolAgreeAtTheSameSegmentCount` static_asserts the two families match.
+
+**`capacity(segment)` may answer 0, meaning "no opinion".** That is what an unbounded policy
+returns, and it tells the proxy the ceiling is structural — `live_segments * segment` — rather
+than something the policy knows. It is what lets `capacity()` treat a pooled source without a
+branch of its own, since `live_segments` already takes the smaller of the policy's limit and the
+source's.
 
 **Say where you want to be asked.** `admit_point` is the field that makes two policies
 genuinely different rather than differently parameterised:
@@ -257,7 +273,41 @@ the proxy has not decided yet — use `SegmentLink` and accept a ceiling that is
 within the number of producers acting concurrently.
 
 If the policy is unbounded, make it an **empty struct** — `admit::None` is, so under
-`[[no_unique_address]]` an unbounded proxy carries no counter and no cache line.
+`[[no_unique_address]]` an unbounded proxy carries no counter and no cache line. This is worth
+protecting: it is why the per-segment capacity lives in the *source* (which builds the segments
+at that size and, in `Hazard`'s case, already stored it) rather than in the policy, where it
+would have made `None` non-empty and charged every pooled and unbounded queue for a hook they
+never call. `AdmitNone.CostsTheProxyNothingComparedToACountingPolicy` pins that down.
+
+### Capacity rounding — one answer per request
+
+Every algorithm rounds a capacity request **up to the next power of two by default**, so that
+"capacity 1000" means the same 1024 cells whichever one you pick and a cross-algorithm benchmark
+compares algorithms rather than geometries. `bit::round_to_next_pow2` (`include/util/bit.hpp`)
+already returns its argument unchanged when it is already a power of two.
+
+A new algorithm should therefore expose the same opt-out under the same name:
+
+```cpp
+struct XOpt { struct no_pow2 {}; };
+
+static constexpr bool pow2 = !Opt::template has<typename XOpt::no_pow2>;
+static constexpr std::size_t round_size(std::size_t n) noexcept {
+    const std::size_t f = n < 2 ? 2 : n;   // one-slot rings never report themselves full
+    if constexpr (pow2) return bit::round_to_next_pow2(f);
+    else return f;
+}
+static constexpr std::size_t capacity_for(std::size_t n) noexcept { return round_size(n); }
+```
+
+and route every index through a `mod()` that masks on the pow2 path and divides otherwise.
+
+**Do not offer the opt-out if the size is structural rather than an optimisation.** `LFring`
+stores its size as an *order* and `SCQ` is built on two `LFring`s, so for them a
+non-power-of-two is not expressible at all; they deliberately omit the tag, and passing one is a
+compile error through `meta::AcceptsOnly` rather than a silently ignored option.
+`RegistryConformanceTest.CapacityRoundsUpToAPowerOfTwo` checks the default across every
+registered entry at deliberately non-power-of-two sizes.
 
 ### Options — flags and values
 

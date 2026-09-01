@@ -222,6 +222,7 @@ public:
         }
     }
 
+
     /// @return Items currently held. Approximate under concurrency, exact when quiescent.
     std::size_t size() const noexcept {
         const uint64_t t = bit::clear_msb(tail_.load(std::memory_order_acquire));

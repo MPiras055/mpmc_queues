@@ -68,7 +68,7 @@ public:
             all_barrier.arrive_and_wait();
             for (uint64_t i = first; i < first + count; ++i) { // NB: first + count
                 prod_delay_();
-                while (!q.enqueue(std::bit_cast<TestItem>(i))) {}
+                while (!q.try_enqueue(std::bit_cast<TestItem>(i))) {}
             }
             producers_done_barrier.arrive_and_wait();
             all_barrier.arrive_and_wait();
@@ -78,9 +78,13 @@ public:
             TestItem out = nullptr;
             [[maybe_unused]] auto joined = registry::Instance<Queue>::session(q);
             all_barrier.arrive_and_wait();
+            // try_dequeue, not dequeue: the blocking form only returns once somebody closes
+            // the queue, and this loop has to keep re-checking `producers_done` instead. The
+            // registry surface has no generic close(), so the condition-variable path in
+            // algo::Mutex is not what this harness measures -- see the note in the docs.
             while (!producers_done.load(std::memory_order_relaxed))
-                if (q.dequeue(out)) cons_delay_();
-            while (q.dequeue(out)) cons_delay_();
+                if (q.try_dequeue(out)) cons_delay_();
+            while (q.try_dequeue(out)) cons_delay_();
             all_barrier.arrive_and_wait();
         };
 
@@ -132,8 +136,8 @@ void usage(const char* argv0) {
               << " <name> <producers> <consumers> <items> <capacity>"
                  " [pin] [prod_ticks prod_amp] [cons_ticks cons_amp]\n\n"
                  "  <capacity>  total items the queue holds. A linked queue splits it across\n"
-                 "              the segments that will exist -- the chunk count for a bounded\n"
-                 "              proxy, the pool size for a pooled one -- so the per-segment\n"
+                 "              the segments that will exist -- a count fixed by the type, and\n"
+                 "              the same one for every bounded family -- so the per-segment\n"
                  "              size is capacity/segments, floored at 2 and rounded up by the\n"
                  "              algorithm. The queue may therefore hold more than asked.\n"
                  "\nregistered:\n";

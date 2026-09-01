@@ -24,6 +24,11 @@
 #include <algo/LFring.hpp>
 #include <algo/PRQ.hpp>
 #include <algo/PSCQ.hpp>
+#include <algo/SCQ.hpp>
+#include <algo/Spin.hpp>
+#include <algo/VyukovNoABA.hpp>
+#include <algo/VyukovDCAS.hpp>
+#include <algo/Mutex.hpp>
 #include <algo/Vyukov.hpp>
 #include <mem/source/Hazard.hpp>
 #include <mem/source/Pool.hpp>
@@ -32,6 +37,8 @@
 
 #include <cstddef>
 #include <type_traits>
+#include <chrono>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -133,7 +140,7 @@ TEST(OptionDefaults, AlgorithmsKeepTheirPreviousConstants) {
     static_assert(queue::IndexRing<>::tail_reload_period == 1ull << 8);
 
     static_assert(seg::FAAArray<Item>::patience == 1024);
-    static_assert(seg::HQ<Item>::patience == 2);
+    static_assert(seg::HQ<Item>::patience == 1024);
     SUCCEED();
 }
 
@@ -177,6 +184,266 @@ TEST(OptionDefaults, OptionsOverrideTheDefaults) {
 /// Naming a tuned segment is one thing; instantiating and driving it is another. A constraint
 /// that rejected the value option, or a `get<>` that failed to bind, shows up here rather than
 /// in a static_assert that was never instantiated.
+/**
+ * @brief `no_pow2` really takes the size as asked, and the queue still works without a mask.
+ *
+ * The default rounds, so the exact-size paths are otherwise never compiled or run. Three of
+ * these are newly written fallbacks -- PSCQ and VyukovDCAS swap a mask for a modulo, and
+ * VyukovNoABA additionally swaps the `>> shift_` that derives its *lap number* for a division.
+ * That last one is the one to distrust: get it wrong and cells appear permanently occupied or
+ * permanently empty, which a round-trip past the wrap point catches and a single push/pop does
+ * not. Hence 100 items through a 3-slot ring below.
+ */
+/// @param honours_capacity false for PSCQ only -- see the call site.
+template <typename Q>
+void exact_size_round_trips(bool honours_capacity = true) {
+    constexpr std::size_t kOdd = 100;
+    Q* q = mem::SingleBlock<Q>::create(kOdd);
+    EXPECT_EQ(q->capacity(), kOdd) << "no_pow2 did not take the size as asked";
+
+    std::vector<Data> store(kOdd);
+    for (std::size_t i = 0; i < kOdd; ++i) store[i] = {i + 1};
+    for (auto& d : store) ASSERT_TRUE(q->try_enqueue(&d));
+    if (honours_capacity) {
+        EXPECT_FALSE(q->try_enqueue(&store[0])) << "accepted past its stated capacity";
+    }
+
+    for (std::size_t i = 0; i < kOdd; ++i) {
+        Item out = nullptr;
+        ASSERT_TRUE(q->try_dequeue(out)) << "ran dry after " << i << " of " << kOdd;
+        EXPECT_EQ(out->seq, i + 1) << "FIFO order broken at " << i;
+    }
+    mem::SingleBlock<Q>::destroy(q);
+}
+
+/// Drive a small ring well past its wrap point, which is where an index or lap that is computed
+/// wrongly on the modulo path actually shows up.
+template <typename Q>
+void exact_size_wraps() {
+    Q* q = mem::SingleBlock<Q>::create(3);
+    ASSERT_EQ(q->capacity(), 3u);
+    Data d{7};
+    for (int lap = 0; lap < 100; ++lap) {
+        ASSERT_TRUE(q->try_enqueue(&d)) << "full at lap " << lap << " with nothing queued";
+        Item out = nullptr;
+        ASSERT_TRUE(q->try_dequeue(out)) << "empty at lap " << lap << " right after an enqueue";
+        EXPECT_EQ(out->seq, 7u);
+    }
+    mem::SingleBlock<Q>::destroy(q);
+}
+
+TEST(OptionDefaults, TheExactSizeOptOutWorksEverywhereItIsOffered) {
+    using L = linkage::None;
+    exact_size_round_trips<algo::Vyukov<Item, meta::OptionsPack<algo::VyukovOpt::no_pow2>, L>>();
+    exact_size_round_trips<
+        algo::VyukovDCAS<Item, meta::OptionsPack<algo::VyukovDCASOpt::no_pow2>, L>>();
+    exact_size_round_trips<
+        algo::VyukovNoABA<Item, meta::OptionsPack<algo::VyukovNoABAOpt::no_pow2>, L>>();
+    // PSCQ is passed false because it does not honour its own capacity() -- a *pre-existing*
+    // defect, unrelated to the size rounding and equally present with the default: its fullness
+    // check in enqueue() tests against `size_`, the physical ring, while capacity() reports
+    // `size_ >> 1`, the usable figure its own header documents ("the physical ring is twice the
+    // usable capacity"). So it reports 128 and accepts 256. Left alone here rather than fixed in
+    // passing, because halving pscq's effective capacity changes what every recorded benchmark
+    // for it measured. The rest of this helper -- exact sizing, FIFO order, the modulo indexing
+    // -- is still checked for it.
+    exact_size_round_trips<algo::PSCQ<Item, meta::OptionsPack<algo::PSCQOpt::no_pow2>, L>>(false);
+    exact_size_round_trips<algo::Mutex<Item, meta::OptionsPack<algo::MutexOpt::no_pow2>, L>>();
+
+    exact_size_wraps<algo::Vyukov<Item, meta::OptionsPack<algo::VyukovOpt::no_pow2>, L>>();
+    exact_size_wraps<algo::VyukovDCAS<Item, meta::OptionsPack<algo::VyukovDCASOpt::no_pow2>, L>>();
+    exact_size_wraps<
+        algo::VyukovNoABA<Item, meta::OptionsPack<algo::VyukovNoABAOpt::no_pow2>, L>>();
+    exact_size_wraps<algo::PSCQ<Item, meta::OptionsPack<algo::PSCQOpt::no_pow2>, L>>();
+    exact_size_wraps<algo::Mutex<Item, meta::OptionsPack<algo::MutexOpt::no_pow2>, L>>();
+
+    // PRQ only exists as a segment -- it requires a linked linkage -- but the ring underneath
+    // is the same, so it gets the same treatment with the linkage it insists on.
+    using PRQx = algo::PRQ<Item, meta::OptionsPack<algo::PRQOpt::no_pow2>,
+                           linkage::Node<mem::PtrHandle>>;
+    exact_size_round_trips<PRQx>();
+    exact_size_wraps<PRQx>();
+}
+
+/// FAAArray and HQ take the option too, but for them it is a pure sizing choice -- they walk
+/// their cells linearly and close, so there is no wrap to get wrong. Segments rather than
+/// standalone queues, hence the separate case.
+TEST(OptionDefaults, TheExactSizeOptOutSizesWriteOnceSegments) {
+    using FAAx = algo::FAAArray<Item, meta::OptionsPack<algo::FAAArrayOpt::no_pow2>,
+                                linkage::Node<mem::PtrHandle>>;
+    using HQx = algo::HQ<Item, meta::OptionsPack<algo::HQOpt::no_pow2>,
+                         linkage::Node<mem::PtrHandle>>;
+    static_assert(FAAx::capacity_for(100) == 100);
+    static_assert(HQx::capacity_for(100) == 100);
+    // ...and the default still rounds.
+    static_assert(seg::FAAArray<Item>::capacity_for(100) == 128);
+    static_assert(seg::HQ<Item>::capacity_for(100) == 128);
+
+    FAAx* f = mem::SingleBlock<FAAx>::create(100);
+    HQx* h = mem::SingleBlock<HQx>::create(100);
+    Data d{1};
+    EXPECT_TRUE(f->enqueue(&d));
+    EXPECT_TRUE(h->enqueue(&d));
+    Item out = nullptr;
+    EXPECT_TRUE(f->try_dequeue(out));
+    EXPECT_TRUE(h->try_dequeue(out));
+    mem::SingleBlock<FAAx>::destroy(f);
+    mem::SingleBlock<HQx>::destroy(h);
+}
+
+/// LFring and SCQ deliberately offer no opt-out: LFring keeps its size as an *order* and SCQ is
+/// built on two of them, so a non-power-of-two is not expressible rather than merely slower.
+/// Handing either a `no_pow2` tag is a compile error through meta::AcceptsOnly; assert the
+/// positive property here, since a negative-compilation harness is not available.
+/**
+ * @brief The condition-variable wait is on for a standalone queue and off for a linked segment.
+ *
+ * Asserted as a constant rather than by timing, because it is a correctness property, not a
+ * performance one: a *linked* segment that parked when full would stall the proxy outright. The
+ * proxy reads "full" as "link a successor", so waiting there is waiting for room that this
+ * segment is never going to have.
+ */
+TEST(LockBasedControls, OnlyAStandaloneMutexParks) {
+    static_assert(queue::Mutex<Item>::parks_when_blocked,
+                  "the standalone control should exercise the condition variables");
+    static_assert(!seg::Mutex<Item>::parks_when_blocked,
+                  "a linked segment must refuse instantly so the proxy links a successor");
+
+    // The wake policy is the tunable, and notify_one is the default: one enqueue creates work
+    // for exactly one consumer, so waking the rest is the herd the two variables avoid.
+    static_assert(!queue::Mutex<Item>::notify_all_policy);
+    using WakeAll = queue::Mutex<Item, meta::OptionsPack<algo::MutexOpt::notify_all>>;
+    static_assert(WakeAll::notify_all_policy);
+}
+
+/// try_dequeue never waits, which is what keeps every generic drain in the tree terminating.
+/// The blocking dequeue() on an empty queue is covered below, where a close() releases it.
+TEST(LockBasedControls, TryDequeueNeverWaits) {
+    using Q = queue::Mutex<Item>;
+    Q* q = mem::SingleBlock<Q>::create(4);
+    Item out = nullptr;
+    EXPECT_FALSE(q->try_dequeue(out)) << "an empty queue reported an item";
+    Data d{1};
+    EXPECT_TRUE(q->try_enqueue(&d));
+    EXPECT_TRUE(q->try_dequeue(out));
+    EXPECT_FALSE(q->try_dequeue(out));
+    mem::SingleBlock<Q>::destroy(q);
+}
+
+/**
+ * @brief A consumer parked in the blocking dequeue() is released by close(), not by a timeout.
+ *
+ * This is the one situation the unbounded wait exists for, and the reason close() notifies
+ * *both* variables: without it a consumer on an empty queue parks for ever. The test would hang
+ * rather than fail if that broke, so it carries its own deadline and reports.
+ */
+TEST(LockBasedControls, CloseReleasesAParkedConsumer) {
+    using Q = queue::Mutex<Item>;
+    Q* q = mem::SingleBlock<Q>::create(4);
+
+    std::atomic<bool> returned{false};
+    std::atomic<bool> took{true};
+    std::thread consumer{[&] {
+        Item out = nullptr;
+        took.store(q->dequeue(out));      // blocks: the queue is empty and open
+        returned.store(true, std::memory_order_release);
+    }};
+
+    q->close();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (!returned.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+
+    EXPECT_TRUE(returned.load()) << "close() did not release a consumer parked in dequeue()";
+    EXPECT_FALSE(took.load()) << "an empty closed queue handed back an item";
+    consumer.join();
+    mem::SingleBlock<Q>::destroy(q);
+}
+
+/// The producer side of the same contract: parked on a full queue, released by close().
+TEST(LockBasedControls, CloseReleasesAParkedProducer) {
+    using Q = queue::Mutex<Item>;
+    Q* q = mem::SingleBlock<Q>::create(2);
+    std::vector<Data> store(8);
+    for (std::size_t i = 0; i < store.size(); ++i) store[i] = {i + 1};
+    while (q->try_enqueue(&store[0])) {}          // fill it
+
+    std::atomic<bool> returned{false};
+    std::atomic<bool> placed{true};
+    std::thread producer{[&] {
+        placed.store(q->enqueue(&store[1]));      // blocks: the queue is full and open
+        returned.store(true, std::memory_order_release);
+    }};
+
+    q->close();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (!returned.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+
+    EXPECT_TRUE(returned.load()) << "close() did not release a producer parked in enqueue()";
+    EXPECT_FALSE(placed.load()) << "a closed queue accepted an item";
+    producer.join();
+    mem::SingleBlock<Q>::destroy(q);
+}
+
+/// A closed queue still drains, and closing twice is a no-op. Both matter to the termination
+/// story: the owner closes once production ends and then collects what is left.
+TEST(LockBasedControls, AClosedQueueStillDrainsAndCloseIsIdempotent) {
+    using Q = queue::Mutex<Item>;
+    Q* q = mem::SingleBlock<Q>::create(4);
+    std::vector<Data> store(4);
+    for (std::size_t i = 0; i < store.size(); ++i) store[i] = {i + 1};
+    for (auto& d : store) ASSERT_TRUE(q->try_enqueue(&d));
+
+    q->close();
+    EXPECT_TRUE(q->is_closed());
+    q->close();                                    // idempotent
+    EXPECT_TRUE(q->is_closed());
+
+    // dequeue() past a close behaves as try_dequeue(): it hands back what is there, then false.
+    for (std::size_t i = 0; i < store.size(); ++i) {
+        Item out = nullptr;
+        ASSERT_TRUE(q->dequeue(out)) << "a closed queue dropped item " << i;
+        EXPECT_EQ(out->seq, i + 1) << "FIFO order broken across the close";
+    }
+    Item out = nullptr;
+    EXPECT_FALSE(q->dequeue(out)) << "a drained closed queue reported an item";
+    EXPECT_FALSE(q->enqueue(&store[0])) << "a closed queue accepted an item";
+    mem::SingleBlock<Q>::destroy(q);
+}
+
+/// Spin is the other lock-based control: same ring, same critical sections, a spinlock instead
+/// of a mutex, and no waiting on the queue's state at all. That last part is what makes the
+/// pair a measurement of lock acquisition rather than of blocking policy.
+TEST(LockBasedControls, SpinRoundTripsAndIsTunable) {
+    using Q = queue::Spin<Item>;
+    static_assert(Q::spins_before_park == 64);
+    using Futex = queue::Spin<Item, meta::OptionsPack<algo::SpinOpt::spins_before_park<0>>>;
+    static_assert(Futex::spins_before_park == 0, "zero should park immediately");
+
+    Q* q = mem::SingleBlock<Q>::create(4);
+    std::vector<Data> store(4);
+    for (std::size_t i = 0; i < store.size(); ++i) store[i] = {i + 1};
+    for (auto& d : store) ASSERT_TRUE(q->try_enqueue(&d));
+    EXPECT_FALSE(q->try_enqueue(&store[0])) << "accepted past capacity";
+    for (std::size_t i = 0; i < store.size(); ++i) {
+        Item out = nullptr;
+        ASSERT_TRUE(q->try_dequeue(out));
+        EXPECT_EQ(out->seq, i + 1) << "FIFO order broken under the spinlock";
+    }
+    Item drained = nullptr;
+    EXPECT_FALSE(q->try_dequeue(drained)) << "reported an item when empty";
+    mem::SingleBlock<Q>::destroy(q);
+}
+
+TEST(OptionDefaults, TheTwoOrderBasedAlgorithmsAlwaysRound) {
+    static_assert(seg::SCQ<Item>::capacity_for(100) == 128);
+    static_assert(seg::SCQ<Item>::capacity_for(1000) == 1024);
+    SUCCEED();
+}
+
 TEST(OptionDefaults, TunedWriteOnceSegmentsStillWork) {
     using FAAd = seg::FAAArray<Item>;
     using FAAt = algo::FAAArray<Item, meta::OptionsPack<algo::FAAArrayOpt::patience<8>>,
@@ -194,8 +461,8 @@ TEST(OptionDefaults, TunedWriteOnceSegmentsStillWork) {
     EXPECT_TRUE(f->enqueue(&d));
     EXPECT_TRUE(h->enqueue(&d));
     Item out = nullptr;
-    EXPECT_TRUE(f->dequeue(out));
-    EXPECT_TRUE(h->dequeue(out));
+    EXPECT_TRUE(f->try_dequeue(out));
+    EXPECT_TRUE(h->try_dequeue(out));
     mem::SingleBlock<FAAt>::destroy(f);
     mem::SingleBlock<HQt>::destroy(h);
 }
@@ -246,12 +513,12 @@ TEST(OptionDefaults, ATunedProxyStillWorks) {
     std::size_t placed = 0;
     for (std::size_t i = 0; i < store.size(); ++i) {
         store[i] = {i + 1};
-        if (q.enqueue(&store[i])) ++placed;
+        if (q.try_enqueue(&store[i])) ++placed;
     }
     ASSERT_GT(placed, 0u);
     Item out = nullptr;
     std::size_t taken = 0;
-    while (q.dequeue(out)) ++taken;
+    while (q.try_dequeue(out)) ++taken;
     EXPECT_EQ(taken, placed);
 }
 
@@ -296,7 +563,7 @@ TEST(SegmentStats, LinksAndRetiresBalanceOverAFillAndDrain) {
     std::size_t placed = 0;
     for (std::size_t i = 0; i < store.size(); ++i) {
         store[i] = {i + 1};
-        if (q.enqueue(&store[i])) ++placed;
+        if (q.try_enqueue(&store[i])) ++placed;
     }
     ASSERT_EQ(placed, store.size()) << "the pool should hold this comfortably";
 
@@ -308,7 +575,7 @@ TEST(SegmentStats, LinksAndRetiresBalanceOverAFillAndDrain) {
 
     Item out = nullptr;
     std::size_t taken = 0;
-    while (q.dequeue(out)) ++taken;
+    while (q.try_dequeue(out)) ++taken;
     EXPECT_EQ(taken, placed);
 
     // A segment is retired only once a successor exists, so the last one stays in service.
@@ -345,15 +612,15 @@ TEST(SegmentStats, ReuseFactorExceedsThePoolAcrossManyCycles) {
             // A real caller loops on enqueue and never notices; this spells it out.
             bool ok = false;
             for (int attempt = 0; attempt < 8 && !ok; ++attempt) {
-                ok = q.enqueue(&d);
+                ok = q.try_enqueue(&d);
                 if (!ok)
-                    while (q.dequeue(out)) ++dequeued;
+                    while (q.try_dequeue(out)) ++dequeued;
             }
             ASSERT_TRUE(ok) << "still refusing after eight attempts on a drained pool, cycle "
                             << cycle;
             ++enqueued;
         }
-        while (q.dequeue(out)) ++dequeued;
+        while (q.try_dequeue(out)) ++dequeued;
     }
     EXPECT_EQ(enqueued, dequeued) << "items lost across the recycling cycles";
 

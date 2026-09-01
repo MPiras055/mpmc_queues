@@ -17,7 +17,11 @@
 #include <algo/HQ.hpp>
 #include <algo/Mutex.hpp>
 #include <algo/PRQ.hpp>
+#include <algo/PSCQ.hpp>
 #include <algo/SCQ.hpp>
+#include <algo/Spin.hpp>
+#include <algo/VyukovDCAS.hpp>
+#include <algo/VyukovNoABA.hpp>
 #include <algo/Vyukov.hpp>
 #include <core/Segment.hpp>
 #include <core/SegmentTraits.hpp>
@@ -50,14 +54,18 @@ protected:
     static std::size_t drain(S* s) {
         Item out = nullptr;
         std::size_t n = 0;
-        while (s->dequeue(out)) ++n;
+        while (s->try_dequeue(out)) ++n;
         return n;
     }
 };
 
+/// Every segment in the tree. The last four were standalone comparators until they grew the
+/// linkage surface -- which is exactly why they belong here: the close/reopen/link_next contract
+/// is the part of being a segment that a standalone benchmark never exercises.
 using SegmentTypes = ::testing::Types<
     seg::Vyukov<Item>, seg::PRQ<Item>, seg::FAAArray<Item>, seg::HQ<Item>, seg::SCQ<Item>,
-    seg::Mutex<Item>>;
+    seg::Mutex<Item>, seg::Spin<Item>, seg::PSCQ<Item>, seg::VyukovDCAS<Item>,
+    seg::VyukovNoABA<Item>>;
 TYPED_TEST_SUITE(SegmentLifecycle, SegmentTypes);
 
 TYPED_TEST(SegmentLifecycle, StartsOpenWithNoSuccessor) {
@@ -172,6 +180,40 @@ TYPED_TEST(SegmentLifecycle, ReopenedSegmentIsEmptyAndReusable) {
         }
         this->drop(s);
     }
+}
+
+/**
+ * @brief A closed segment refuses every enqueue, even one that is already under way.
+ *
+ * This is the invariant `LinkedProxy::dequeue` leans on when it unlinks and retires a segment:
+ * it does so on nothing more than "dequeue said empty twice and a successor exists". If a
+ * producer can still commit after that, the item lands somewhere nothing traverses and is lost
+ * while counted as enqueued.
+ *
+ * The single-threaded half is checked here. It is deliberately weak -- an *advisory* close, a
+ * flag a producer merely reads, passes this too, which is exactly the bug that shipped in PSCQ
+ * and VyukovNoABA. What makes the close enforcing is that the marker lives in the tail counter,
+ * so it invalidates tickets already in flight; that half only shows up under contention and is
+ * covered by ConcurrencyTest and by the proxy race harness in the notes.
+ */
+TYPED_TEST(SegmentLifecycle, AClosedSegmentRefusesEveryEnqueue) {
+    auto* s = this->make();
+    s->close();
+    ASSERT_TRUE(s->is_closed());
+
+    Data d{1};
+    for (int i = 0; i < 8; ++i)
+        EXPECT_FALSE(s->enqueue(&d)) << "attempt " << i << " got into a closed segment";
+
+    // Draining does not reopen it: the refusal is permanent until reopen() says otherwise.
+    Item out = nullptr;
+    while (s->try_dequeue(out)) {}
+    EXPECT_FALSE(s->enqueue(&d)) << "a drained segment started accepting again while closed";
+
+    EXPECT_TRUE(s->reopen());
+    EXPECT_FALSE(s->is_closed()) << "reopen() left the closed marker set";
+    EXPECT_TRUE(s->enqueue(&d)) << "reopen() did not restore the segment to service";
+    this->drop(s);
 }
 
 TYPED_TEST(SegmentLifecycle, ReopenClearsTheSuccessor) {

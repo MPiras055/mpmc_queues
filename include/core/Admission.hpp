@@ -37,12 +37,17 @@ enum class AdmitPoint {
  * BoundedChunkProxy was this predicate; everything else in those three files was the
  * same Michael-Scott traversal written out three times.
  *
- * @note A policy configures *itself*. The proxy hands over the two numbers it knows —
- *       segment capacity and a chunk count — and the policy decides what they mean to
- *       it. Previously the proxy did that arithmetic, so it had to know that ItemCount
- *       wanted `segment_capacity * chunks` while SegmentCount wanted the divisor, and
- *       `capacity()` branched on whether the policy was bounded at all. That is the
- *       policy's business, not the traversal's.
+ * @note A policy configures *itself*. The proxy hands over the one number it knows at that
+ *       point — the rounded segment capacity — and the policy decides what it means, taking the
+ *       segment count from its own template parameter. Previously the proxy did that arithmetic,
+ *       so it had to know that ItemCount wanted `segment_capacity * chunks` while SegmentCount
+ *       wanted the divisor, and `capacity()` branched on whether the policy was bounded at all.
+ *       That is the policy's business, not the traversal's.
+ *
+ * @note The segment count is a template parameter rather than a constructor argument so that it
+ *       is spelled the same way as a pooled source's size. When it was a defaulted runtime
+ *       argument nothing ever passed it, so a chunk-bounded queue and a pooled one built from
+ *       the same constant silently disagreed about how many segments they had.
  *
  * @note Config is passed by value rather than the policy being returned from a factory:
  *       these hold atomics, so they are not movable and must be constructed in place.
@@ -51,8 +56,9 @@ template <typename A>
 concept AdmissionPolicy = requires(A a, const A ca, std::size_t n) {
     typename A::Config;
 
-    /// Derive this policy's configuration from what the proxy knows.
-    { A::config(n, n) } -> std::same_as<typename A::Config>;
+    /// Derive this policy's configuration from the rounded segment capacity. How many segments
+    /// there will be is the policy's own template parameter, so it is not passed here.
+    { A::config(n) } -> std::same_as<typename A::Config>;
     requires std::constructible_from<A, typename A::Config>;
 
     { A::bounded } -> std::convertible_to<bool>; ///< does this policy impose any ceiling?
@@ -62,17 +68,19 @@ concept AdmissionPolicy = requires(A a, const A ca, std::size_t n) {
     { A::admit_point } -> std::convertible_to<AdmitPoint>;
 
     /**
-     * How many segments this policy allows to be live at once, given the chunk count.
+     * How many segments this policy allows to be live at once.
      *
      * **0 means "this policy does not bound the segment count"**, which is the answer for a
      * policy that counts items or nothing at all. LinkedProxy uses it as the divisor when
      * splitting a total capacity across the segments that will exist, taking the smaller
      * non-zero of this and the source's own limit.
      */
-    { A::live_segments(n) } noexcept -> std::same_as<std::size_t>;
+    { A::live_segments() } noexcept -> std::same_as<std::size_t>;
 
-    /// The item ceiling, given the segment capacity. Lets the proxy report a capacity
-    /// without knowing whether the bound counts items, segments, or nothing at all.
+    /// The item ceiling, given the segment capacity, or **0 for "no opinion"** -- which is the
+    /// answer from a policy that imposes no bound, and tells the proxy to fall back on how many
+    /// segments the structure allows. Lets capacity() be reported without the traversal knowing
+    /// whether the bound counts items, segments, or nothing at all.
     { ca.capacity(n) } noexcept -> std::same_as<std::size_t>;
 
     /// The bound in the policy's own unit (items, segments, ...). For diagnostics.

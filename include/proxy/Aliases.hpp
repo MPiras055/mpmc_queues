@@ -41,16 +41,24 @@ template <typename T, typename Seg, typename SrcOpt = meta::EmptyOptions,
           typename ProxyOpt = meta::EmptyOptions>
 using Unbounded = LinkedProxy<T, Seg, admit::None, HazardSource<Seg, SrcOpt>, ProxyOpt>;
 
-/// Bounded by live item count. Was BoundedCounterProxy.
-template <typename T, typename Seg, typename SrcOpt = meta::EmptyOptions,
+/**
+ * @brief Bounded by live item count. Was BoundedCounterProxy.
+ * @tparam N segments to spread the capacity across -- same position and meaning as MemBounded's.
+ */
+template <typename T, typename Seg, std::size_t N = 4, typename SrcOpt = meta::EmptyOptions,
           typename ProxyOpt = meta::EmptyOptions>
-using ItemBounded = LinkedProxy<T, Seg, admit::ItemCount, HazardSource<Seg, SrcOpt>, ProxyOpt>;
+using ItemBounded = LinkedProxy<T, Seg, admit::ItemCount<N>, HazardSource<Seg, SrcOpt>, ProxyOpt>;
 
-/// Bounded by live segment count. Was BoundedChunkProxy.
-template <typename T, typename Seg, typename SrcOpt = meta::EmptyOptions,
+/**
+ * @brief Bounded by live segment count. Was BoundedChunkProxy.
+ * @tparam N the segment ceiling. Deliberately spelled like MemBounded's pool size, so the two
+ *         can be compared at the same geometry without the caller having to remember to keep a
+ *         template argument and a constructor argument in step.
+ */
+template <typename T, typename Seg, std::size_t N = 4, typename SrcOpt = meta::EmptyOptions,
           typename ProxyOpt = meta::EmptyOptions>
 using ChunkBounded =
-    LinkedProxy<T, Seg, admit::SegmentCount, HazardSource<Seg, SrcOpt>, ProxyOpt>;
+    LinkedProxy<T, Seg, admit::SegmentCount<N>, HazardSource<Seg, SrcOpt>, ProxyOpt>;
 
 /**
  * @brief Bounded by a fixed pool of recycled segments. Was BoundedMemProxy.

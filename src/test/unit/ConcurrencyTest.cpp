@@ -93,7 +93,7 @@ Outcome run_shape(uint64_t total, size_t producers, size_t consumers, size_t cap
                 items[i] = {++mine, p};
                 uint64_t spins = 0;
                 uint64_t progress_mark = produced.load(std::memory_order_relaxed);
-                while (!q.enqueue(&items[i])) {
+                while (!q.try_enqueue(&items[i])) {
                     if (++spins % kProgressWindow == 0) {
                         const uint64_t now = produced.load(std::memory_order_relaxed);
                         if (now == progress_mark) { // nobody advanced: a real livelock
@@ -122,9 +122,9 @@ Outcome run_shape(uint64_t total, size_t producers, size_t consumers, size_t cap
             };
             while (!producers_done.load(std::memory_order_relaxed) &&
                    !stalled.load(std::memory_order_relaxed))
-                if (q.dequeue(out)) take();
+                if (q.try_dequeue(out)) take();
             // Producers are finished: whatever remains must still come out.
-            while (q.dequeue(out)) take();
+            while (q.try_dequeue(out)) take();
         });
     }
 
@@ -219,7 +219,7 @@ TEST(HQSlowPath, DoesNotBurnCapacityWithNothingQueuedBehind) {
         // when the producer fetch-adds, which is the window the burn happens in.
         std::thread producer{[&] {
             for (std::size_t i = 0; i < kCapacity; ++i) {
-                if (!s->enqueue(&store[i])) break; // refused: capacity was destroyed
+                if (!s->try_enqueue(&store[i])) break; // refused: capacity was destroyed
                 placed.fetch_add(1, std::memory_order_relaxed);
                 for (int k = 0; k < 200; ++k) SPIN_HINT();
             }
@@ -230,8 +230,8 @@ TEST(HQSlowPath, DoesNotBurnCapacityWithNothingQueuedBehind) {
         std::thread consumer{[&] {
             Item out = nullptr;
             while (!done.load(std::memory_order_acquire))
-                if (s->dequeue(out)) ++taken;
-            while (s->dequeue(out)) ++taken;
+                if (s->try_dequeue(out)) ++taken;
+            while (s->try_dequeue(out)) ++taken;
         }};
 
         producer.join();

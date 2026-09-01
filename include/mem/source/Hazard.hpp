@@ -102,6 +102,9 @@ public:
     /// 0: this source allocates on demand, so nothing bounds how many segments are live.
     static constexpr std::size_t live_segments() noexcept { return 0; }
 
+    /// @copydoc core::SegmentSource::segment_capacity
+    std::size_t segment_capacity() const noexcept { return seg_capacity_; }
+
     /**
      * @brief: RAII Guard Protection Scope
      */

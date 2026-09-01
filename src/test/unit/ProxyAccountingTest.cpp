@@ -54,7 +54,7 @@ TEST(ProxyAccounting, ItemsSurviveTheThreadThatEnqueuedThem) {
     for (std::size_t i = 0; i < store.size(); ++i) store[i] = {i + 1};
 
     in_a_worker(q, [&] {
-        for (auto& d : store) ASSERT_TRUE(q.enqueue(&d));
+        for (auto& d : store) ASSERT_TRUE(q.try_enqueue(&d));
     });
 
     // The producer is gone; its items are not. A size() that folds only over attached
@@ -69,7 +69,7 @@ TEST(ProxyAccounting, ADetachedProducerAndAttachedConsumerAgree) {
     for (std::size_t i = 0; i < store.size(); ++i) store[i] = {i + 1};
 
     in_a_worker(q, [&] {
-        for (auto& d : store) ASSERT_TRUE(q.enqueue(&d));
+        for (auto& d : store) ASSERT_TRUE(q.try_enqueue(&d));
     });
     ASSERT_EQ(q.size(), store.size());
 
@@ -77,7 +77,7 @@ TEST(ProxyAccounting, ADetachedProducerAndAttachedConsumerAgree) {
     constexpr std::size_t kTaken = 10;
     in_a_worker(q, [&] {
         Item out = nullptr;
-        for (std::size_t i = 0; i < kTaken; ++i) ASSERT_TRUE(q.dequeue(out));
+        for (std::size_t i = 0; i < kTaken; ++i) ASSERT_TRUE(q.try_dequeue(out));
     });
 
     EXPECT_EQ(q.size(), store.size() - kTaken)
@@ -95,7 +95,7 @@ TEST(ProxyAccounting, CountsDoNotAccumulateAcrossManyShortLivedThreads) {
     std::size_t pushed = 0;
     for (int round = 0; round < 6; ++round) {
         in_a_worker(q, [&] {
-            for (int k = 0; k < 10; ++k) ASSERT_TRUE(q.enqueue(&store[pushed + k]));
+            for (int k = 0; k < 10; ++k) ASSERT_TRUE(q.try_enqueue(&store[pushed + k]));
         });
         pushed += 10;
         ASSERT_EQ(q.size(), pushed) << "after round " << round;
@@ -105,7 +105,7 @@ TEST(ProxyAccounting, CountsDoNotAccumulateAcrossManyShortLivedThreads) {
     for (int round = 0; round < 6; ++round) {
         in_a_worker(q, [&] {
             Item out = nullptr;
-            for (int k = 0; k < 10; ++k) ASSERT_TRUE(q.dequeue(out));
+            for (int k = 0; k < 10; ++k) ASSERT_TRUE(q.try_dequeue(out));
         });
         pushed -= 10;
         ASSERT_EQ(q.size(), pushed) << "after drain round " << round;
@@ -118,8 +118,8 @@ TEST(ProxyAccounting, AnInheritedNodeDoesNotCarryTheLastOwnersCloseHint) {
     // producer that finds the tail full records it in `last_seen`, and the next enqueue on
     // that same tail is told to skip the segment's own loop. If that field survives into the
     // next thread to inherit the node, it will skip a segment it has never seen closed.
-    using Bounded = proxy::ChunkBounded<Item, Seg>;
-    Bounded q{/*segment_capacity=*/2, /*chunks=*/8};
+    using Bounded = proxy::ChunkBounded<Item, Seg, /*segments=*/8>;
+    Bounded q{/*total capacity=*/16};   // split 8 ways -> 2 slots per segment
 
     // Eight items over 2-slot segments crosses four segment boundaries, so the first worker
     // certainly records a full tail -- while staying well inside the 8-segment bound, so the
@@ -133,7 +133,7 @@ TEST(ProxyAccounting, AnInheritedNodeDoesNotCarryTheLastOwnersCloseHint) {
             auto joined = q.join();
             ASSERT_TRUE(joined);
             for (auto& d : store)
-                if (q.enqueue(&d)) ++placed;
+                if (q.try_enqueue(&d)) ++placed;
         }};
         t.join();
     }
@@ -147,7 +147,7 @@ TEST(ProxyAccounting, AnInheritedNodeDoesNotCarryTheLastOwnersCloseHint) {
         std::thread t{[&] {
             auto joined = q.join();
             ASSERT_TRUE(joined);
-            second_ok = q.enqueue(&more[0]);
+            second_ok = q.try_enqueue(&more[0]);
         }};
         t.join();
     }

@@ -32,16 +32,31 @@ constexpr std::size_t kChunks = 4;
 // ---------------------------------------------------------------------------
 
 TEST(AdmitNone, AdmitsEverythingAndCostsNothing) {
-    proxy::admit::None a{proxy::admit::None::config(0, 0)};
+    proxy::admit::None a{proxy::admit::None::config(0)};
     EXPECT_TRUE(a.try_admit());
     EXPECT_EQ(a.bound(), 0u);
     EXPECT_FALSE(proxy::admit::None::bounded);
     // Empty, so [[no_unique_address]] can erase it from the proxy entirely.
     EXPECT_TRUE(std::is_empty_v<proxy::admit::None>);
+
+    // 0 means "no opinion", not "holds nothing": this policy imposes no ceiling, so the real
+    // one is structural and LinkedProxy::capacity() falls back on the segment count. Answering
+    // with one segment's worth, as this used to, was wrong for a pooled source.
+    EXPECT_EQ(a.capacity(64), 0u);
+}
+
+/// The emptiness above has to be worth something, and this is where it shows: with the same
+/// segment and the same source, the only difference between these two proxies is the policy
+/// member. It is the property that keeps a pooled or unbounded queue from paying for a hook it
+/// never calls -- and the reason the per-segment capacity lives in the source rather than here.
+TEST(AdmitNone, CostsTheProxyNothingComparedToACountingPolicy) {
+    using S = seg::Vyukov<Item>;
+    EXPECT_LT(sizeof(proxy::Unbounded<Item, S>), sizeof(proxy::ItemBounded<Item, S, kChunks>))
+        << "admit::None is no longer being elided by [[no_unique_address]]";
 }
 
 TEST(AdmitItemCount, StopsAdmittingAtTheBound) {
-    proxy::admit::ItemCount a{proxy::admit::ItemCount::Config{4}};
+    proxy::admit::ItemCount<> a{proxy::admit::ItemCount<>::Config{4}};
     EXPECT_EQ(a.bound(), 4u);
     for (int i = 0; i < 4; ++i) {
         ASSERT_TRUE(a.try_admit()) << "refused at occupancy " << i;
@@ -53,7 +68,8 @@ TEST(AdmitItemCount, StopsAdmittingAtTheBound) {
 }
 
 TEST(AdmitSegmentCount, CountsSegmentsNotItems) {
-    proxy::admit::SegmentCount a{proxy::admit::SegmentCount::config(kSegment, kChunks)};
+    using Policy = proxy::admit::SegmentCount<kChunks>;
+    Policy a{Policy::config(kSegment)};
     EXPECT_EQ(a.bound(), kChunks);
     // Item traffic must not move a segment-based bound.
     for (int i = 0; i < 1000; ++i) a.on_enqueue();
@@ -68,19 +84,31 @@ TEST(AdmitSegmentCount, CountsSegmentsNotItems) {
 // The bounds as observed through a proxy
 // ---------------------------------------------------------------------------
 
+/**
+ * @brief Run @p f once per segment count, each as a compile-time argument.
+ *
+ * The counts moved from a constructor argument into the type, so a runtime `for` over them is
+ * no longer possible -- which is the whole point of the change: a chunk count and a pool size
+ * are now spelled the same way and cannot drift apart.
+ */
+template <std::size_t... Counts, typename F>
+void for_each_count(F f) {
+    (f.template operator()<Counts>(), ...);
+}
+
 /// Peak occupancy reached while producers push and nobody consumes.
 template <typename Q>
 std::size_t fill_to_refusal(Q& q, std::vector<Data>& store) {
     std::size_t placed = 0;
     for (auto& d : store)
-        if (q.enqueue(&d)) ++placed;
+        if (q.try_enqueue(&d)) ++placed;
         else break;
     return placed;
 }
 
 TEST(BoundedProxies, ItemBoundedNeverExceedsItsCapacity) {
-    using Q = proxy::ItemBounded<Item, seg::Vyukov<Item>>;
-    Q q{kSegment, kChunks};
+    using Q = proxy::ItemBounded<Item, seg::Vyukov<Item>, kChunks>;
+    Q q{kSegment};
     auto joined = q.join();
     ASSERT_TRUE(joined);
 
@@ -102,9 +130,9 @@ TEST(BoundedProxies, UnboundedKeepsGoingWellPastOneSegment) {
 }
 
 TEST(BoundedProxies, ItemBoundIsRespectedConcurrently) {
-    using Q = proxy::ItemBounded<Item, seg::PRQ<Item>>;
+    using Q = proxy::ItemBounded<Item, seg::PRQ<Item>, kChunks>;
     constexpr std::size_t kProducers = 4;
-    Q q{kSegment, kChunks};
+    Q q{kSegment};
 
     std::vector<Data> store(20000);
     std::atomic<int64_t> live{0};
@@ -122,7 +150,7 @@ TEST(BoundedProxies, ItemBoundIsRespectedConcurrently) {
             for (;;) {
                 const std::size_t i = next.fetch_add(1);
                 if (i >= store.size()) break;
-                if (!q.enqueue(&store[i])) continue;
+                if (!q.try_enqueue(&store[i])) continue;
                 const int64_t now = live.fetch_add(1) + 1;
                 int64_t seen = peak.load();
                 while (now > seen && !peak.compare_exchange_weak(seen, now)) {}
@@ -135,8 +163,8 @@ TEST(BoundedProxies, ItemBoundIsRespectedConcurrently) {
 }
 
 TEST(BoundedProxies, ChunkBoundedRefusesRatherThanGrowingForever) {
-    using Q = proxy::ChunkBounded<Item, seg::Vyukov<Item>>;
-    Q q{kSegment, kChunks};
+    using Q = proxy::ChunkBounded<Item, seg::Vyukov<Item>, kChunks>;
+    Q q{kSegment};
     auto joined = q.join();
     ASSERT_TRUE(joined);
 
@@ -160,34 +188,32 @@ TEST(BoundedProxies, ChunkBoundedRefusesRatherThanGrowingForever) {
  * `chunks == 1` is therefore the case that matters most and is checked explicitly.
  */
 TEST(BoundedProxies, ChunkBoundedReachesItsStatedCapacity) {
-    using Q = proxy::ChunkBounded<Item, seg::Vyukov<Item>>;
-
-    for (std::size_t chunks : {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
-        Q q{kSegment, chunks};
+    for_each_count<1, 2, 4, 8>([]<std::size_t Chunks>() {
+        using Q = proxy::ChunkBounded<Item, seg::Vyukov<Item>, Chunks>;
+        Q q{kSegment};
         auto joined = q.join();
         ASSERT_TRUE(joined);
 
-        std::vector<Data> store(kSegment * chunks * 4);
+        std::vector<Data> store(kSegment * Chunks * 4);
         const std::size_t placed = fill_to_refusal(q, store);
 
         EXPECT_EQ(placed, q.capacity())
-            << "chunks=" << chunks << ": advertised " << q.capacity() << " but held " << placed;
-    }
+            << "chunks=" << Chunks << ": advertised " << q.capacity() << " but held " << placed;
+    });
 }
 
 /// The same property for the item-counting policy, which has always had it -- present so a
 /// change to one policy that breaks the other is caught here rather than in a benchmark.
 TEST(BoundedProxies, ItemBoundedReachesItsStatedCapacity) {
-    using Q = proxy::ItemBounded<Item, seg::Vyukov<Item>>;
-
-    for (std::size_t chunks : {std::size_t{1}, std::size_t{2}, std::size_t{4}}) {
-        Q q{kSegment, chunks};
+    for_each_count<1, 2, 4>([]<std::size_t Chunks>() {
+        using Q = proxy::ItemBounded<Item, seg::Vyukov<Item>, Chunks>;
+        Q q{kSegment};
         auto joined = q.join();
         ASSERT_TRUE(joined);
 
-        std::vector<Data> store(kSegment * chunks * 4);
-        EXPECT_EQ(fill_to_refusal(q, store), q.capacity()) << "chunks=" << chunks;
-    }
+        std::vector<Data> store(kSegment * Chunks * 4);
+        EXPECT_EQ(fill_to_refusal(q, store), q.capacity()) << "chunks=" << Chunks;
+    });
 }
 
 /**
@@ -203,22 +229,22 @@ TEST(BoundedProxies, ItemBoundedReachesItsStatedCapacity) {
  * the achievable total is frequently larger than the request.
  */
 TEST(BoundedProxies, CapacityIsSplitAcrossSegments) {
-    using Counted = proxy::ChunkBounded<Item, seg::Vyukov<Item>, meta::EmptyOptions,
-                                        meta::OptionsPack<proxy::ProxyOpt::segment_stats>>;
-    for (std::size_t chunks : {std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
-        Counted q{kSegment * chunks, chunks};      // ask for a total, not a segment size
+    for_each_count<2, 4, 8>([]<std::size_t Chunks>() {
+        using Counted = proxy::ChunkBounded<Item, seg::Vyukov<Item>, Chunks, meta::EmptyOptions,
+                                            meta::OptionsPack<proxy::ProxyOpt::segment_stats>>;
+        Counted q{kSegment * Chunks};              // ask for a total, not a segment size
         auto joined = q.join();
         ASSERT_TRUE(joined);
 
-        std::vector<Data> store(kSegment * chunks * 4);
+        std::vector<Data> store(kSegment * Chunks * 4);
         const std::size_t placed = fill_to_refusal(q, store);
 
-        EXPECT_EQ(placed, q.capacity()) << "chunks=" << chunks;
+        EXPECT_EQ(placed, q.capacity()) << "chunks=" << Chunks;
         // Sentinel plus one per link: the whole point is that the total was spread out.
-        EXPECT_EQ(q.segments_linked(), chunks)
-            << "chunks=" << chunks << ": capacity was not split -- linked "
+        EXPECT_EQ(q.segments_linked(), Chunks)
+            << "chunks=" << Chunks << ": capacity was not split -- linked "
             << q.segments_linked() << " segments";
-    }
+    });
 }
 
 /// The same for a pooled source, where the divisor comes from the pool rather than the policy.
@@ -239,9 +265,56 @@ TEST(BoundedProxies, PooledCapacityIsSplitAcrossThePool) {
     EXPECT_EQ(fill_to_refusal(q, store), q.capacity());
 }
 
+/**
+ * @brief A chunk-bounded queue and a pooled one, given the same segment count, must be the
+ *        same shape.
+ *
+ * This is the guard for the change that made the count a template parameter. It used to be the
+ * second constructor argument of LinkedProxy, defaulted to 4 and passed by nobody -- so every
+ * `chunk-*` registry entry ran with 4 segments while every `mem-*` entry ran with `kPoolSize`,
+ * and a benchmark comparing the two families was comparing different geometries without saying
+ * so. Now both take it as a template argument, and this asserts they land in the same place.
+ *
+ * Deliberately checks the *observable* consequences rather than the constant: same advertised
+ * capacity, same number of segments actually linked to reach it, same items admitted.
+ */
+TEST(BoundedProxies, ChunkAndPoolAgreeAtTheSameSegmentCount) {
+    for_each_count<2, 4, 8>([]<std::size_t Segments>() {
+        using Stats = meta::OptionsPack<proxy::ProxyOpt::segment_stats>;
+        using PooledSeg = seg::Vyukov<Item, meta::EmptyOptions, mem::IndexHandle<Segments>>;
+        using Chunked =
+            proxy::ChunkBounded<Item, seg::Vyukov<Item>, Segments, meta::EmptyOptions, Stats>;
+        using Pooled = proxy::MemBounded<Item, PooledSeg, Segments, meta::EmptyOptions, Stats>;
+
+        static_assert(Chunked::live_segments == Pooled::live_segments,
+                      "the two families disagree about how many segments they may have live");
+
+        constexpr std::size_t total = kSegment * Segments;
+        Chunked chunked{total};
+        Pooled pooled{total};
+        auto jc = chunked.join();
+        auto jp = pooled.join();
+        ASSERT_TRUE(jc);
+        ASSERT_TRUE(jp);
+
+        EXPECT_EQ(chunked.capacity(), pooled.capacity())
+            << "segments=" << Segments << ": chunk-bounded advertises " << chunked.capacity()
+            << " but pooled advertises " << pooled.capacity();
+
+        std::vector<Data> store(total * 4);
+        const std::size_t in_chunked = fill_to_refusal(chunked, store);
+        const std::size_t in_pooled = fill_to_refusal(pooled, store);
+
+        EXPECT_EQ(in_chunked, in_pooled) << "segments=" << Segments << ": same stated capacity, "
+                                         << "different number of items actually admitted";
+        EXPECT_EQ(chunked.segments_linked(), pooled.segments_linked())
+            << "segments=" << Segments << ": the capacity was split differently";
+    });
+}
+
 TEST(BoundedProxies, RefusalIsRecoverableAfterDraining) {
-    using Q = proxy::ItemBounded<Item, seg::Vyukov<Item>>;
-    Q q{kSegment, kChunks};
+    using Q = proxy::ItemBounded<Item, seg::Vyukov<Item>, kChunks>;
+    Q q{kSegment};
     auto joined = q.join();
     ASSERT_TRUE(joined);
 
@@ -251,11 +324,11 @@ TEST(BoundedProxies, RefusalIsRecoverableAfterDraining) {
 
     Item out = nullptr;
     std::size_t drained = 0;
-    while (q.dequeue(out)) ++drained;
+    while (q.try_dequeue(out)) ++drained;
     EXPECT_EQ(drained, placed);
 
     // Having drained, the proxy must admit again -- a bound that latches is a deadlock.
-    EXPECT_TRUE(q.enqueue(&store[0]));
+    EXPECT_TRUE(q.try_enqueue(&store[0]));
 }
 
 } // namespace

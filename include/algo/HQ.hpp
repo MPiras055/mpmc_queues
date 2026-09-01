@@ -12,6 +12,7 @@
 #include <mem/SingleBlock.hpp>
 #include <meta/OptionsPack.hpp>
 #include <util/align.hpp>
+#include <util/bit.hpp>
 #include <util/specs.hpp>
 #include <atomic>
 #include <cassert>
@@ -19,6 +20,15 @@
 namespace algo {
 
 struct HQOpt {
+    /**
+     * @brief Take the capacity exactly as asked instead of rounding up to a power of two.
+     *
+     * Purely a *sizing* choice here, not an indexing one: this structure walks its cells
+     * linearly and closes when it runs out, so it never wraps and has no mask to speed up.
+     * Rounding is still the default so that a capacity request means the same thing across
+     * every algorithm and a cross-algorithm benchmark compares the same geometry.
+     */
+    struct no_pow2 {};
     struct force_cell_padding {};
 
     /**
@@ -87,6 +97,7 @@ struct HQOpt {
 template <typename T, typename Opt, typename Link,
           typename Tag = cell::LowTag<T>>
     requires meta::AcceptsOnly<Opt, typename HQOpt::force_cell_padding,
+                               typename HQOpt::no_pow2,
                                meta::ValueOption<HQOpt::patience>> &&
              linkage::Linked<Link> && cell::Tagging<Tag, T>
 class HQ : public mem::SingleBlock<HQ<T, Opt, Link, Tag>> {
@@ -95,10 +106,12 @@ class HQ : public mem::SingleBlock<HQ<T, Opt, Link, Tag>> {
     using word = typename Tag::word;
 
     static constexpr bool pad_cells = Opt::template has<typename HQOpt::force_cell_padding>;
+    /// Round the cell count up to a power of two; see HQOpt::no_pow2.
+    static constexpr bool pow2 = !Opt::template has<typename HQOpt::no_pow2>;
     /// Cast rather than trusted: `get` returns the option's own type when one is present, so
     /// `patience<8>` would otherwise arrive as `int`. See OptionsPack::get.
     static constexpr std::size_t kPatience =
-        static_cast<std::size_t>(Opt::template get<HQOpt::patience, std::size_t{2}>);
+        static_cast<std::size_t>(Opt::template get<HQOpt::patience, std::size_t{1024}>);
 
 public:
     /// Loads a consumer spends on a straggling producer; see HQOpt::patience.
@@ -117,21 +130,27 @@ public:
      * its total across the segments that will exist, and has to know what each one rounds to
      * before it can report a capacity the queue can genuinely reach.
      */
-    static constexpr std::size_t capacity_for(std::size_t n) noexcept { return n; }
+    static constexpr std::size_t round_size(std::size_t n) noexcept {
+        const std::size_t f = n < 2 ? 2 : n;
+        if constexpr (pow2) return bit::round_to_next_pow2(f);
+        else return f;
+    }
+
+    static constexpr std::size_t capacity_for(std::size_t n) noexcept { return round_size(n); }
 
     /// @brief Where the co-allocated regions go. See @ref block-construction.
     /// @param n requested capacity; the only thing the layout may depend on.
     static constexpr auto plan(std::size_t n) noexcept {
         mem::LayoutBuilder b{sizeof(Self), alignof(Self)};
         mem::Plan<1> p{};
-        p.regions[0] = b.add(n * sizeof(cell_type), alignof(cell_type));
+        p.regions[0] = b.add(round_size(n) * sizeof(cell_type), alignof(cell_type));
         p.total = b.total();
         p.block_align = b.block_align();
         return p;
     }
 
     HQ(std::size_t n, mem::Blocks blk) noexcept
-        : capacity_{n}, cells_{blk.template at<cell_type>(plan(n).regions[0])} {
+        : capacity_{round_size(n)}, cells_{blk.template at<cell_type>(plan(n).regions[0])} {
         assert(n != 0 && "HQ: capacity must be non-null");
         for (std::size_t i = 0; i < n; ++i)
             cells_[i].val.store(empty_w(), std::memory_order_relaxed);
@@ -167,6 +186,14 @@ public:
     FORCE_INLINE bool dequeue(T& out) noexcept {
         return has_successor() ? fast_dequeue(out) : slow_dequeue(out);
     }
+
+
+    /// @copydoc core::Queue::try_enqueue
+    /// Never blocks, so this is the same operation as enqueue().
+    bool try_enqueue(T item) noexcept { return enqueue(item); }
+    /// @copydoc core::Queue::try_dequeue
+    /// Never blocks, so this is the same operation as dequeue().
+    bool try_dequeue(T& out) noexcept { return dequeue(out); }
 
     /// @return Items currently held. Approximate under concurrency, exact when quiescent.
     std::size_t size() const noexcept {
@@ -312,10 +339,10 @@ private:
             // a few cycles behind time to land, because once the head has fetch-added past
             // this index the slot is gone either way. Without the hint two dependent loads
             // of an already-hot line retire in a handful of cycles and the wait is noise.
-            for (std::size_t i = 0; i < kPatience; ++i) {
-                if (!is_empty_w(c.val.load(std::memory_order_acquire))) break;
-                SPIN_HINT();
-            }
+            // for (std::size_t i = 0; i < kPatience; ++i) {
+            //     if (!is_empty_w(c.val.load(std::memory_order_acquire))) break;
+            //     SPIN_HINT();
+            // }
             const word w = c.val.exchange(consumed_w(), std::memory_order_acq_rel);
             if (Tag::is_payload(w)) {
                 out = Tag::decode(w);

@@ -173,6 +173,14 @@ public:
         return true;
     }
 
+
+    /// @copydoc core::Queue::try_enqueue
+    /// Never blocks, so this is the same operation as enqueue().
+    bool try_enqueue(T item) noexcept { return enqueue(item); }
+    /// @copydoc core::Queue::try_dequeue
+    /// Never blocks, so this is the same operation as dequeue().
+    bool try_dequeue(T& out) noexcept { return dequeue(out); }
+
     /// @return Items currently held. Approximate under concurrency, exact when quiescent.
     std::size_t size() const noexcept { return data_->size(); }
     /// @return Items this queue can hold.

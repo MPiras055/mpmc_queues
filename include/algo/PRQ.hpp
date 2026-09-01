@@ -20,7 +20,14 @@
 namespace algo {
 
 struct PRQOpt {
-    struct force_pow2 {};
+    /**
+     * @brief Take the capacity exactly as asked instead of rounding up to a power of two.
+     *
+     * Rounding is the default so that every algorithm answers a capacity request the same way
+     * and a cross-algorithm benchmark compares the same geometry. Opting out costs a division
+     * where the default path masks.
+     */
+    struct no_pow2 {};
     struct no_cell_padding {};
 
     /**
@@ -64,7 +71,7 @@ struct PRQOpt {
  */
 template <typename T, typename Opt, typename Link,
           typename Tag = cell::MsbTag<T>>
-    requires meta::AcceptsOnly<Opt, typename PRQOpt::force_pow2, typename PRQOpt::no_cell_padding,
+    requires meta::AcceptsOnly<Opt, typename PRQOpt::no_pow2, typename PRQOpt::no_cell_padding,
                                meta::ValueOption<PRQOpt::max_dequeue_retries>,
                                meta::ValueOption<PRQOpt::tail_reload_period>> &&
              linkage::Linked<Link> && cell::ClaimingTag<Tag, T>
@@ -74,7 +81,8 @@ class PRQ : public mem::SingleBlock<PRQ<T, Opt, Link, Tag>> {
     using word = typename Tag::word;
 
     static constexpr bool pad_cells = !Opt::template has<typename PRQOpt::no_cell_padding>;
-    static constexpr bool force_pow2 = Opt::template has<typename PRQOpt::force_pow2>;
+    /// Index mapping is a mask rather than a modulo; see PRQOpt::no_pow2.
+    static constexpr bool pow2 = !Opt::template has<typename PRQOpt::no_pow2>;
 
     static constexpr uint64_t kMaxRetryDeq = static_cast<uint64_t>(
         Opt::template get<PRQOpt::max_dequeue_retries, uint64_t{4 * 1024}>);
@@ -112,7 +120,7 @@ public:
      *       spins there for ever.
      */
     static constexpr std::size_t round_size(std::size_t n) noexcept {
-        if constexpr (force_pow2) return bit::round_to_next_pow2(n > 1 ? n : 2);
+        if constexpr (pow2) return bit::round_to_next_pow2(n > 1 ? n : 2);
         else return n > 1 ? n : 2;
     }
 
@@ -280,6 +288,14 @@ public:
         }
     }
 
+
+    /// @copydoc core::Queue::try_enqueue
+    /// Never blocks, so this is the same operation as enqueue().
+    bool try_enqueue(T item) noexcept { return enqueue(item); }
+    /// @copydoc core::Queue::try_dequeue
+    /// Never blocks, so this is the same operation as dequeue().
+    bool try_dequeue(T& out) noexcept { return dequeue(out); }
+
     /// @return Items currently held. Approximate under concurrency, exact when quiescent.
     std::size_t size() const noexcept {
         const uint64_t t = bit::clear_msb(tail_.load(std::memory_order_acquire));
@@ -334,7 +350,7 @@ private:
     static constexpr bool is_closed_ticket(uint64_t t) noexcept { return bit::get_msb(t) != 0; }
 
     FORCE_INLINE std::size_t mod(uint64_t i) const noexcept {
-        if constexpr (force_pow2) return bit::clear_msb(i) & (capacity_ - 1);
+        if constexpr (pow2) return bit::clear_msb(i) & (capacity_ - 1);
         else return bit::clear_msb(i) % capacity_;
     }
 

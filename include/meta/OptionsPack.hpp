@@ -80,8 +80,8 @@ inline constexpr bool is_one_of_v = (option_matches<T, Us>::value || ...);
          *
          * `has<>` answers false for anything it does not recognise, which means a
          * misspelled tag, or one belonging to a different algorithm, reads as "not
-         * requested" and quietly does nothing. `OptionsPack<VyukovOpt::force_pow2>` handed
-         * to PRQ is the concrete case: PRQ has its own `force_pow2` and would ignore
+         * requested" and quietly does nothing. `OptionsPack<VyukovOpt::no_pow2>` handed
+         * to PRQ is the concrete case: PRQ has its own `no_pow2` and would ignore
          * Vyukov's.
          *
          * An algorithm declares what it accepts and asserts this, so an unrecognised tag

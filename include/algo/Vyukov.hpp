@@ -20,8 +20,14 @@ namespace algo {
 
 /** @brief Compile-time configuration for Vyukov-style ring buffers. */
 struct VyukovOpt {
-    /** Round capacity up to a power of two so index mapping is a mask, not a modulo. */
-    struct force_pow2 {};
+    /**
+     * @brief Take the capacity exactly as asked instead of rounding up to a power of two.
+     *
+     * Rounding is the default so that every algorithm answers a capacity request the same way
+     * and a cross-algorithm benchmark compares the same geometry. Opting out costs a division
+     * where the default path masks.
+     */
+    struct no_pow2 {};
     /** Pack cells instead of padding each to a cache line. */
     struct no_cell_padding {};
 };
@@ -41,13 +47,14 @@ struct VyukovOpt {
  * @tparam Link linkage::None or linkage::Node<HandlePolicy>
  */
 template <typename T, typename Opt = meta::EmptyOptions, typename Link = linkage::None>
-    requires meta::AcceptsOnly<Opt, typename VyukovOpt::force_pow2, typename VyukovOpt::no_cell_padding>
+    requires meta::AcceptsOnly<Opt, typename VyukovOpt::no_pow2, typename VyukovOpt::no_cell_padding>
 class Vyukov : public mem::SingleBlock<Vyukov<T, Opt, Link>> {
     using Self = Vyukov<T, Opt, Link>;
 
 
     static constexpr bool pad_cells = !Opt::template has<typename VyukovOpt::no_cell_padding>;
-    static constexpr bool force_pow2 = Opt::template has<typename VyukovOpt::force_pow2>;
+    /// Index mapping is a mask rather than a modulo; see VyukovOpt::no_pow2.
+    static constexpr bool pow2 = !Opt::template has<typename VyukovOpt::no_pow2>;
 
 public:
     using cell_type = cell::SequencedCell<T, pad_cells>;
@@ -64,7 +71,7 @@ public:
      *       spins there for ever.
      */
     static constexpr std::size_t round_size(std::size_t n) noexcept {
-        if constexpr (force_pow2) return bit::round_to_next_pow2(n > 1 ? n : 2);
+        if constexpr (pow2) return bit::round_to_next_pow2(n > 1 ? n : 2);
         else return n > 1 ? n : 2;
     }
 
@@ -151,6 +158,14 @@ public:
         }
     }
 
+
+    /// @copydoc core::Queue::try_enqueue
+    /// Never blocks, so this is the same operation as enqueue().
+    bool try_enqueue(T item) noexcept { return enqueue(item); }
+    /// @copydoc core::Queue::try_dequeue
+    /// Never blocks, so this is the same operation as dequeue().
+    bool try_dequeue(T& out) noexcept { return dequeue(out); }
+
     /// @return Items currently held. Approximate under concurrency, exact when quiescent.
     std::size_t size() const noexcept {
         uint64_t t = tail_.load(std::memory_order_acquire);
@@ -212,7 +227,7 @@ private:
     static constexpr bool is_closed_ticket(uint64_t t) noexcept { return bit::get_msb(t) != 0; }
 
     FORCE_INLINE std::size_t mod(uint64_t i) const noexcept {
-        if constexpr (force_pow2) return i & (capacity_ - 1);
+        if constexpr (pow2) return i & (capacity_ - 1);
         else return i % capacity_;
     }
 

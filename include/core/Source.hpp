@@ -49,6 +49,11 @@ concept SegmentSource = requires(Src src, const Src csrc, typename Src::handle h
      * AdmissionPolicy::live_segments as the capacity-splitting divisor.
      */
     { Src::live_segments() } noexcept -> std::same_as<std::size_t>;
+
+    /// What each segment this source hands out actually holds, after the segment's own rounding.
+    /// The source is what builds them at that size, so it is the one that knows; LinkedProxy
+    /// reads it back rather than keeping its own copy.
+    { csrc.segment_capacity() } noexcept -> std::same_as<std::size_t>;
     /// announce that the caller is about to access shared memory
     { src.pin() } noexcept -> std::same_as<typename Src::guard>;
     /// retrieve the payload specific to the thread holding the guard
