@@ -51,20 +51,29 @@ struct SpinOpt {
  * for the lock itself. enqueue() and dequeue() refuse immediately when full or empty, so
  * whatever this is slower or faster by is attributable to lock acquisition alone.
  *
- * The lock is the usual three-state futex rather than a bare `while (exchange)`:
+ * **One word holds both the lock and the closed flag.**
  *
  * ```
- *   0  free
- *   1  held, nobody waiting        -> unlock is a plain store, no syscall
- *   2  held, at least one waiter   -> unlock must notify
+ *   bit  0   locked
+ *   bit 31   closed          (kClosed, the MSB)
  * ```
  *
- * The distinction is what keeps the uncontended path free of a `notify_one()`, which would
- * otherwise be paid on every single unlock for the rare case that somebody is parked.
+ * There is deliberately no third "contended" state. Tracking it would let an uncontended
+ * release skip its `notify_one()`, but the critical sections here are a bounds check, a store
+ * and two index updates -- contention is brief and rare enough that the wider state machine
+ * costs more on every acquire than the notify saves. A `notify_one()` with nobody parked is
+ * close to free: the standard libraries keep a waiter count per address and skip the futex
+ * syscall when it is zero.
+ *
+ * Sharing the word with the closed flag is what dictates the instructions. **Every update must
+ * be `fetch_or`/`fetch_and`** -- an `exchange` or a plain store would clobber the flag, which is
+ * exactly the class of bug that lost items in three other segments earlier. `fetch_or` costs the
+ * same single RMW as an exchange and returns more: the previous word, whose `kClosed` bit tells
+ * the new owner the close state without a second load.
  *
  * `std::atomic::wait`/`notify_one` are C++20 and map onto the platform's futex where there is
- * one, so a parked thread costs nothing while it waits -- unlike a spin, which is why the
- * spin count is bounded.
+ * one, so a parked thread costs nothing while it waits -- unlike a spin, which is why the spin
+ * count is bounded.
  */
 template <typename T, typename Opt = meta::EmptyOptions, typename Link = linkage::None>
     requires meta::AcceptsOnly<Opt, typename SpinOpt::no_pow2,
@@ -78,11 +87,10 @@ class Spin : public mem::SingleBlock<Spin<T, Opt, Link>> {
     static constexpr uint32_t kSpins =
         static_cast<uint32_t>(Opt::template get<SpinOpt::spins_before_park, uint32_t{64}>);
 
-    /// @name Lock states; see the class note.
+    /// @name The two bits of `lock_`; see the class note.
     /// @{
-    static constexpr uint32_t kFree = 0;
-    static constexpr uint32_t kHeld = 1;
-    static constexpr uint32_t kContended = 2;
+    static constexpr uint32_t kLocked = 1u;
+    static constexpr uint32_t kClosed = bit::msb_mask<uint32_t>;
     /// @}
 
 public:
@@ -127,12 +135,16 @@ public:
     /// @return false if the queue is full, or closed.
     bool try_enqueue(T item) noexcept {
         const Guard g{*this};
-        if (closed_) return false;
+        if (g.was_closed()) return false;
         if (count_ == capacity_) {
             // A linked segment closes itself here and the close is permanent; see
             // algo::Mutex::enqueue for why a segment that refuses once must refuse for ever.
             // Standalone, a drained queue has to accept again, so the close is conditional.
-            if constexpr (Link::is_linked) closed_ = true;
+            // Set under the lock, which is what orders it against an insert: the fullness
+            // check, the close and the insert all sit inside one critical section, so nobody
+            // can be part-way past the check when the close lands.
+            if constexpr (Link::is_linked)
+                lock_.fetch_or(kClosed, std::memory_order_relaxed);
             return false;
         }
         cells_[tail_] = item;
@@ -174,19 +186,32 @@ public:
     // -- linkage (only when linked) -----------------------------------------
 
     /// @brief Refuse all further enqueues, permanently.
+    /**
+     * @brief Refuse all further enqueues, permanently.
+     *
+     * Takes the lock even though setting a bit does not need it: the lock is what orders a
+     * close against an insert already inside its critical section. Making this lock-free would
+     * let a producer that read "open" commit afterwards -- precisely the hole that lost items
+     * in PSCQ and VyukovNoABA.
+     */
     void close() noexcept
         requires(Link::is_linked)
     {
         const Guard g{*this};
-        closed_ = true;
+        lock_.fetch_or(kClosed, std::memory_order_relaxed);
     }
 
-    /// @return true once closed; a closed segment still drains.
+    /**
+     * @return true once closed; a closed segment still drains.
+     *
+     * Lock-free, unlike the rest: the flag is a bit of an atomic word, and this is called on
+     * the proxy's retire path where taking the lock was pure overhead. The answer is a
+     * snapshot rather than a serialised read, which is all the proxy treats it as.
+     */
     bool is_closed() const noexcept
         requires(Link::is_linked)
     {
-        const Guard g{*this};
-        return closed_;
+        return (lock_.load(std::memory_order_acquire) & kClosed) != 0;
     }
 
     /**
@@ -199,7 +224,7 @@ public:
         const Guard g{*this};
         link_.unlink();
         head_ = tail_ = count_ = 0;
-        closed_ = false;
+        lock_.fetch_and(static_cast<uint32_t>(~kClosed), std::memory_order_relaxed);
         return true;
     }
 
@@ -222,38 +247,48 @@ public:
 
 private:
     /**
-     * @brief Bounded spin, then park. See the class note for the three states.
+     * @brief Bounded spin, then park.
+     * @return the word as it stood *before* the lock was taken, so its kClosed bit is the close
+     *         state the new owner should act on -- read for free, out of the same RMW.
      *
-     * `exchange(kContended)` rather than a CAS on the slow path: the thread is about to sleep
-     * anyway, so it can afford to claim the contended state unconditionally, and doing so means
-     * a lock that was actually free is still acquired by the same instruction.
+     * `fetch_or` rather than `exchange` because the closed flag shares this word; see the class
+     * note. The bound is the point of the spin: past a few attempts, spinning is worse than
+     * sleeping, because it burns a core the lock holder may be trying to run on.
      */
-    void acquire() const noexcept {
-        for (uint32_t i = 0; i < kSpins; ++i) {
-            uint32_t expect = kFree;
-            if (lock_.compare_exchange_weak(expect, kHeld, std::memory_order_acquire,
-                                            std::memory_order_relaxed))
-                return;
-            SPIN_HINT();
+    uint32_t acquire() const noexcept {
+        for (;;) {
+            // `<=` so that spins_before_park<0> still makes one attempt before parking, which
+            // is what makes 0 mean "a pure futex" rather than "deadlock".
+            for (uint32_t i = 0; i <= kSpins; ++i) {
+                const uint32_t prev = lock_.fetch_or(kLocked, std::memory_order_acquire);
+                if ((prev & kLocked) == 0) return prev;
+                SPIN_HINT();
+            }
+            const uint32_t held = lock_.load(std::memory_order_relaxed);
+            // Re-checked rather than assumed: the holder may have released between the last
+            // attempt and here, and waiting on a value that is already stale never wakes.
+            if (held & kLocked) lock_.wait(held, std::memory_order_relaxed);
         }
-        while (lock_.exchange(kContended, std::memory_order_acquire) != kFree)
-            lock_.wait(kContended, std::memory_order_relaxed);
     }
 
+    /// Clears the lock bit and *only* the lock bit -- a store here would drop the close.
     void release() const noexcept {
-        // Only the contended state owes a wakeup, which is the whole reason for having three
-        // states rather than two.
-        if (lock_.exchange(kFree, std::memory_order_release) == kContended)
-            lock_.notify_one();
+        lock_.fetch_and(static_cast<uint32_t>(~kLocked), std::memory_order_release);
+        lock_.notify_one();
     }
 
-    /// Scoped lock, so an early `return` inside a critical section cannot leak it.
+    /// Scoped lock, so an early `return` inside a critical section cannot leak it. Carries the
+    /// word observed at acquisition, so a critical section that needs the close state has it.
     struct Guard {
         const Spin& q;
-        explicit Guard(const Spin& s) noexcept : q{s} { q.acquire(); }
+        uint32_t prev;
+        explicit Guard(const Spin& s) noexcept : q{s}, prev{s.acquire()} {}
         Guard(const Guard&) = delete;
         Guard& operator=(const Guard&) = delete;
         ~Guard() { q.release(); }
+
+        /// Was the queue already closed when this lock was taken?
+        bool was_closed() const noexcept { return (prev & kClosed) != 0; }
     };
 
     FORCE_INLINE std::size_t wrap(std::size_t i) const noexcept {
@@ -261,10 +296,11 @@ private:
         else return i % capacity_;
     }
 
-    CACHE_ALIGN mutable std::atomic<uint32_t> lock_{kFree};
+    /// Lock bit and closed bit in one word. **Only ever updated with fetch_or/fetch_and** --
+    /// an exchange or a plain store would silently clear the close. See the class note.
+    CACHE_ALIGN mutable std::atomic<uint32_t> lock_{0};
     CACHE_PAD(std::atomic<uint32_t>);
     std::size_t head_ = 0, tail_ = 0, count_ = 0;
-    bool closed_ = false;
     [[no_unique_address]] link_state link_{};
     const std::size_t capacity_;
     T* const cells_;

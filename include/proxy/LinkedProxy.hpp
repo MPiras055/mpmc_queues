@@ -44,25 +44,62 @@ struct ProxyOpt {
 };
 
 namespace detail {
-
-/// Disabled stat
-struct SegmentStatsOff {
+template <bool Enabled>
+struct LocalSegmentStats {
     static constexpr bool enabled = false;
     constexpr void on_link() const noexcept {}
     constexpr void on_retire() const noexcept {}
     constexpr void on_discard() const noexcept {}
 };
 
+template <>
+struct LocalSegmentStats<true> {
+    static constexpr bool enabled = true;
+
+    //atomic counters single writer multiple reader
+    std::atomic<uint64_t> linked{0}, retired{0}, discarded{0};
+
+    void on_link() noexcept { linked.fetch_add(1,std::memory_order_relaxed); }
+    void on_retire() noexcept { retired.fetch_add(1,std::memory_order_relaxed); }
+    void on_discard() noexcept { discarded.fetch_add(1,std::memory_order_relaxed); }
+
+    void reset() noexcept {
+        linked.store(0, std::memory_order_relaxed);
+        retired.store(0, std::memory_order_relaxed);
+        discarded.store(0, std::memory_order_relaxed);
+    }
+};
+
+/// Disabled stat
+struct SegmentStatsOff {
+    static constexpr bool enabled = false;
+    // @brief: Never touched globally
+    // constexpr void on_link() const noexcept {}
+    // constexpr void on_retire() const noexcept {}
+    // constexpr void on_discard() const noexcept {}
+};
+
 /**
- * @brief Enabled: three monotonic counters, relaxed.
- * @note: counters explicitly not aligned to keep the memory footprint low
+ * @brief shared SegmentStats instance
+ * 
+ * @note: counters are explicitly not aligned since they're read in isolation and the write happens only
+ * once per thread
  */
 struct SegmentStatsOn {
     static constexpr bool enabled = true;
+    //@brief: Never touched globally
+    // void on_link() noexcept { linked_.fetch_add(1, std::memory_order_relaxed); }
+    // void on_retire() noexcept { retired_.fetch_add(1, std::memory_order_relaxed); }
+    // void on_discard() noexcept { discarded_.fetch_add(1, std::memory_order_relaxed); }
 
-    void on_link() noexcept { linked_.fetch_add(1, std::memory_order_relaxed); }
-    void on_retire() noexcept { retired_.fetch_add(1, std::memory_order_relaxed); }
-    void on_discard() noexcept { discarded_.fetch_add(1, std::memory_order_relaxed); }
+    /**
+     * @brief: Fold a LocalSegmentStats into this one
+     */
+    void absorb(const LocalSegmentStats<true>& stats) {
+        if(stats.linked) linked_.fetch_add(stats.linked,std::memory_order_relaxed);
+        if(stats.retired) retired_.fetch_add(stats.retired,std::memory_order_relaxed);
+        if(stats.discarded) discarded_.fetch_add(discarded_,std::memory_order_relaxed);
+    }
 
     uint64_t linked() const noexcept { return linked_.load(std::memory_order_relaxed); }
     uint64_t retired() const noexcept { return retired_.load(std::memory_order_relaxed); }
@@ -80,13 +117,21 @@ private:
  * @note: it's explicitly not aligned since it is stored inside the source's `ThreadData`,
  * which is anyway padded
  * @tparam H the source's handle type.
+ * 
+ * @dev: ThreadMeta sits in the same cache line and is padded continously with a uint64_t value 
+ * (Segment source reference). We want to make sure that ThreadMeta never exceeds the padding, resulting
+ * At the worst case (Segments stats on) threadMeta weights 8 + 8 + 3 * 8 = 40. Accounting for the segment source
+ * reference we are up to 48 bytes. CACHE_LINE sits as 64 bytes or 128 bytes so we're safe.
+ * 
  */
-template <typename H>
+template <typename H, bool WithStats = false>
 struct ThreadMeta {
     /// signed counter to accurately track the size of the queue across concurrent threads
     std::atomic<int64_t> ops{0};
     /// last tail (handle type) the thread found closed
     H last_seen{};
+    /// Empty, and erased by [[no_unique_address]], unless ProxyOpt::segment_stats is set.
+    [[no_unique_address]] detail::LocalSegmentStats<WithStats> seg{};
 };
 
 /**
@@ -146,7 +191,20 @@ class LinkedProxy {
                   "segment_traits says this segment needs the close hint, but it has no "
                   "enqueue(T, bool) overload");
 
-    using Meta = ThreadMeta<H>;
+    using Meta = ThreadMeta<H, stats_enabled>;
+
+    /**
+     * @brief The per-thread payload has to leave room for the source's own word.
+     *
+     * This lands inside the source's `ThreadData`, which is one cache line: the source spends a
+     * word of it on its own per-thread state -- a hazard pointer for source::Hazard, a
+     * VersionedIndex for source::Pool -- and the rest is ours. Overrunning the line would put
+     * two threads' bookkeeping on the same one, which is the false sharing all of this exists
+     * to avoid, and it would do so silently.
+     */
+    static_assert(sizeof(Meta) <= CACHE_LINE - sizeof(uintptr_t),
+                  "ThreadMeta must leave the source a word inside the cache line; shrink it or "
+                  "move the field behind an option");
 
     /// check that the source was given the ThreadMeta as payload
     static_assert(std::same_as<typename Source::thread_payload, Meta>,
@@ -214,6 +272,10 @@ public:
                     me_->ops.exchange(0,std::memory_order_relaxed),
                     std::memory_order_relaxed
                 );
+                if constexpr (stats_enabled) {
+                    q_->stats_.absorb(me_->seg);
+                    me_->seg.reset();
+                }
                 me_->last_seen = Source::nil();
                 q_   = nullptr;
                 me_  = nullptr;
@@ -254,6 +316,19 @@ public:
         return Segment::capacity_for(share < 2 ? 2 : share);
     }
 
+    /**
+     * @brief Sum one per-thread counter across the threads still attached.
+     */
+    using LocalCounter = std::atomic<uint64_t> detail::LocalSegmentStats<true>::*;
+
+    uint64_t live_stats(LocalCounter field) const noexcept
+        requires(stats_enabled)
+    {
+        return source_.reduce_payloads(uint64_t{0}, [field](uint64_t acc, const Meta& m) {
+            return acc + (m.seg.*field).load(std::memory_order_relaxed);
+        });
+    }
+
     /// What one segment actually holds. Read back from the source, which is what built them at
     /// that size, rather than kept as a second copy here.
     std::size_t segment_capacity() const noexcept { return source_.segment_capacity(); }
@@ -291,7 +366,9 @@ public:
         //initialize head and tail
         head_.store(*sentinel, std::memory_order_relaxed);
         tail_.store(*sentinel, std::memory_order_relaxed);
-        stats_.on_link();   //record the segment as linked
+        // Straight to the shared counter: this is the sentinel, written once by the
+        // constructing thread, which has no proxy session to flush a local tally through.
+        g.payload().seg.on_link();
     }
 
     /// Delete copy constructor and copy assignment
@@ -426,7 +503,7 @@ public:
                                                     std::memory_order_acquire);
                 //signal on the admission policy
                 admit_.on_segment_linked();
-                stats_.on_link();
+                me.seg.on_link();   // thread-local; folded into stats_ when the thread leaves
                 break;
             }
 
@@ -439,7 +516,7 @@ public:
             }
 
             source_.discard(*fresh);                //discard the previously acquired segment
-            stats_.on_discard();                    //update the discard stats
+            me.seg.on_discard();                    //thread-local; see LocalSegmentStats
             source_.renew(g);                       //renew protection on the tail
             tail = source_.protect(g, installed);
         }
@@ -513,7 +590,7 @@ public:
                 //first would let this thread's own advance free it under a slower reader.
                 source_.retire(expect); // retire the current head
                 admit_.on_segment_retired();
-                stats_.on_retire();
+                me.seg.on_retire();
                 source_.renew(g);
                 head = source_.protect(g, head_.load(std::memory_order_acquire));
             } else {
@@ -538,11 +615,7 @@ public:
         });
         return total > 0 ? static_cast<std::size_t>(total) : 0;
     }
-
-    /// @brief: get a conservative item ceiling bound
-    /// @warning: this value is only an estimation, it is really possible
-    /// that under extreme contention the queue may accept far less items or a few
-    /// more (generally a fraction of the bound capacity)
+    
     /**
      * @brief Items this queue can hold.
      *
@@ -566,7 +639,7 @@ public:
     uint64_t segments_linked() const noexcept
         requires(stats_enabled)
     {
-        return stats_.linked();
+        return stats_.linked() + live_stats(&detail::LocalSegmentStats<true>::linked);
     }
 
     /*
@@ -576,7 +649,7 @@ public:
     uint64_t segments_retired() const noexcept
         requires(stats_enabled)
     {
-        return stats_.retired();
+        return stats_.retired() + live_stats(&detail::LocalSegmentStats<true>::retired);
     }
 
     /*
@@ -587,7 +660,7 @@ public:
     uint64_t segments_discarded() const noexcept
         requires(stats_enabled)
     {
-        return stats_.discarded();
+        return stats_.discarded() + live_stats(&detail::LocalSegmentStats<true>::discarded);
     }
     /// @}
 

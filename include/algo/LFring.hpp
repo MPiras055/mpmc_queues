@@ -23,6 +23,9 @@ struct LFringOpt {
     /**
      * The ring holds indices into someone else's buffer rather than the payload itself.
      * Removes the fullness pre-check, because the owner guarantees an index is available.
+     * 
+     * @note: this option shoudn't be checked by the user if instantiating a standalone LFring.
+     * It's only used by SCQ instantiation
      */
     struct indirect_store {};
 

@@ -22,8 +22,21 @@ namespace proxy {
  * is just `Seg*`. LinkedProxy static_asserts the two agree, so getting this wrong is a
  * diagnosable error rather than a silent layout mismatch.
  */
-template <typename Seg, typename SrcOpt = meta::EmptyOptions>
-using HazardSource = mem::source::Hazard<Seg, ThreadMeta<Seg*>, SrcOpt>;
+/**
+ * @brief Does this proxy option pack ask for segment counters?
+ *
+ * The per-thread half of those counters lives in `ThreadMeta`, which the *source* is
+ * parameterised on -- so the flag has to be known here, before the source type exists, rather
+ * than inside LinkedProxy. `LinkedProxy` static_asserts that the two agree, so getting this
+ * wrong is a diagnosable error rather than a second set of counters nobody reads.
+ */
+template <typename POpt>
+inline constexpr bool counts_segments = POpt::template has<typename ProxyOpt::segment_stats>;
+
+template <typename Seg, typename SrcOpt = meta::EmptyOptions,
+          typename POpt = meta::EmptyOptions>
+using HazardSource =
+    mem::source::Hazard<Seg, ThreadMeta<Seg*, counts_segments<POpt>>, SrcOpt>;
 
 /**
  * @name The proxy family
@@ -38,16 +51,16 @@ using HazardSource = mem::source::Hazard<Seg, ThreadMeta<Seg*>, SrcOpt>;
 
 /// Grows without limit. Was UnboundedProxy.
 template <typename T, typename Seg, typename SrcOpt = meta::EmptyOptions,
-          typename ProxyOpt = meta::EmptyOptions>
-using Unbounded = LinkedProxy<T, Seg, admit::None, HazardSource<Seg, SrcOpt>, ProxyOpt>;
+          typename POpt = meta::EmptyOptions>
+using Unbounded = LinkedProxy<T, Seg, admit::None, HazardSource<Seg, SrcOpt, POpt>, POpt>;
 
 /**
  * @brief Bounded by live item count. Was BoundedCounterProxy.
  * @tparam N segments to spread the capacity across -- same position and meaning as MemBounded's.
  */
 template <typename T, typename Seg, std::size_t N = 4, typename SrcOpt = meta::EmptyOptions,
-          typename ProxyOpt = meta::EmptyOptions>
-using ItemBounded = LinkedProxy<T, Seg, admit::ItemCount<N>, HazardSource<Seg, SrcOpt>, ProxyOpt>;
+          typename POpt = meta::EmptyOptions>
+using ItemBounded = LinkedProxy<T, Seg, admit::ItemCount<N>, HazardSource<Seg, SrcOpt, POpt>, POpt>;
 
 /**
  * @brief Bounded by live segment count. Was BoundedChunkProxy.
@@ -56,9 +69,9 @@ using ItemBounded = LinkedProxy<T, Seg, admit::ItemCount<N>, HazardSource<Seg, S
  *         template argument and a constructor argument in step.
  */
 template <typename T, typename Seg, std::size_t N = 4, typename SrcOpt = meta::EmptyOptions,
-          typename ProxyOpt = meta::EmptyOptions>
+          typename POpt = meta::EmptyOptions>
 using ChunkBounded =
-    LinkedProxy<T, Seg, admit::SegmentCount<N>, HazardSource<Seg, SrcOpt>, ProxyOpt>;
+    LinkedProxy<T, Seg, admit::SegmentCount<N>, HazardSource<Seg, SrcOpt, POpt>, POpt>;
 
 /**
  * @brief Bounded by a fixed pool of recycled segments. Was BoundedMemProxy.
@@ -68,10 +81,12 @@ using ChunkBounded =
  * whole 288-line proxy collapses into an alias.
  */
 template <typename T, typename Seg, std::size_t N = 4, typename SrcOpt = meta::EmptyOptions,
-          typename ProxyOpt = meta::EmptyOptions>
+          typename POpt = meta::EmptyOptions>
 using MemBounded =
     LinkedProxy<T, Seg, admit::None,
-                mem::source::Pool<Seg, N, ThreadMeta<mem::VersionedIndex<N>>, SrcOpt>, ProxyOpt>;
+                mem::source::Pool<Seg, N, ThreadMeta<mem::VersionedIndex<N>, counts_segments<POpt>>,
+                                  SrcOpt>,
+                POpt>;
 
 /// @}
 

@@ -162,6 +162,61 @@ using Linked = meta::TypeList<
     Entry<"mem-noaba", proxy::MemBounded<T, IdxNoABA<T>, kPoolSize>>
     >;
 
+/**
+ * @brief Tuning variants, deliberately **outside** `All`.
+ *
+ * Two things live here that must not be in the headline sweep:
+ *
+ *  - **Instrumented entries.** `ProxyOpt::segment_stats` puts atomics on the link path, so a
+ *    counter run and a throughput run have to be separate passes. Keeping them in a separate
+ *    list is what stops them being mixed by accident.
+ *  - **The backoff grid.** `patience` is a template parameter, so every value is a distinct
+ *    type and needs its own entry. Sweeping them from `All` would multiply the cost of every
+ *    full run for a question only two algorithms are being asked.
+ *
+ * Names carry the value (`u-faa-p0`) so a CSV row is self-describing.
+ * @see docs/"Benchmark Notes - Concurrent Queue Implementations.md"
+ */
+template <typename T>
+using Stats = meta::OptionsPack<proxy::ProxyOpt::segment_stats>;
+
+template <typename T, std::size_t P>
+using FAAp = seg::FAAArray<T, meta::OptionsPack<algo::FAAArrayOpt::patience<P>>>;
+template <typename T, std::size_t P>
+using HQp = seg::HQ<T, meta::OptionsPack<algo::HQOpt::patience<P>>>;
+
+/// Instrumented: same shape as the `All` entry, with the segment counters switched on. These are
+/// what the slot-efficiency formulas need -- W = S*n - i needs S, and nothing else does.
+template <typename T>
+using Instrumented = meta::TypeList<
+    Entry<"i-u-faa", proxy::Unbounded<T, seg::FAAArray<T>, meta::EmptyOptions, Stats<T>>>,
+    Entry<"i-u-hq", proxy::Unbounded<T, seg::HQ<T>, meta::EmptyOptions, Stats<T>>>,
+    Entry<"i-u-prq", proxy::Unbounded<T, seg::PRQ<T>, meta::EmptyOptions, Stats<T>>>,
+    Entry<"i-u-pscq", proxy::Unbounded<T, seg::PSCQ<T>, meta::EmptyOptions, Stats<T>>>,
+    Entry<"i-u-scq", proxy::Unbounded<T, seg::SCQ<T>, meta::EmptyOptions, Stats<T>>>,
+    Entry<"i-u-vyukov", proxy::Unbounded<T, seg::Vyukov<T>, meta::EmptyOptions, Stats<T>>>,
+    Entry<"i-u-noaba", proxy::Unbounded<T, seg::VyukovNoABA<T>, meta::EmptyOptions, Stats<T>>>>;
+
+/// The backoff grid. `p0` is the no-backoff case the notes expect to fail pathologically.
+template <typename T>
+using Backoff = meta::TypeList<
+    Entry<"u-faa-p0", proxy::Unbounded<T, FAAp<T, 0>, meta::EmptyOptions, Stats<T>>>,
+    Entry<"u-faa-p16", proxy::Unbounded<T, FAAp<T, 16>, meta::EmptyOptions, Stats<T>>>,
+    Entry<"u-faa-p64", proxy::Unbounded<T, FAAp<T, 64>, meta::EmptyOptions, Stats<T>>>,
+    Entry<"u-faa-p256", proxy::Unbounded<T, FAAp<T, 256>, meta::EmptyOptions, Stats<T>>>,
+    Entry<"u-faa-p1024", proxy::Unbounded<T, FAAp<T, 1024>, meta::EmptyOptions, Stats<T>>>,
+    Entry<"u-faa-p4096", proxy::Unbounded<T, FAAp<T, 4096>, meta::EmptyOptions, Stats<T>>>,
+    Entry<"u-hq-p0", proxy::Unbounded<T, HQp<T, 0>, meta::EmptyOptions, Stats<T>>>,
+    Entry<"u-hq-p16", proxy::Unbounded<T, HQp<T, 16>, meta::EmptyOptions, Stats<T>>>,
+    Entry<"u-hq-p64", proxy::Unbounded<T, HQp<T, 64>, meta::EmptyOptions, Stats<T>>>,
+    Entry<"u-hq-p256", proxy::Unbounded<T, HQp<T, 256>, meta::EmptyOptions, Stats<T>>>,
+    Entry<"u-hq-p1024", proxy::Unbounded<T, HQp<T, 1024>, meta::EmptyOptions, Stats<T>>>,
+    Entry<"u-hq-p4096", proxy::Unbounded<T, HQp<T, 4096>, meta::EmptyOptions, Stats<T>>>>;
+
+/// What `mpmc_tune` sweeps.
+template <typename T>
+using Tuning = meta::concat<Instrumented<T>, Backoff<T>>;
+
 /// Everything, for the benchmark.
 template <typename T>
 using All = meta::concat<Standalone<T>, Linked<T>>;

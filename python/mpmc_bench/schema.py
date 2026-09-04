@@ -78,6 +78,8 @@ class DelayPair:
 
 
 _EXPERIMENT_KEYS = {
+    "metrics",
+    "executable",
     "name",
     "output_file",
     "repetitions",
@@ -103,6 +105,13 @@ class Experiment:
     delays: list[DelayPair] = field(default_factory=lambda: [DelayPair()])
     name: str = ""
     timeout_s: float = 300.0
+    #: Ask the benchmark for `key=value` output and record the counter columns. Off by default,
+    #: because the instrumented entries put atomics on the link path -- a counter run and a
+    #: throughput run must be separate passes.
+    metrics: bool = False
+    #: Which binary to sweep: "benchmark" (the 47 headline entries) or "mpmc_tune" (the
+    #: instrumented and backoff variants). See registry::Tuning.
+    executable: str = "benchmark"
 
     @property
     def grid_size(self) -> int:
@@ -161,6 +170,8 @@ class Experiment:
             delays=delays,
             name=str(raw.get("name", "")),
             timeout_s=float(raw.get("timeout_s", 300.0)),
+            metrics=bool(raw.get("metrics", False)),
+            executable=str(raw.get("executable", "benchmark")),
         )
 
 

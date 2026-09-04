@@ -113,7 +113,7 @@ public:
 
     PSCQ(std::size_t n, mem::Blocks blk) noexcept
         : size_{phys_size(n)}, mask_{phys_size(n) - 1},
-          max_threshold_{static_cast<int64_t>(2 * phys_size(n)) - 1},
+          max_threshold_{static_cast<int64_t>(2 * phys_size(n))},
           cells_{blk.template at<cell_type>(plan(n).regions[0])} {
         for (std::size_t i = 0; i < size_; ++i) {
             cells_[i].val.store(Tag::empty(), std::memory_order_relaxed);

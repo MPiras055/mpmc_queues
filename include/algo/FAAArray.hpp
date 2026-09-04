@@ -92,6 +92,7 @@ class FAAArray : public mem::SingleBlock<FAAArray<T, Opt, Link, Tag>> {
     /// Cast rather than trusted: `get` returns the option's own type when one is present.
     static constexpr std::size_t kPatience =
         static_cast<std::size_t>(Opt::template get<FAAArrayOpt::patience, std::size_t{1024}>);
+    static constexpr bool no_patience = kPatience == 0;
 
 public:
     /// Loads a consumer spends on a straggling producer; see FAAArrayOpt::patience.
@@ -167,8 +168,10 @@ public:
             if (h >= capacity_) return false;
             cell_type& c = cells_[h];
             // Give a straggling producer a bounded chance to publish.
-            for (std::size_t i = 0; i < kPatience; ++i)
-                if (!is_empty_w(c.val.load(std::memory_order_acquire))) break;
+            if constexpr (!no_patience) {
+                for (std::size_t i = 0; i < kPatience; ++i)
+                    if (!is_empty_w(c.val.load(std::memory_order_acquire))) break;
+            }
             const word w = c.val.exchange(consumed_w(), std::memory_order_acq_rel);
             if (Tag::is_payload(w)) {
                 out = Tag::decode(w);

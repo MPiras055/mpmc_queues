@@ -19,12 +19,26 @@
 #include <cstdint>
 #include <iostream>
 #include <string>
+#include <type_traits>
 #include <thread>
 #include <vector>
 
 namespace {
 
 using TestItem = uint64_t*;
+
+/**
+ * @brief Which registry list this binary sweeps.
+ *
+ * `mpmc_tune` is the same harness over `registry::Tuning` -- the instrumented and backoff
+ * variants — so the two binaries cannot drift in how they measure. See Registry.hpp for why the
+ * tuning entries are kept out of `All`.
+ */
+#ifdef MPMC_BENCH_TUNING
+template <typename T> using BenchSet = registry::Tuning<T>;
+#else
+template <typename T> using BenchSet = registry::All<T>;
+#endif
 
 /// Optional simulated per-operation work, so contention can be varied.
 struct Delay {
@@ -40,6 +54,22 @@ struct Delay {
 template <typename Queue>
 class Benchmark {
 public:
+    /**
+     * @brief Turn a sequence number into an item every tag scheme can carry.
+     *
+     * Even, at least 2, and far below the top bit. All three matter, and the benchmark used to
+     * get the first two wrong by sending `1`:
+     *
+     *  - `cell::LowTag` (FAAArray, HQ) reserves **0 as empty and 1 as consumed**, so item `1`
+     *    read back as an already-consumed cell. Measured directly: 8 enqueued, 7 drained.
+     *  - `cell::MsbTag` (PRQ, PSCQ) reserves the top bit, so items must stay below it.
+     *  - `algo::VyukovNoABA` encodes an empty cell as a word with the top *and* bottom bits set,
+     *    which an even word can never collide with.
+     */
+    static TestItem encode(uint64_t seq) noexcept {
+        return std::bit_cast<TestItem>((seq + 1) * 2);
+    }
+
     Benchmark(size_t producers, size_t consumers, uint64_t items, size_t capacity)
         : producers_{producers}, consumers_{consumers}, items_{items},
           instance_{capacity} {
@@ -61,14 +91,14 @@ public:
         std::atomic<bool> producers_done{false};
 
         const auto producer = [&](uint64_t id) {
-            // Start at 1 so no item is ever a null pointer.
             const uint64_t first = id * batch + (id < remainder ? id : remainder) + 1;
             const uint64_t count = batch + (id < remainder ? 1 : 0);
             [[maybe_unused]] auto joined = registry::Instance<Queue>::session(q);
             all_barrier.arrive_and_wait();
             for (uint64_t i = first; i < first + count; ++i) { // NB: first + count
                 prod_delay_();
-                while (!q.try_enqueue(std::bit_cast<TestItem>(i))) {}
+                while (!q.try_enqueue(encode(i))) {}
+                produced_.fetch_add(1, std::memory_order_relaxed);
             }
             producers_done_barrier.arrive_and_wait();
             all_barrier.arrive_and_wait();
@@ -83,8 +113,10 @@ public:
             // registry surface has no generic close(), so the condition-variable path in
             // algo::Mutex is not what this harness measures -- see the note in the docs.
             while (!producers_done.load(std::memory_order_relaxed))
-                if (q.try_dequeue(out)) cons_delay_();
-            while (q.try_dequeue(out)) cons_delay_();
+                if (q.try_dequeue(out)) { consumed_.fetch_add(1, std::memory_order_relaxed);
+                                          cons_delay_(); }
+            while (q.try_dequeue(out)) { consumed_.fetch_add(1, std::memory_order_relaxed);
+                                         cons_delay_(); }
             all_barrier.arrive_and_wait();
         };
 
@@ -129,7 +161,41 @@ private:
     util::threading::ThreadPinner pinner_;
     bool pinning_ = false;
     Delay prod_delay_{}, cons_delay_{};
+    /// Counted rather than assumed: a run that loses items must not report a throughput.
+    std::atomic<uint64_t> produced_{0}, consumed_{0};
+
+public:
+    uint64_t produced() const noexcept { return produced_.load(std::memory_order_relaxed); }
+    uint64_t consumed() const noexcept { return consumed_.load(std::memory_order_relaxed); }
+    /// Non-const: registry::Instance::get() is not const-qualified.
+    Queue& queue() noexcept { return instance_.get(); }
 };
+
+/**
+ * @brief `key=value` lines, one per metric.
+ *
+ * Deliberately not the default: everything downstream reads a bare number today. The slot
+ * efficiency the notes define -- W = S*n - i, eta = i/(S*n) -- is derived in Python from
+ * `segments_linked` (S), `segment_capacity` (n) and `produced` (i), so nothing here needs a
+ * per-cell counter.
+ */
+template <typename B>
+void emit_metrics(B& bench, long double rate, uint64_t items) {
+    std::cout << "throughput=" << rate << "\n"
+              << "produced=" << bench.produced() << "\n"
+              << "consumed=" << bench.consumed() << "\n"
+              << "items=" << items << "\n"
+              << "capacity=" << bench.queue().capacity() << "\n";
+    using Q = std::remove_cvref_t<decltype(bench.queue())>;
+    if constexpr (requires { bench.queue().segment_capacity(); })
+        std::cout << "segment_capacity=" << bench.queue().segment_capacity() << "\n";
+    if constexpr (requires { bench.queue().segments_linked(); }) {
+        std::cout << "segments_linked=" << bench.queue().segments_linked() << "\n"
+                  << "segments_retired=" << bench.queue().segments_retired() << "\n"
+                  << "segments_discarded=" << bench.queue().segments_discarded() << "\n";
+    }
+    (void)sizeof(Q);
+}
 
 void usage(const char* argv0) {
     std::cerr << "usage: " << argv0
@@ -141,7 +207,7 @@ void usage(const char* argv0) {
                  "              size is capacity/segments, floored at 2 and rounded up by the\n"
                  "              algorithm. The queue may therefore hold more than asked.\n"
                  "\nregistered:\n";
-    registry::for_each_name(registry::All<TestItem>{},
+    registry::for_each_name(BenchSet<TestItem>{},
                             [](std::string_view n) { std::cerr << "  " << n << '\n'; });
 }
 
@@ -153,10 +219,16 @@ int main(int argc, char** argv) {
     // exists -- previously the same list was duplicated into a QUEUE_MAP and a
     // STYLE_MAP, and both drifted.
     if (argc == 2 && std::string(argv[1]) == "--list") {
-        registry::for_each_name(registry::All<TestItem>{},
+        registry::for_each_name(BenchSet<TestItem>{},
                                 [](std::string_view n) { std::cout << n << '\n'; });
         return 0;
     }
+
+    // Opt-in structured output. The default stays a single bare number, because runner.py
+    // parses it with float(stdout) and every CSV already on disk depends on that.
+    bool metrics = false;
+    for (int a = 1; a < argc; ++a)
+        if (std::string(argv[a]) == "--metrics") metrics = true;
 
     if (argc < 6) {
         usage(argv[0]);
@@ -188,14 +260,30 @@ int main(int argc, char** argv) {
 
     // One branch per registered entry; the matching one is instantiated with the
     // concrete type and everything below runs monomorphically.
+    bool lost = false;
     const bool matched = registry::dispatch_impl(
-        registry::All<TestItem>{}, name, [&]<typename Q>() {
+        BenchSet<TestItem>{}, name, [&]<typename Q>() {
             Benchmark<Q> bench(producers, consumers, items, capacity);
             if (pin) bench.set_pinning();
             bench.set_producer_delay(prod);
             bench.set_consumer_delay(cons);
-            std::cout << bench.execute() << "\n";
+            const long double rate = bench.execute();
+
+            // The gate. A run that loses or duplicates items must not report a throughput --
+            // this tree has had three segments do exactly that while looking fast.
+            if (bench.produced() != bench.consumed()) {
+                std::cerr << "LOST ITEMS: produced=" << bench.produced()
+                          << " consumed=" << bench.consumed()
+                          << " delta=" << static_cast<int64_t>(bench.produced()) -
+                                             static_cast<int64_t>(bench.consumed())
+                          << "\n";
+                lost = true;
+                return;
+            }
+            if (metrics) emit_metrics(bench, rate, items);
+            else std::cout << rate << "\n";
         });
+    if (lost) return 2;
 
     if (!matched) {
         std::cerr << "unknown queue: " << name << "\n\n";

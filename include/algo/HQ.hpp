@@ -113,6 +113,8 @@ class HQ : public mem::SingleBlock<HQ<T, Opt, Link, Tag>> {
     static constexpr std::size_t kPatience =
         static_cast<std::size_t>(Opt::template get<HQOpt::patience, std::size_t{1024}>);
 
+    static constexpr bool no_patience = kPatience == 0;
+
 public:
     /// Loads a consumer spends on a straggling producer; see HQOpt::patience.
     static constexpr std::size_t patience = kPatience;
@@ -384,14 +386,15 @@ private:
 
                 // Something *is* published behind this index, so the head has to get
                 // past it. Give the producer a bounded chance to land first.
-                for (std::size_t i = 0; i < kPatience; ++i) {
-                    w = c.val.load(std::memory_order_acquire);
-                    if (!is_empty_w(w)) break; // resolved, either payload or consumed
-                    SPIN_HINT();
-                }
-                if (is_consumed_w(w)) { // another consumer got there; help head along
-                    (void)head_.compare_exchange_weak(h, h + 1, std::memory_order_relaxed);
-                    continue;
+                if constexpr (!no_patience) {
+                    for (std::size_t i = 0; i < kPatience; ++i) {
+                        w = c.val.load(std::memory_order_acquire);
+                        if (!is_empty_w(w)) break; // resolved, either payload or consumed
+                    }
+                    if (is_consumed_w(w)) { // another consumer got there; help head along
+                        (void)head_.compare_exchange_weak(h, h + 1, std::memory_order_relaxed);
+                        continue;
+                    }
                 }
             }
 

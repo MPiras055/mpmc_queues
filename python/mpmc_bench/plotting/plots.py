@@ -19,7 +19,10 @@ from .styles import style_for
 
 logger = logging.getLogger("mpmc.plot")
 
-__all__ = ["PlotConfig", "plot_throughput", "plot_scalability", "main"]
+__all__ = [
+    "PlotConfig", "plot_throughput", "plot_scalability",
+    "plot_slot_efficiency", "plot_segments_per_item", "plot_backoff_grid", "main",
+]
 
 
 @dataclass
@@ -119,10 +122,122 @@ def plot_scalability(df, config: PlotConfig, baseline_threads: int = 2):
     return fig
 
 
+def _require(df, columns: list[str], what: str):
+    """Metrics columns only exist when the sweep ran with `metrics: true`."""
+    missing = [c for c in columns if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"{what} needs {', '.join(missing)}, which this CSV does not have. "
+            "Re-run the experiment with \"metrics\": true (it drives the benchmark's "
+            "--metrics mode)."
+        )
+    if df.empty:
+        raise ValueError("nothing to plot: the filters matched no rows")
+
+
+def plot_slot_efficiency(df, config: PlotConfig):
+    """Slot efficiency against thread count, one line per implementation.
+
+    eta = i / (S*n): the fraction of provisioned cells that actually carried an item. This is
+    the headline for the HybridQueue claim -- FAAArray without backoff should collapse while HQ
+    stays flat, because HQ's slowDequeue stops consumers invalidating cells a producer is still
+    working on.
+    """
+    _require(df, ["SlotEfficiency", "Total_Threads"], "plot_slot_efficiency")
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    for name in dataio.queues_in(df):
+        group = df[df["Queue"] == name].dropna(subset=["SlotEfficiency"])
+        if group.empty:
+            continue
+        agg = group.groupby("Total_Threads", as_index=False).agg({"SlotEfficiency": "median"})
+        st = style_for(str(name))
+        ax.plot(agg["Total_Threads"], agg["SlotEfficiency"], label=st.label, color=st.color,
+                marker=st.marker, linestyle=st.linestyle, markersize=5, linewidth=1.5)
+    ax.set_ylim(0, 1.05)
+    _finalise(fig, ax, config)
+    return fig
+
+
+def plot_segments_per_item(df, config: PlotConfig):
+    """S/i -- allocation pressure. PRQ and an untuned FAAArray should stand out."""
+    _require(df, ["Segments", "Produced", "Total_Threads"], "plot_segments_per_item")
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    for name in dataio.queues_in(df):
+        group = df[df["Queue"] == name].dropna(subset=["Segments", "Produced"]).copy()
+        if group.empty:
+            continue
+        group["SegPerItem"] = group["Segments"] / group["Produced"]
+        agg = group.groupby("Total_Threads", as_index=False).agg({"SegPerItem": "median"})
+        st = style_for(str(name))
+        ax.plot(agg["Total_Threads"], agg["SegPerItem"], label=st.label, color=st.color,
+                marker=st.marker, linestyle=st.linestyle, markersize=5, linewidth=1.5)
+    ax.set_yscale("log")
+    _finalise(fig, ax, config)
+    return fig
+
+
+def plot_backoff_grid(df, config: PlotConfig, value: str = "Throughput_Median"):
+    """Heatmap over patience x thread count, for the backoff grid-search.
+
+    Queue names carry the value (`u-faa-p1024`), so the patience axis is recovered from the
+    name rather than needing a column. Rows are sorted numerically, not lexically, or 1024
+    sorts before 16.
+    """
+    _require(df, [value, "Total_Threads"], "plot_backoff_grid")
+
+    rows = []
+    for name in dataio.queues_in(df):
+        base, _, suffix = str(name).rpartition("-p")
+        if not suffix.isdigit():
+            continue      # not a backoff variant; skip rather than guess
+        group = df[df["Queue"] == name]
+        for threads, sub in group.groupby("Total_Threads"):
+            rows.append((base, int(suffix), int(threads), sub[value].median()))
+    if not rows:
+        raise ValueError(
+            "no backoff variants found. Names must end in '-p<N>', which the "
+            "registry::Tuning entries do (u-faa-p0, u-hq-p1024, ...)."
+        )
+
+    families = sorted({r[0] for r in rows})
+    fig, axes = plt.subplots(1, len(families), figsize=(6 * len(families), 4.5), squeeze=False)
+    for ax, fam in zip(axes[0], families):
+        sub = [r for r in rows if r[0] == fam]
+        patiences = sorted({r[1] for r in sub})
+        threads = sorted({r[2] for r in sub})
+        grid = [[next((r[3] for r in sub if r[1] == p and r[2] == t), float("nan"))
+                 for t in threads] for p in patiences]
+        im = ax.imshow(grid, aspect="auto", origin="lower", cmap="viridis")
+        ax.set_xticks(range(len(threads)), [str(t) for t in threads])
+        ax.set_yticks(range(len(patiences)), [str(p) for p in patiences])
+        ax.set_xlabel("Total threads")
+        ax.set_ylabel("patience")
+        ax.set_title(fam)
+        fig.colorbar(im, ax=ax, label=value)
+    fig.suptitle(config.title)
+    fig.tight_layout()
+    if config.save_path:
+        fig.savefig(config.save_path, dpi=150)
+        logger.info("saved %s", config.save_path)
+    if config.show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="mpmc-plot", description="Plot benchmark results.")
     parser.add_argument("csv", help="results CSV produced by mpmc-run")
-    parser.add_argument("--kind", choices=["throughput", "scalability"], default="throughput")
+    parser.add_argument(
+        "--kind",
+        choices=["throughput", "scalability", "slot-efficiency", "segments-per-item",
+                 "backoff-grid"],
+        default="throughput",
+        help="the last three need a CSV produced with \"metrics\": true",
+    )
     parser.add_argument("--queues", nargs="*", help="implementations to include (default: all)")
     parser.add_argument("--size", type=int, nargs="*", help="queue capacities to include")
     parser.add_argument("--pin", dest="pin", action="store_true", default=None)
@@ -130,8 +245,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--prod-delay", type=int, nargs="*", help="producer delays (ns)")
     parser.add_argument("--cons-delay", type=int, nargs="*", help="consumer delays (ns)")
     parser.add_argument("--baseline", type=int, default=2, help="threads to normalise scalability against")
-    parser.add_argument("--scale", type=float, default=1e6)
-    parser.add_argument("--ylabel", default="Millions of ops/sec")
+    parser.add_argument("--scale", type=float, default=None,
+                        help="divide the y values (default: 1e6 for throughput, else 1)")
+    parser.add_argument("--ylabel", default=None, help="default depends on --kind")
     parser.add_argument("--title", default=None)
     parser.add_argument("--logx", action="store_true")
     parser.add_argument("--save", help="write the figure here instead of showing it")
@@ -155,15 +271,29 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
 
+        defaults = {
+            "throughput": (1e6, "Millions of ops/sec"),
+            "scalability": (1.0, "Speedup vs baseline"),
+            "slot-efficiency": (1.0, "Slot efficiency  i / (S*n)"),
+            "segments-per-item": (1.0, "Segments per item  S / i"),
+            "backoff-grid": (1.0, "Throughput (median)"),
+        }
+        scale, ylabel = defaults[args.kind]
         cfg = PlotConfig(
             title=args.title or f"{Path(args.csv).stem} ({args.kind})",
-            ylabel=args.ylabel, scale=args.scale, logx=args.logx,
+            ylabel=args.ylabel or ylabel,
+            scale=args.scale if args.scale is not None else scale,
+            logx=args.logx,
             show=args.save is None, save_path=args.save,
         )
-        if args.kind == "throughput":
-            plot_throughput(df, cfg)
-        else:
-            plot_scalability(df, cfg, args.baseline)
+        kinds = {
+            "throughput": lambda: plot_throughput(df, cfg),
+            "scalability": lambda: plot_scalability(df, cfg, args.baseline),
+            "slot-efficiency": lambda: plot_slot_efficiency(df, cfg),
+            "segments-per-item": lambda: plot_segments_per_item(df, cfg),
+            "backoff-grid": lambda: plot_backoff_grid(df, cfg),
+        }
+        kinds[args.kind]()
         return 0
 
     except (FileNotFoundError, ValueError) as exc:

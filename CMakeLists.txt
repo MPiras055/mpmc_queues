@@ -203,9 +203,17 @@ target_compile_definitions(timeTicks PRIVATE NDEBUG)
 if(BUILD_BENCHMARK)
     add_executable(benchmark src/bench/main.cpp)
     target_link_libraries(benchmark PRIVATE mpmc project_opt)
+
+    # Same source, same harness, different registry list -- so the tuning sweep cannot drift
+    # from the headline one in how it measures. See registry::Tuning.
+    add_executable(mpmc_tune src/bench/main.cpp)
+    target_link_libraries(mpmc_tune PRIVATE mpmc project_opt)
+    target_compile_definitions(mpmc_tune PRIVATE MPMC_BENCH_TUNING)
     if(MPMC_LTO_FLAG)
         target_compile_options(benchmark PRIVATE ${MPMC_LTO_FLAG})
         target_link_options(benchmark PRIVATE ${MPMC_LTO_FLAG})
+        target_compile_options(mpmc_tune PRIVATE ${MPMC_LTO_FLAG})
+        target_link_options(mpmc_tune PRIVATE ${MPMC_LTO_FLAG})
     endif()
     target_compile_definitions(
     benchmark 
