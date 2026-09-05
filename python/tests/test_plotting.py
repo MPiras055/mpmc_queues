@@ -69,8 +69,29 @@ class TestFilters:
 
     def test_scalability_skips_queues_without_a_baseline(self, csv_file):
         df = dataio.load_results(csv_file)
-        df = df[df["Total_Threads"] != 2]           # remove every baseline point
-        assert list(dataio.scalability(df, baseline_threads=2)) == []
+        smallest = int(df["Producers"].min())
+        df = df[df["Producers"] != smallest]        # remove every baseline point
+        assert list(dataio.scalability(df, smallest)) == []
+
+    def test_scalability_normalises_on_producers_not_threads(self, csv_file):
+        """Consumers add no production capacity, so they must not count as scaling.
+
+        Two sweeps at the same *total* thread count but different producer counts must not be
+        held to the same speedup: that is what made the ideal line unreachable for a
+        consumer-heavy sweep.
+        """
+        df = dataio.load_results(csv_file)
+        base = int(df["Producers"].min())
+        for _, group in dataio.scalability(df, base):
+            # The x the plot uses is Producers, and the baseline row sits at exactly 1.0.
+            at_base = group[group["Producers"] == base]["Scalability"]
+            assert not at_base.empty and at_base.iloc[0] == pytest.approx(1.0)
+
+    def test_stat_column_falls_back_when_median_absent(self, csv_file):
+        """Older CSVs predate Throughput_Median; they must still plot, not raise."""
+        df = dataio.load_results(csv_file)
+        df = df.drop(columns=[c for c in ("Throughput_Median",) if c in df.columns])
+        assert dataio.stat_column(df, "median") == "Throughput_Mean"
 
 
 class TestStyles:

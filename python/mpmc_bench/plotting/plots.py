@@ -55,23 +55,28 @@ def _finalise(fig, ax, config: PlotConfig) -> None:
         plt.close(fig)
 
 
-def plot_throughput(df, config: PlotConfig):
-    """Throughput against total thread count, one line per implementation."""
+def plot_throughput(df, config: PlotConfig, stat: str = "median"):
+    """Throughput against total thread count, one line per implementation.
+
+    Total threads here, not producers: this chart is about offered load and the contention it
+    creates, which every thread contributes to. Only plot_scalability normalises on producers.
+    """
     if df.empty:
         raise ValueError("nothing to plot: the filters matched no rows")
 
+    col = dataio.stat_column(df, stat)
     fig, ax = plt.subplots(figsize=(9, 5.5))
     for name in dataio.queues_in(df):
         group = df[df["Queue"] == name].sort_values("Total_Threads")
         # Several rows can share a thread count (repeats, or sizes left unfiltered);
         # average them rather than drawing a zigzag between duplicate x values.
         agg = group.groupby("Total_Threads", as_index=False).agg(
-            {"Throughput_Mean": "mean", "Throughput_StdDev": "mean"}
+            {col: "mean", "Throughput_StdDev": "mean"}
         )
         st = style_for(str(name))
         ax.errorbar(
             agg["Total_Threads"],
-            agg["Throughput_Mean"] / config.scale,
+            agg[col] / config.scale,
             yerr=agg["Throughput_StdDev"] / config.scale,
             label=st.label, color=st.color, marker=st.marker, linestyle=st.linestyle,
             capsize=3, markersize=5, linewidth=1.5,
@@ -80,19 +85,33 @@ def plot_throughput(df, config: PlotConfig):
     return fig
 
 
-def plot_scalability(df, config: PlotConfig, baseline_threads: int = 2):
-    """Speedup relative to @p baseline_threads, against ideal linear scaling."""
+def plot_scalability(df, config: PlotConfig, baseline_producers: int | None = None,
+                     stat: str = "median"):
+    """Speedup relative to @p baseline_producers, against ideal linear scaling.
+
+    Scaled on **producers**, not on total threads: consumers do not add production capacity, so
+    an axis that counts them asks for speedup the configuration cannot deliver. See
+    dataio.scalability.
+    """
     if df.empty:
         raise ValueError("nothing to plot: the filters matched no rows")
+
+    if baseline_producers is None:
+        # The smallest producer count actually measured. A fixed default cannot work across
+        # sweeps -- [1,1] starts at 1 producer, [3,1] at 3 -- and erroring by default only
+        # trains people to pass a flag without thinking about it.
+        baseline_producers = int(df["Producers"].min())
+        logger.info("normalising against %d producer(s), the smallest in this data",
+                    baseline_producers)
 
     fig, ax = plt.subplots(figsize=(9, 5.5))
     plotted, skipped = 0, []
     present = set(dataio.queues_in(df))
 
-    for name, group in dataio.scalability(df, baseline_threads):
+    for name, group in dataio.scalability(df, baseline_producers, stat):
         st = style_for(name)
         ax.plot(
-            group["Total_Threads"], group["Scalability"],
+            group["Producers"], group["Scalability"],
             label=st.label, color=st.color, marker=st.marker, linestyle=st.linestyle,
             markersize=5, linewidth=1.5,
         )
@@ -104,20 +123,23 @@ def plot_scalability(df, config: PlotConfig, baseline_threads: int = 2):
         # Say so rather than quietly omitting lines: without a baseline point there is no
         # honest way to normalise, and an absent line is easy to miss.
         logger.warning(
-            "no %d-thread baseline for %s; omitted from the scalability plot",
-            baseline_threads, ", ".join(skipped),
+            "no %d-producer baseline for %s; omitted from the scalability plot",
+            baseline_producers, ", ".join(skipped),
         )
     if not plotted:
         raise ValueError(
-            f"no implementation has a {baseline_threads}-thread measurement to normalise against"
+            f"no implementation has a {baseline_producers}-producer measurement to normalise "
+            f"against (--baseline counts producers, not threads)"
         )
 
-    threads = sorted(df["Total_Threads"].unique())
+    producers = sorted(df["Producers"].unique())
     ax.plot(
-        threads, [t / baseline_threads for t in threads],
+        producers, [p / baseline_producers for p in producers],
         label="Ideal (linear)", color="#777777", linestyle="--", linewidth=1,
     )
-    cfg = PlotConfig(**{**config.__dict__, "ylabel": f"Speedup vs {baseline_threads} threads"})
+    cfg = PlotConfig(**{**config.__dict__,
+                        "xlabel": "Producers",
+                        "ylabel": f"Speedup vs {baseline_producers} producer(s)"})
     _finalise(fig, ax, cfg)
     return fig
 
@@ -244,7 +266,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-pin", dest="pin", action="store_false")
     parser.add_argument("--prod-delay", type=int, nargs="*", help="producer delays (ns)")
     parser.add_argument("--cons-delay", type=int, nargs="*", help="consumer delays (ns)")
-    parser.add_argument("--baseline", type=int, default=2, help="threads to normalise scalability against")
+    parser.add_argument("--baseline", type=int, default=None,
+                        help="PRODUCERS to normalise scalability against "
+                             "(default: the smallest present). Counts producers, not threads: "
+                             "consumers add no production capacity")
+    parser.add_argument("--stat", choices=["median", "mean"], default="median",
+                        help="throughput estimator (default: median; the mean is dragged by "
+                             "clock-ramp outliers)")
     parser.add_argument("--scale", type=float, default=None,
                         help="divide the y values (default: 1e6 for throughput, else 1)")
     parser.add_argument("--ylabel", default=None, help="default depends on --kind")
@@ -287,11 +315,12 @@ def main(argv: list[str] | None = None) -> int:
             show=args.save is None, save_path=args.save,
         )
         kinds = {
-            "throughput": lambda: plot_throughput(df, cfg),
-            "scalability": lambda: plot_scalability(df, cfg, args.baseline),
+            "throughput": lambda: plot_throughput(df, cfg, args.stat),
+            "scalability": lambda: plot_scalability(df, cfg, args.baseline, args.stat),
             "slot-efficiency": lambda: plot_slot_efficiency(df, cfg),
             "segments-per-item": lambda: plot_segments_per_item(df, cfg),
-            "backoff-grid": lambda: plot_backoff_grid(df, cfg),
+            "backoff-grid": lambda: plot_backoff_grid(
+                df, cfg, dataio.stat_column(df, args.stat)),
         }
         kinds[args.kind]()
         return 0

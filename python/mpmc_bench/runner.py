@@ -72,6 +72,12 @@ class Point:
 
         Straight from the notes. Derived here rather than in the C++ so the definition lives in
         one place, and it needs no per-cell instrumentation -- only the segment count.
+
+        **Only meaningful for write-once segments** (FAAArray, HQ), where a cell is used once and
+        a new segment must be linked every `n` items. A circular ring -- PRQ, SCQ, Vyukov -- 
+        reuses its slots as consumers drain, so it can carry far more than `S * n` items and the
+        ratio is not a waste figure at all. Measured: PRQ moved 200k items through 19 segments at
+        4P/4C, and 195 of them at 8P/1C, purely because the starved consumer let the ring fill.
         """
         S = self.metrics.get("segments_linked")
         n = self.metrics.get("segment_capacity")
@@ -79,8 +85,15 @@ class Point:
         if not S or not n or not i:
             return "", "", ""
         total = S * n
-        if total < i:  # S or n misread; better blank than a nonsense efficiency
-            logger.warning("%s: S*n (%g) < items (%g); skipping efficiency", self.queue, total, i)
+        if total < i:
+            # Either a circular ring reusing slots (expected, and the ratio does not apply), or
+            # a genuine undercount of S. Blank beats publishing a ratio above 1 that would read
+            # as "better than perfect".
+            logger.info(
+                "%s: S*n (%g) < items (%g) -- slots were reused, so slot efficiency does not "
+                "apply to this queue; expected for circular rings, a bug for write-once ones",
+                self.queue, total, i,
+            )
             return "", "", ""
         return f"{total - i:.0f}", f"{(total - i) / S:.2f}", f"{i / total:.4f}"
 

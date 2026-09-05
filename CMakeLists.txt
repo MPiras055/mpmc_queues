@@ -209,10 +209,19 @@ if(BUILD_BENCHMARK)
     add_executable(mpmc_tune src/bench/main.cpp)
     target_link_libraries(mpmc_tune PRIVATE mpmc project_opt)
     target_compile_definitions(mpmc_tune PRIVATE MPMC_BENCH_TUNING)
+
+    # Third list, same harness again: CAS1 (LFring) against emulated CAS2 (PSCQ). Separate
+    # because it is the one sweep that must feed a restricted value space -- see
+    # queue::LFringQueue for why LFring cannot carry an arbitrary payload.
+    add_executable(mpmc_cas src/bench/main.cpp)
+    target_link_libraries(mpmc_cas PRIVATE mpmc project_opt)
+    target_compile_definitions(mpmc_cas PRIVATE MPMC_BENCH_CAS)
     if(MPMC_LTO_FLAG)
         target_compile_options(benchmark PRIVATE ${MPMC_LTO_FLAG})
         target_link_options(benchmark PRIVATE ${MPMC_LTO_FLAG})
         target_compile_options(mpmc_tune PRIVATE ${MPMC_LTO_FLAG})
+        target_compile_options(mpmc_cas PRIVATE ${MPMC_LTO_FLAG})
+        target_link_options(mpmc_cas PRIVATE ${MPMC_LTO_FLAG})
         target_link_options(mpmc_tune PRIVATE ${MPMC_LTO_FLAG})
     endif()
     target_compile_definitions(

@@ -3,6 +3,7 @@
 #include <core/Construction.hpp>
 #include <algo/HQ.hpp>
 #include <algo/Spin.hpp>
+#include <registry/Adapters.hpp>
 #include <algo/LFring.hpp>
 #include <algo/Mutex.hpp>
 #include <algo/PRQ.hpp>
@@ -216,6 +217,22 @@ using Backoff = meta::TypeList<
 /// What `mpmc_tune` sweeps.
 template <typename T>
 using Tuning = meta::concat<Instrumented<T>, Backoff<T>>;
+
+/**
+ * @brief CAS1 against emulated CAS2, at identical ring geometry.
+ *
+ * Both are standalone bounded rings allocating `2n` cells and reporting the same `capacity()`,
+ * so the difference measured is the cell protocol: LFring's single-word compare-exchange against
+ * PSCQ's three-step 128-bit transaction.
+ *
+ * Kept out of `All` because LFring carries **indices, not payloads** -- see queue::LFringQueue.
+ * The `mpmc_cas` binary feeds both entries the same even values from `[2, 2n)`, which the other
+ * two binaries must not do.
+ */
+template <typename T>
+using CasCompare = meta::TypeList<
+    Entry<"pscq", queue::PSCQ<T>>,
+    Entry<"lfring", queue::LFringQueue<T>>>;
 
 /// Everything, for the benchmark.
 template <typename T>

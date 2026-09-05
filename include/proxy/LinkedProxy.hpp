@@ -77,6 +77,7 @@ struct SegmentStatsOff {
     // constexpr void on_link() const noexcept {}
     // constexpr void on_retire() const noexcept {}
     // constexpr void on_discard() const noexcept {}
+    constexpr void count_sentinel() const noexcept {}
 };
 
 /**
@@ -91,6 +92,18 @@ struct SegmentStatsOn {
     // void on_link() noexcept { linked_.fetch_add(1, std::memory_order_relaxed); }
     // void on_retire() noexcept { retired_.fetch_add(1, std::memory_order_relaxed); }
     // void on_discard() noexcept { discarded_.fetch_add(1, std::memory_order_relaxed); }
+
+    /**
+     * @brief Count the sentinel segment, which no thread-local tally will ever carry.
+     *
+     * The one write on this side that is not an absorb. The constructor links the sentinel
+     * while holding a *source* session, not a proxy one, so `session::hand_back()` never runs
+     * for it -- and the node goes inactive as soon as the constructor returns, which puts it
+     * out of reach of `live_stats()` too. Counting it thread-locally loses it entirely: every
+     * queue then reports one segment too few, `S * n` comes out below the item count, and the
+     * slot-efficiency columns blank themselves rather than publish a nonsense ratio.
+     */
+    void count_sentinel() noexcept { linked_.fetch_add(1, std::memory_order_relaxed); }
 
     /**
      * @brief: Fold a LocalSegmentStats into this one
@@ -366,9 +379,16 @@ public:
         //initialize head and tail
         head_.store(*sentinel, std::memory_order_relaxed);
         tail_.store(*sentinel, std::memory_order_relaxed);
-        // Straight to the shared counter: this is the sentinel, written once by the
-        // constructing thread, which has no proxy session to flush a local tally through.
-        g.payload().seg.on_link();
+        // Straight to the shared counter, and it has to be. The thread-local tally is only
+        // ever drained by session::hand_back(), and this constructor holds a *source* session
+        // (`s` above), not a proxy one -- so nothing would flush it. Worse, the node goes
+        // inactive when `s` dies at the end of this body, and live_stats() walks only active
+        // nodes, so the count would be unreachable from both directions.
+        //
+        // That is not hypothetical: routing the sentinel through g.payload() made every queue
+        // report exactly one segment too few, which showed up as S*n < items and blanked the
+        // slot-efficiency columns.
+        stats_.count_sentinel();
     }
 
     /// Delete copy constructor and copy assignment

@@ -365,14 +365,14 @@ ops/sec", the ratios do not. Override with `--scale` and `--ylabel` if you need 
 `--list` prints the queues present in the CSV, which is the quickest way to see what a sweep
 actually produced. Everything else filters rows before plotting:
 
-| flag | effect |
-| --- | --- |
-| `--queues u-faa-p0 u-hq-p0` | only these implementations (default: all) |
-| `--size 1024 4096` | only these capacities |
-| `--pin` / `--no-pin` | only pinned, or only unpinned, runs |
-| `--prod-delay 0` / `--cons-delay 0` | only these simulated-work levels, in ns |
-| `--baseline 4` | thread count `scalability` normalises against |
-| `--logx`, `--title`, `--ylabel`, `--scale` | axes |
+| flag                                       | effect                                        |
+| ------------------------------------------ | --------------------------------------------- |
+| `--queues u-faa-p0 u-hq-p0`                | only these implementations (default: all)     |
+| `--size 1024 4096`                         | only these capacities                         |
+| `--pin` / `--no-pin`                       | only pinned, or only unpinned, runs           |
+| `--prod-delay 0` / `--cons-delay 0`        | only these simulated-work levels, in ns       |
+| `--baseline 4`                             | thread count `scalability` normalises against |
+| `--logx`, `--title`, `--ylabel`, `--scale` | axes                                          |
 
 Filtering matters once a sweep has more than one size or delay in it: without `--size`, rows at
 different capacities are averaged together at the same x, and the line is a blend of two

@@ -34,8 +34,10 @@ using TestItem = uint64_t*;
  * variants — so the two binaries cannot drift in how they measure. See Registry.hpp for why the
  * tuning entries are kept out of `All`.
  */
-#ifdef MPMC_BENCH_TUNING
+#if defined(MPMC_BENCH_TUNING)
 template <typename T> using BenchSet = registry::Tuning<T>;
+#elif defined(MPMC_BENCH_CAS)
+template <typename T> using BenchSet = registry::CasCompare<T>;
 #else
 template <typename T> using BenchSet = registry::All<T>;
 #endif
@@ -66,14 +68,36 @@ public:
      *  - `algo::VyukovNoABA` encodes an empty cell as a word with the top *and* bottom bits set,
      *    which an even word can never collide with.
      */
+#ifdef MPMC_BENCH_CAS
+    /**
+     * The CAS1/CAS2 comparison shares one value space, because LFring cannot carry an arbitrary
+     * payload: it is an index ring, and `enqueue` folds the value into the low `log2(n)` bits
+     * with the cycle counter above them, so only `[0, n)` survives the round trip.
+     *
+     * Both queues therefore get the same even values from `[2, n)`, `n` being the physical cell
+     * count. Repeating them across laps is sound precisely because both algorithms are ABA-free
+     * -- that is the property being relied on, not an accident of the harness.
+     */
+    TestItem encode(uint64_t seq) const noexcept {
+        const uint64_t span = (value_span_ - 2) / 2;   // usable evens: 2, 4, ... span_-2
+        return std::bit_cast<TestItem>(2 + 2 * (seq % span));
+    }
+#else
     static TestItem encode(uint64_t seq) noexcept {
         return std::bit_cast<TestItem>((seq + 1) * 2);
     }
+#endif
 
     Benchmark(size_t producers, size_t consumers, uint64_t items, size_t capacity)
         : producers_{producers}, consumers_{consumers}, items_{items},
           instance_{capacity} {
         assert(producers_ != 0 && consumers_ != 0 && items_ != 0);
+#ifdef MPMC_BENCH_CAS
+        // Read back from the constructed queue, not from the request: both algorithms round the
+        // capacity up to a power of two, and the value space is twice that.
+        value_span_ = 2 * static_cast<uint64_t>(instance_.get().capacity());
+        assert(value_span_ > 2 && "CAS comparison needs a ring with room for at least one value");
+#endif
     }
 
     void set_pinning() { pinning_ = true; }
@@ -158,6 +182,10 @@ private:
     size_t producers_, consumers_;
     uint64_t items_;
     registry::Instance<Queue> instance_;
+#ifdef MPMC_BENCH_CAS
+    /// Physical cell count: the exclusive upper bound of the shared value space. See encode().
+    uint64_t value_span_ = 0;
+#endif
     util::threading::ThreadPinner pinner_;
     bool pinning_ = false;
     Delay prod_delay_{}, cons_delay_{};
@@ -193,6 +221,16 @@ void emit_metrics(B& bench, long double rate, uint64_t items) {
         std::cout << "segments_linked=" << bench.queue().segments_linked() << "\n"
                   << "segments_retired=" << bench.queue().segments_retired() << "\n"
                   << "segments_discarded=" << bench.queue().segments_discarded() << "\n";
+        if constexpr (requires {bench.queue().segment_capacity();}) {
+            //compute waste and efficiency slots metrics
+            const uint32_t linked = bench.queue().segments_linked();
+            const uint32_t wasted_total   = (linked * bench.queue().segment_capacity()) - items;
+            const float wasted_average = static_cast<float>(wasted_total) / linked;
+            const float efficiency     = 1 - (wasted_average / static_cast<float>(bench.queue().segment_capacity()));
+            std::cout   << "slot wasted (total)=" << wasted_total << "\n"
+                        << "slot wasted (avg)= " << wasted_average << "\n"
+                        << "slot efficiency= " << efficiency << "\n";
+        }
     }
     (void)sizeof(Q);
 }

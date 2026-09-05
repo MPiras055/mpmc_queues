@@ -70,6 +70,11 @@ def load_results(csv_path: str | Path) -> pd.DataFrame:
     # Older CSVs wrote the literal "FAILED" into the throughput column.
     df = df[pd.to_numeric(df["Throughput_Mean"], errors="coerce").notna()].copy()
     df["Throughput_Mean"] = df["Throughput_Mean"].astype(float)
+    # Median/min/max arrived later than mean/stdev, so a CSV recorded before them has only the
+    # mean. Coerce whichever are present; stat_column() decides which one a plot may use.
+    for col in ("Throughput_Median", "Throughput_Min", "Throughput_Max"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     if "Throughput_StdDev" in df.columns:
         df["Throughput_StdDev"] = pd.to_numeric(
             df["Throughput_StdDev"], errors="coerce"
@@ -101,18 +106,40 @@ def queues_in(df: pd.DataFrame) -> list[str]:
     return list(dict.fromkeys(df["Queue"].tolist()))
 
 
-def scalability(df: pd.DataFrame, baseline_threads: int = 2) -> Iterable[tuple[str, pd.DataFrame]]:
-    """Yield (queue, frame) with a Scalability column relative to @p baseline_threads.
+def stat_column(df: pd.DataFrame, stat: str = "median") -> str:
+    """Which throughput column a plot should read.
 
-    A queue with no measurement at the baseline thread count is skipped, with its name
-    reported by the caller -- normalising against a missing point would silently invent a
-    speedup.
+    `median` is the right estimator -- the runner records it for that reason, since a clock
+    that ramps drags the mean -- but it only exists in CSVs written after it was added. Falling
+    back keeps older result files plottable instead of raising at them.
     """
+    wanted = {"median": "Throughput_Median", "mean": "Throughput_Mean"}[stat]
+    if wanted in df.columns and df[wanted].notna().any():
+        return wanted
+    if wanted != "Throughput_Mean":
+        logger.warning("%s is not in this CSV; falling back to Throughput_Mean", wanted)
+    return "Throughput_Mean"
+
+
+def scalability(
+    df: pd.DataFrame, baseline_producers: int, stat: str = "median"
+) -> Iterable[tuple[str, pd.DataFrame]]:
+    """Yield (queue, frame) with a Scalability column relative to @p baseline_producers.
+
+    **Normalised on producers, not on total threads.** Consumers add no production capacity, so
+    counting them as scaling makes the ideal line unreachable by construction: at 64 total
+    threads a balanced sweep has 32 producers and a 1:3 sweep has 16, and crediting both with 64
+    asks the same speedup of two configurations that cannot deliver the same work.
+
+    A queue with no measurement at the baseline is skipped, with its name reported by the
+    caller -- normalising against a missing point would silently invent a speedup.
+    """
+    col = stat_column(df, stat)
     for name, group in df.groupby("Queue", sort=False):
-        group = group.sort_values("Total_Threads")
-        base = group[group["Total_Threads"] == baseline_threads]["Throughput_Mean"]
+        group = group.sort_values("Producers")
+        base = group[group["Producers"] == baseline_producers][col]
         if base.empty or base.iloc[0] <= 0:
             continue
         group = group.copy()
-        group["Scalability"] = group["Throughput_Mean"] / base.iloc[0]
+        group["Scalability"] = group[col] / base.iloc[0]
         yield str(name), group

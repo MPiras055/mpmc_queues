@@ -84,3 +84,6 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .clangd
+noam/
+titanic/
+*.log
