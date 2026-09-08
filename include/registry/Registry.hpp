@@ -1,4 +1,5 @@
 #pragma once
+#include "meta/OptionsPack.hpp"
 #include <algo/FAAArray.hpp>
 #include <core/Construction.hpp>
 #include <algo/HQ.hpp>
@@ -12,6 +13,7 @@
 #include <algo/Vyukov.hpp>
 #include <algo/VyukovDCAS.hpp>
 #include <algo/VyukovNoABA.hpp>
+#include <algo/CRQ.hpp>
 #include <concepts>
 #include <meta/FixedString.hpp>
 #include <variant>
@@ -58,6 +60,8 @@ template <typename T, std::size_t N = kPoolSize>
 using IdxVyukov = seg::Vyukov<T, meta::EmptyOptions, mem::IndexHandle<N>>;
 template <typename T, std::size_t N = kPoolSize>
 using IdxPRQ = seg::PRQ<T, meta::EmptyOptions, mem::IndexHandle<N>>;
+template <typename T, std::size_t N = kPoolSize>
+using IdxCRQ = seg::CRQ<T,meta::EmptyOptions, mem::IndexHandle<N>>;
 template <typename T, std::size_t N = kPoolSize>
 using IdxSCQ = seg::SCQ<T, meta::EmptyOptions, mem::IndexHandle<N>>;
 template <typename T, std::size_t N = kPoolSize>
@@ -117,6 +121,7 @@ template <typename T>
 using Linked = meta::TypeList<
     Entry<"u-vyukov", proxy::Unbounded<T, seg::Vyukov<T>>>,
     Entry<"u-prq", proxy::Unbounded<T, seg::PRQ<T>>>,
+    Entry<"u-crq", proxy::Unbounded<T, seg::CRQ<T>>>,
     Entry<"u-faa", proxy::Unbounded<T, seg::FAAArray<T>>>,
     Entry<"u-hq", proxy::Unbounded<T, seg::HQ<T>>>,
     Entry<"u-scq", proxy::Unbounded<T, seg::SCQ<T>>>,
@@ -128,6 +133,7 @@ using Linked = meta::TypeList<
 
     Entry<"item-vyukov", proxy::ItemBounded<T, seg::Vyukov<T>, kPoolSize>>,
     Entry<"item-prq", proxy::ItemBounded<T, seg::PRQ<T>, kPoolSize>>,
+    Entry<"item-crq", proxy::ItemBounded<T, seg::CRQ<T>, kPoolSize>>,
     Entry<"item-faa", proxy::ItemBounded<T, seg::FAAArray<T>, kPoolSize>>,
     Entry<"item-hq", proxy::ItemBounded<T, seg::HQ<T>, kPoolSize>>,
     Entry<"item-scq", proxy::ItemBounded<T, seg::SCQ<T>, kPoolSize>>,
@@ -139,6 +145,7 @@ using Linked = meta::TypeList<
 
     Entry<"chunk-vyukov", proxy::ChunkBounded<T, seg::Vyukov<T>, kPoolSize>>,
     Entry<"chunk-prq", proxy::ChunkBounded<T, seg::PRQ<T>, kPoolSize>>,
+    Entry<"chunk-crq", proxy::ChunkBounded<T, seg::CRQ<T>, kPoolSize>>,
     Entry<"chunk-faa", proxy::ChunkBounded<T, seg::FAAArray<T>, kPoolSize>>,
     Entry<"chunk-hq", proxy::ChunkBounded<T, seg::HQ<T>, kPoolSize>>,
     Entry<"chunk-scq", proxy::ChunkBounded<T, seg::SCQ<T>, kPoolSize>>,
@@ -153,6 +160,7 @@ using Linked = meta::TypeList<
     // before that they were not recyclable and mem::source::Pool refused them outright.
     Entry<"mem-vyukov", proxy::MemBounded<T, IdxVyukov<T>, kPoolSize>>,
     Entry<"mem-prq", proxy::MemBounded<T, IdxPRQ<T>, kPoolSize>>,
+    Entry<"mem-crq", proxy::MemBounded<T, IdxCRQ<T>, kPoolSize>>,
     Entry<"mem-scq", proxy::MemBounded<T, IdxSCQ<T>, kPoolSize>>,
     Entry<"mem-faa", proxy::MemBounded<T, IdxFAAArray<T>, kPoolSize>>,
     Entry<"mem-hq", proxy::MemBounded<T, IdxHQ<T>, kPoolSize>>,
@@ -193,10 +201,13 @@ using Instrumented = meta::TypeList<
     Entry<"i-u-faa", proxy::Unbounded<T, seg::FAAArray<T>, meta::EmptyOptions, Stats<T>>>,
     Entry<"i-u-hq", proxy::Unbounded<T, seg::HQ<T>, meta::EmptyOptions, Stats<T>>>,
     Entry<"i-u-prq", proxy::Unbounded<T, seg::PRQ<T>, meta::EmptyOptions, Stats<T>>>,
+    Entry<"i-u-crq", proxy::Unbounded<T, seg::CRQ<T>, meta::EmptyOptions, Stats<T>>>,
     Entry<"i-u-pscq", proxy::Unbounded<T, seg::PSCQ<T>, meta::EmptyOptions, Stats<T>>>,
     Entry<"i-u-scq", proxy::Unbounded<T, seg::SCQ<T>, meta::EmptyOptions, Stats<T>>>,
     Entry<"i-u-vyukov", proxy::Unbounded<T, seg::Vyukov<T>, meta::EmptyOptions, Stats<T>>>,
-    Entry<"i-u-noaba", proxy::Unbounded<T, seg::VyukovNoABA<T>, meta::EmptyOptions, Stats<T>>>>;
+    Entry<"i-u-noaba", proxy::Unbounded<T, seg::VyukovNoABA<T>, meta::EmptyOptions, Stats<T>>>,
+    Entry<"i-u-vdcas", proxy::Unbounded<T, seg::VyukovDCAS<T>, meta::EmptyOptions, Stats<T>>>
+>;
 
 /// The backoff grid. `p0` is the no-backoff case the notes expect to fail pathologically.
 template <typename T>
@@ -232,7 +243,9 @@ using Tuning = meta::concat<Instrumented<T>, Backoff<T>>;
 template <typename T>
 using CasCompare = meta::TypeList<
     Entry<"pscq", queue::PSCQ<T>>,
-    Entry<"lfring", queue::LFringQueue<T>>>;
+    Entry<"lfring", queue::LFringQueue<T>>,
+    Entry<"vdcas", queue::VyukovDCAS<T>>
+>;
 
 /// Everything, for the benchmark.
 template <typename T>

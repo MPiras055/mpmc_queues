@@ -248,6 +248,58 @@ acceptance test for anything touching a segment or the proxy:
 timeout 1800 ./build/ConcurrencyTest            # and once per sanitizer config
 ```
 
+### 1b. Running one queue, or a named list
+
+The full `ConcurrencyTest` is five cases across every registry entry — minutes. When the question
+is "did this break `u-pscq`", filter it. GoogleTest can do this directly:
+
+```bash
+./build/ConcurrencyTest --gtest_filter='Mpmc/u_faa.*'                 # one queue
+./build/ConcurrencyTest --gtest_filter='Mpmc/u_faa.*:Mpmc/u_hq.*'     # a list
+```
+
+Two things make that easy to get wrong, and a third makes getting it wrong dangerous:
+
+- **The suite prefix differs per binary**: `Mpmc/` in `ConcurrencyTest`, `QueueBehaviour/` in
+  `RegistryConformanceTest`, `SegmentLifecycle/` in `SegmentLifecycleTest`.
+- **Registry names are mangled.** `registry::TestNames::GetName` replaces every
+  non-alphanumeric character with `_`, so `u-faa` is `u_faa` and `vyukov-dcas` is
+  `vyukov_dcas` in a filter.
+- **gtest exits 0 when a filter matches nothing.** A mistyped queue name is indistinguishable
+  from a passing run — which, for the suite that catches lost items, is the worst way to fail.
+
+`tools/qtest` wraps all three:
+
+```bash
+tools/qtest u-pscq                          # every registry suite, that queue
+tools/qtest u-pscq u-prq u-scq              # a list
+tools/qtest --suite ConcurrencyTest u-hq    # one binary
+tools/qtest --suite SegmentLifecycleTest pscq
+tools/qtest --build-dir /tmp/mpmc-verif-tsan u-pscq
+tools/qtest --list                          # the registry names, unmangled
+tools/qtest u-pscq -- --gtest_repeat=20 --gtest_shuffle
+```
+
+It mangles the names for you, picks the prefix per binary, wraps each run in `timeout` (a lock
+bug hangs rather than fails), passes anything after `--` through to gtest, and **fails when the
+filter selects nothing**:
+
+```
+$ tools/qtest --suite ConcurrencyTest u-faaa
+qtest: filter 'Mpmc/u_faaa.*' matched no tests in ConcurrencyTest
+       (names are mangled: '-' becomes '_'; try tools/qtest --list)
+$ echo $?
+1
+$ ./build/ConcurrencyTest --gtest_filter='Mpmc/u_faaa.*'; echo $?
+0
+```
+
+That contrast is the entire reason the wrapper exists.
+
+`SegmentLifecycleTest` names its instances after the segment (`SegmentLifecycle/pscq`) rather
+than by index; the tokens match the registry's segment spellings (`faa`, `dcas`, `noaba`) so one
+queue name works across every suite. `TaggingTest` is not per-queue — its types are tag schemes.
+
 ### 2. Stress the suites that are timing-dependent
 
 A single green run of these means little; they are cheap, so repeat them.

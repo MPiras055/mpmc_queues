@@ -13,6 +13,9 @@
  */
 #include <gtest/gtest.h>
 
+#include <string>
+#include <type_traits>
+
 #include <algo/FAAArray.hpp>
 #include <algo/HQ.hpp>
 #include <algo/Mutex.hpp>
@@ -66,7 +69,33 @@ using SegmentTypes = ::testing::Types<
     seg::Vyukov<Item>, seg::PRQ<Item>, seg::FAAArray<Item>, seg::HQ<Item>, seg::SCQ<Item>,
     seg::Mutex<Item>, seg::Spin<Item>, seg::PSCQ<Item>, seg::VyukovDCAS<Item>,
     seg::VyukovNoABA<Item>>;
-TYPED_TEST_SUITE(SegmentLifecycle, SegmentTypes);
+/**
+ * @brief Name the instances after the segment, not after its index.
+ *
+ * Without this gtest calls them `SegmentLifecycle/0 … /9`, which cannot be selected by
+ * `--gtest_filter` in any way a reader would guess. The registry-driven suites get named
+ * instances from `registry::TestNames`; these types are not registry entries, so the mapping is
+ * spelled out here. Tokens match the registry's segment spellings (`faa`, `dcas`, `noaba`) so
+ * one queue name works across every suite.
+ */
+struct SegNames {
+    template <typename S>
+    static std::string GetName(int i) {
+        if constexpr (std::is_same_v<S, seg::Vyukov<Item>>) return "vyukov";
+        else if constexpr (std::is_same_v<S, seg::PRQ<Item>>) return "prq";
+        else if constexpr (std::is_same_v<S, seg::FAAArray<Item>>) return "faa";
+        else if constexpr (std::is_same_v<S, seg::HQ<Item>>) return "hq";
+        else if constexpr (std::is_same_v<S, seg::SCQ<Item>>) return "scq";
+        else if constexpr (std::is_same_v<S, seg::Mutex<Item>>) return "mutex";
+        else if constexpr (std::is_same_v<S, seg::Spin<Item>>) return "spin";
+        else if constexpr (std::is_same_v<S, seg::PSCQ<Item>>) return "pscq";
+        else if constexpr (std::is_same_v<S, seg::VyukovDCAS<Item>>) return "dcas";
+        else if constexpr (std::is_same_v<S, seg::VyukovNoABA<Item>>) return "noaba";
+        else return std::to_string(i);   // a type added to the list but not to this map
+    }
+};
+
+TYPED_TEST_SUITE(SegmentLifecycle, SegmentTypes, SegNames);
 
 TYPED_TEST(SegmentLifecycle, StartsOpenWithNoSuccessor) {
     auto* s = this->make();

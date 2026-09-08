@@ -5,18 +5,25 @@
  * @ingroup util
  */
 
+#include "util/specs.hpp"
+#include <bit>
+#include <concepts>
 #include <cstdint>
-
+#include <type_traits>
 
 namespace p_atomic {
 
+// Any type that fits within a 64-bit machine word and can be bit_cast safely
+template <typename T>
+concept DcasWord = (sizeof(std::remove_cvref_t<T>) == sizeof(uint64_t)) &&
+                   std::is_trivially_copyable_v<std::remove_cvref_t<T>>;
+
 /**
- * @brief Double-width compare-and-swap with expected update.
- * 
+ * @brief Base double-width compare-and-swap (uint64_t primitive).
+ *
  * Atomically compares two consecutive machine words with expected values, 
  * and if they match, replaces them with desired values. If the CAS fails, 
- * the actual values in memory are written back into the @p expected_lo 
- * and @p expected_hi parameters.
+ * the actual values in memory are written back into @p expected_lo and @p expected_hi.
  * 
  * @param addr Pointer to the memory location (must be 16-byte aligned on x86_64).
  * @param expected_lo [in,out] Expected low word; overwritten with actual value on failure.
@@ -34,8 +41,8 @@ inline bool dcas(void* addr,
     uint64_t old_hi = expected_hi;
 
     __asm__ __volatile__ (
-        "lock cmpxchg16b %1\n"
-        "sete %0\n"
+        "lock cmpxchg16b %1\n\t"
+        "sete %0"
         : "=q"(result),
           "+m"(*(volatile __int128*)addr),
           "+a"(old_lo), "+d"(old_hi)
@@ -102,4 +109,47 @@ inline bool dcas(void* addr,
 #endif
 }
 
-}   // namespace portable atomic
+/**
+ * @brief Templated updating DCAS overload.
+ *
+ * Selected only when both expected arguments are non-const lvalues.
+ * Handles bit-casting internally and writes back the latest memory values
+ * into @p expected_lo and @p expected_hi on CAS failure.
+ */
+template <DcasWord ExpLo, DcasWord ExpHi, DcasWord DesLo, DcasWord DesHi>
+requires (!std::is_const_v<ExpLo> && !std::is_const_v<ExpHi>)
+FORCE_INLINE bool dcas(void* addr,
+                       ExpLo& expected_lo, ExpHi& expected_hi,
+                       const DesLo& desired_lo, const DesHi& desired_hi) {
+    uint64_t lo = std::bit_cast<uint64_t>(expected_lo);
+    uint64_t hi = std::bit_cast<uint64_t>(expected_hi);
+
+    const bool success = dcas(addr, lo, hi,
+                              std::bit_cast<uint64_t>(desired_lo),
+                              std::bit_cast<uint64_t>(desired_hi));
+    if (!success) {
+        expected_lo = std::bit_cast<ExpLo>(lo);
+        expected_hi = std::bit_cast<ExpHi>(hi);
+    }
+    return success;
+}
+
+/**
+ * @brief Templated non-updating DCAS overload.
+ *
+ * Selected when expected arguments are passed as rvalues, temporaries,
+ * literals, const references, or mixed types. Expected values are not updated.
+ */
+template <DcasWord ExpLo, DcasWord ExpHi, DcasWord DesLo, DcasWord DesHi>
+FORCE_INLINE bool dcas(void* addr,
+                       ExpLo&& expected_lo, ExpHi&& expected_hi,
+                       const DesLo& desired_lo, const DesHi& desired_hi) {
+    uint64_t lo = std::bit_cast<uint64_t>(expected_lo);
+    uint64_t hi = std::bit_cast<uint64_t>(expected_hi);
+
+    return dcas(addr, lo, hi,
+                std::bit_cast<uint64_t>(desired_lo),
+                std::bit_cast<uint64_t>(desired_hi));
+}
+
+}   // namespace p_atomic

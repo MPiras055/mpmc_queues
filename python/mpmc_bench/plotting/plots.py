@@ -15,7 +15,9 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 from . import data as dataio
-from .styles import style_for
+from . import theme as theming
+from .styles import assign_styles
+from .theme import LIGHT, Theme
 
 logger = logging.getLogger("mpmc.plot")
 
@@ -34,20 +36,55 @@ class PlotConfig:
     logx: bool = False
     show: bool = True
     save_path: str | Path | None = None
+    theme: Theme = LIGHT
+    #: Where to write the plotted values as CSV. On the light theme three palette slots
+    #: measure below 3:1 against the surface, and the relief rule for that answers with
+    #: visible labels *or* a table -- so this is the relief, not a nicety.
+    table_path: str | Path | None = None
 
 
-def _finalise(fig, ax, config: PlotConfig) -> None:
+def write_table(config: PlotConfig, records: list[dict]) -> Path | None:
+    """Write the values a chart actually drew, using its own axis names as headers."""
+    if not config.table_path or not records:
+        return None
+    import pandas as pd
+
+    frame = pd.DataFrame(records).rename(columns={"X": config.xlabel, "Y": config.ylabel})
+    path = Path(config.table_path)
+    frame.to_csv(path, index=False)
+    logger.info("saved %s", path)
+    return path
+
+
+def _legend(ax_or_fig, theme: Theme, handles=None, labels=None, **kwargs):
+    """One legend, in text ink.
+
+    A lone series needs no legend box -- the title already names it -- but two or more
+    always do, because identity must never rest on colour alone.
+    """
+    if handles is None:
+        handles, labels = ax_or_fig.get_legend_handles_labels()
+    if len(handles) < 2:
+        return None
+    leg = ax_or_fig.legend(handles, labels, **kwargs)
+    for text in leg.get_texts():
+        text.set_color(theme.text_secondary)
+    return leg
+
+
+def _finalise(fig, ax, config: PlotConfig, records: list[dict] | None = None) -> None:
     ax.set_title(config.title)
     ax.set_xlabel(config.xlabel)
     ax.set_ylabel(config.ylabel)
     if config.logx:
         ax.set_xscale("log", base=2)
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize="small")
+    theming.style_axes(ax, config.theme)
+    _legend(ax, config.theme)
     fig.tight_layout()
 
+    write_table(config, records or [])
     if config.save_path:
-        fig.savefig(config.save_path, dpi=150)
+        fig.savefig(config.save_path, dpi=150, facecolor=config.theme.surface)
         logger.info("saved %s", config.save_path)
     if config.show:
         plt.show()
@@ -65,15 +102,18 @@ def plot_throughput(df, config: PlotConfig, stat: str = "median"):
         raise ValueError("nothing to plot: the filters matched no rows")
 
     col = dataio.stat_column(df, stat)
+    names = dataio.queues_in(df)
+    styles = assign_styles(names, config.theme)
+    records: list[dict] = []
     fig, ax = plt.subplots(figsize=(9, 5.5))
-    for name in dataio.queues_in(df):
+    for name in names:
         group = df[df["Queue"] == name].sort_values("Total_Threads")
         # Several rows can share a thread count (repeats, or sizes left unfiltered);
         # average them rather than drawing a zigzag between duplicate x values.
         agg = group.groupby("Total_Threads", as_index=False).agg(
             {col: "mean", "Throughput_StdDev": "mean"}
         )
-        st = style_for(str(name))
+        st = styles[str(name)]
         ax.errorbar(
             agg["Total_Threads"],
             agg[col] / config.scale,
@@ -81,7 +121,12 @@ def plot_throughput(df, config: PlotConfig, stat: str = "median"):
             label=st.label, color=st.color, marker=st.marker, linestyle=st.linestyle,
             capsize=3, markersize=5, linewidth=1.5,
         )
-    _finalise(fig, ax, config)
+        records += [
+            {"Series": st.label, "X": x, "Y": y, "YErr": e}
+            for x, y, e in zip(agg["Total_Threads"], agg[col] / config.scale,
+                               agg["Throughput_StdDev"] / config.scale)
+        ]
+    _finalise(fig, ax, config, records)
     return fig
 
 
@@ -105,16 +150,22 @@ def plot_scalability(df, config: PlotConfig, baseline_producers: int | None = No
                     baseline_producers)
 
     fig, ax = plt.subplots(figsize=(9, 5.5))
+    styles = assign_styles(dataio.queues_in(df), config.theme)
+    records: list[dict] = []
     plotted, skipped = 0, []
     present = set(dataio.queues_in(df))
 
     for name, group in dataio.scalability(df, baseline_producers, stat):
-        st = style_for(name)
+        st = styles[name]
         ax.plot(
             group["Producers"], group["Scalability"],
             label=st.label, color=st.color, marker=st.marker, linestyle=st.linestyle,
             markersize=5, linewidth=1.5,
         )
+        records += [
+            {"Series": st.label, "X": x, "Y": y}
+            for x, y in zip(group["Producers"], group["Scalability"])
+        ]
         plotted += 1
         present.discard(name)
 
@@ -133,14 +184,16 @@ def plot_scalability(df, config: PlotConfig, baseline_producers: int | None = No
         )
 
     producers = sorted(df["Producers"].unique())
+    # A reference line, not a series: it takes the muted ink so it never reads as one more
+    # implementation, and so it never eats a palette slot.
     ax.plot(
         producers, [p / baseline_producers for p in producers],
-        label="Ideal (linear)", color="#777777", linestyle="--", linewidth=1,
+        label="Ideal (linear)", color=config.theme.text_muted, linestyle="--", linewidth=1,
     )
     cfg = PlotConfig(**{**config.__dict__,
                         "xlabel": "Producers",
                         "ylabel": f"Speedup vs {baseline_producers} producer(s)"})
-    _finalise(fig, ax, cfg)
+    _finalise(fig, ax, cfg, records)
     return fig
 
 
@@ -168,16 +221,20 @@ def plot_slot_efficiency(df, config: PlotConfig):
     _require(df, ["SlotEfficiency", "Total_Threads"], "plot_slot_efficiency")
 
     fig, ax = plt.subplots(figsize=(9, 5.5))
+    styles = assign_styles(dataio.queues_in(df), config.theme)
+    records: list[dict] = []
     for name in dataio.queues_in(df):
         group = df[df["Queue"] == name].dropna(subset=["SlotEfficiency"])
         if group.empty:
             continue
         agg = group.groupby("Total_Threads", as_index=False).agg({"SlotEfficiency": "median"})
-        st = style_for(str(name))
+        st = styles[str(name)]
         ax.plot(agg["Total_Threads"], agg["SlotEfficiency"], label=st.label, color=st.color,
                 marker=st.marker, linestyle=st.linestyle, markersize=5, linewidth=1.5)
+        records += [{"Series": st.label, "X": x, "Y": y}
+                    for x, y in zip(agg["Total_Threads"], agg["SlotEfficiency"])]
     ax.set_ylim(0, 1.05)
-    _finalise(fig, ax, config)
+    _finalise(fig, ax, config, records)
     return fig
 
 
@@ -186,17 +243,21 @@ def plot_segments_per_item(df, config: PlotConfig):
     _require(df, ["Segments", "Produced", "Total_Threads"], "plot_segments_per_item")
 
     fig, ax = plt.subplots(figsize=(9, 5.5))
+    styles = assign_styles(dataio.queues_in(df), config.theme)
+    records: list[dict] = []
     for name in dataio.queues_in(df):
         group = df[df["Queue"] == name].dropna(subset=["Segments", "Produced"]).copy()
         if group.empty:
             continue
         group["SegPerItem"] = group["Segments"] / group["Produced"]
         agg = group.groupby("Total_Threads", as_index=False).agg({"SegPerItem": "median"})
-        st = style_for(str(name))
+        st = styles[str(name)]
         ax.plot(agg["Total_Threads"], agg["SegPerItem"], label=st.label, color=st.color,
                 marker=st.marker, linestyle=st.linestyle, markersize=5, linewidth=1.5)
+        records += [{"Series": st.label, "X": x, "Y": y}
+                    for x, y in zip(agg["Total_Threads"], agg["SegPerItem"])]
     ax.set_yscale("log")
-    _finalise(fig, ax, config)
+    _finalise(fig, ax, config, records)
     return fig
 
 
@@ -225,6 +286,7 @@ def plot_backoff_grid(df, config: PlotConfig, value: str = "Throughput_Median"):
 
     families = sorted({r[0] for r in rows})
     fig, axes = plt.subplots(1, len(families), figsize=(6 * len(families), 4.5), squeeze=False)
+    fig.set_facecolor(config.theme.surface)
     for ax, fam in zip(axes[0], families):
         sub = [r for r in rows if r[0] == fam]
         patiences = sorted({r[1] for r in sub})
@@ -237,11 +299,22 @@ def plot_backoff_grid(df, config: PlotConfig, value: str = "Throughput_Median"):
         ax.set_xlabel("Total threads")
         ax.set_ylabel("patience")
         ax.set_title(fam)
-        fig.colorbar(im, ax=ax, label=value)
-    fig.suptitle(config.title)
+        # A heatmap is a continuous field; a grid drawn over the cells is only noise.
+        ax.set_facecolor(config.theme.surface)
+        ax.grid(False)
+        ax.tick_params(colors=config.theme.axis, labelcolor=config.theme.text_muted)
+        ax.xaxis.label.set_color(config.theme.text_secondary)
+        ax.yaxis.label.set_color(config.theme.text_secondary)
+        ax.title.set_color(config.theme.text_primary)
+        bar = fig.colorbar(im, ax=ax, label=value)
+        bar.ax.yaxis.label.set_color(config.theme.text_secondary)
+        bar.ax.tick_params(colors=config.theme.axis, labelcolor=config.theme.text_muted)
+    fig.suptitle(config.title, color=config.theme.text_primary)
     fig.tight_layout()
+    write_table(config, [{"Series": r[0], "Patience": r[1], "X": r[2], "Y": r[3]}
+                         for r in rows])
     if config.save_path:
-        fig.savefig(config.save_path, dpi=150)
+        fig.savefig(config.save_path, dpi=150, facecolor=config.theme.surface)
         logger.info("saved %s", config.save_path)
     if config.show:
         plt.show()
@@ -250,9 +323,31 @@ def plot_backoff_grid(df, config: PlotConfig, value: str = "Throughput_Median"):
     return fig
 
 
+#: Per-kind y scaling and axis name. compare.py reads this too, so the panels are labelled
+#: exactly like the single-chart version of the same kind.
+DEFAULTS = {
+    "throughput": (1e6, "Millions of ops/sec"),
+    "scalability": (1.0, "Speedup vs baseline"),
+    "slot-efficiency": (1.0, "Slot efficiency  i / (S*n)"),
+    "segments-per-item": (1.0, "Segments per item  S / i"),
+    "backoff-grid": (1.0, "Throughput (median)"),
+}
+
+
+def _table_path_for(requested: str | None, save_path: str | None) -> Path | None:
+    """Resolve ``--table [PATH]``: explicit path, else beside ``--save``."""
+    if requested is None:
+        return None
+    if requested:
+        return Path(requested)
+    if not save_path:
+        raise ValueError("--table needs a path, or a --save to sit beside")
+    return Path(save_path).with_suffix(".csv")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="mpmc-plot", description="Plot benchmark results.")
-    parser.add_argument("csv", help="results CSV produced by mpmc-run")
+    parser.add_argument("csv", nargs="?", help="results CSV produced by mpmc-run")
     parser.add_argument(
         "--kind",
         choices=["throughput", "scalability", "slot-efficiency", "segments-per-item",
@@ -278,6 +373,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ylabel", default=None, help="default depends on --kind")
     parser.add_argument("--title", default=None)
     parser.add_argument("--logx", action="store_true")
+    parser.add_argument("--theme", choices=sorted(theming.THEMES), default=None,
+                        help=f"colour theme (default: light, or ${theming.ENV_VAR})")
+    parser.add_argument("--label", action="append", metavar="NAME=LABEL",
+                        help="rename one series in the legend; repeatable")
+    parser.add_argument("--labels", metavar="FILE",
+                        help="JSON object of {queue name: legend label}")
+    parser.add_argument("--table", nargs="?", const="", default=None, metavar="FILE",
+                        help="also write the plotted values as CSV (default: beside --save). "
+                             "On the light theme this is the relief the sub-3:1 palette "
+                             "slots oblige, not an extra")
+    parser.add_argument("--compare", metavar="SPEC.json",
+                        help="render side-by-side panels sharing one y-axis; see compare.py")
     parser.add_argument("--save", help="write the figure here instead of showing it")
     parser.add_argument("--list", action="store_true", help="list implementations in the CSV and exit")
     args = parser.parse_args(argv)
@@ -285,6 +392,31 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
     try:
+        from .styles import load_labels, parse_label_assignments, set_labels
+
+        active = theming.apply(theming.resolve(args.theme))
+        set_labels(load_labels(args.labels) if args.labels else None)
+        set_labels(parse_label_assignments(args.label))
+        table_path = _table_path_for(args.table, args.save)
+
+        if args.compare:
+            from .compare import load_spec, plot_compare
+
+            spec = load_spec(args.compare, base_csv=args.csv)
+            scale, ylabel = DEFAULTS[spec.kind]
+            cfg = PlotConfig(
+                title=args.title or spec.title,
+                ylabel=args.ylabel or ylabel,
+                scale=args.scale if args.scale is not None else scale,
+                logx=args.logx, theme=active,
+                show=args.save is None, save_path=args.save, table_path=table_path,
+            )
+            plot_compare(spec, cfg, args.stat)
+            return 0
+
+        if not args.csv:
+            parser.error("a results CSV is required (or --compare with one in the spec)")
+
         df = dataio.load_results(args.csv)
         if args.list:
             for name in dataio.queues_in(df):
@@ -299,20 +431,14 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
 
-        defaults = {
-            "throughput": (1e6, "Millions of ops/sec"),
-            "scalability": (1.0, "Speedup vs baseline"),
-            "slot-efficiency": (1.0, "Slot efficiency  i / (S*n)"),
-            "segments-per-item": (1.0, "Segments per item  S / i"),
-            "backoff-grid": (1.0, "Throughput (median)"),
-        }
-        scale, ylabel = defaults[args.kind]
+        scale, ylabel = DEFAULTS[args.kind]
         cfg = PlotConfig(
             title=args.title or f"{Path(args.csv).stem} ({args.kind})",
             ylabel=args.ylabel or ylabel,
             scale=args.scale if args.scale is not None else scale,
             logx=args.logx,
-            show=args.save is None, save_path=args.save,
+            theme=active,
+            show=args.save is None, save_path=args.save, table_path=table_path,
         )
         kinds = {
             "throughput": lambda: plot_throughput(df, cfg, args.stat),

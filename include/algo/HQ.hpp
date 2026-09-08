@@ -16,6 +16,7 @@
 #include <util/specs.hpp>
 #include <atomic>
 #include <cassert>
+#include <iostream>
 
 namespace algo {
 

@@ -130,7 +130,7 @@ public:
                 for (;;) {
                     uint64_t expect_val = 0, expect_seq = seq;
                     if (p_atomic::dcas(&c, expect_val, expect_seq,
-                                       reinterpret_cast<uint64_t>(item), t + 1))
+                                       item, t + 1))
                         return true;
                     assert(c.seq.load(std::memory_order_acquire) == seq &&
                            "VyukovDCAS: a reserved cell moved under its owner");
@@ -157,8 +157,7 @@ public:
             const uint64_t seq = c.seq.load(std::memory_order_acquire);
             T value = c.val.load(std::memory_order_acquire);
             if (seq == h + 1) {
-                uint64_t expect_val = reinterpret_cast<uint64_t>(value), expect_seq = seq;
-                const bool took = p_atomic::dcas(&c, expect_val, expect_seq, 0, h + capacity_);
+                const bool took = p_atomic::dcas(&c, value, seq, nullptr, h + capacity_);
                 uint64_t hh = h;
                 const bool moved = head_.compare_exchange_weak(hh, h + 1, std::memory_order_relaxed);
                 if (took) {

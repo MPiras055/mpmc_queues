@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+#
+# Run the registry-driven unit suites against one queue, or a named list.
+#
+#   tools/qtest u-pscq                          every registry suite, that queue
+#   tools/qtest u-pscq u-prq u-scq              a list
+#   tools/qtest --suite ConcurrencyTest u-hq    one binary
+#   tools/qtest --build-dir /tmp/mpmc-verif-tsan u-pscq
+#   tools/qtest --list                          the registry names, unmangled
+#   tools/qtest u-pscq -- --gtest_repeat=20 --gtest_shuffle
+#
+# Everything here is a plain `<binary> --gtest_filter=...`; the wrapper exists for three
+# reasons, all of which are easy to get wrong by hand:
+#
+#   1. Registry names are mangled for gtest. `registry::TestNames::GetName` turns every
+#      non-alphanumeric character into '_', so `u-faa` is `u_faa` in a filter.
+#   2. The suite prefix differs per binary -- `Mpmc/` here, `QueueBehaviour/` there.
+#   3. **gtest exits 0 when a filter matches nothing.** A mistyped queue name is otherwise
+#      indistinguishable from a passing run, which for a concurrency suite is the worst
+#      possible failure mode. This script checks the filter selects something first.
+set -uo pipefail
+
+BUILD_DIR="${MPMC_BUILD_DIR:-build}"
+TIMEOUT="${QTEST_TIMEOUT:-1800}"
+SUITES=()
+NAMES=()
+PASSTHRU=()
+LIST_ONLY=0
+
+# suite binary -> the prefix gtest gives its typed instances
+prefix_for() {
+    case "$1" in
+        ConcurrencyTest)         echo "Mpmc" ;;
+        RegistryConformanceTest) echo "QueueBehaviour" ;;
+        SegmentLifecycleTest)    echo "SegmentLifecycle" ;;
+        *)                       echo "" ;;
+    esac
+}
+
+usage() {
+    sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --build-dir) BUILD_DIR="$2"; shift 2 ;;
+        --suite)     SUITES+=("$2"); shift 2 ;;
+        --timeout)   TIMEOUT="$2"; shift 2 ;;
+        --list)      LIST_ONLY=1; shift ;;
+        -h|--help)   usage 0 ;;
+        --)          shift; PASSTHRU=("$@"); break ;;
+        -*)          echo "qtest: unknown option $1" >&2; usage 1 ;;
+        *)           NAMES+=("$1"); shift ;;
+    esac
+done
+
+[[ -d "$BUILD_DIR" ]] || { echo "qtest: no such build directory: $BUILD_DIR" >&2; exit 1; }
+
+if [[ $LIST_ONLY -eq 1 ]]; then
+    exec "$BUILD_DIR/benchmark" --list
+fi
+
+[[ ${#NAMES[@]} -gt 0 ]] || { echo "qtest: name at least one queue (or --list)" >&2; usage 1; }
+[[ ${#SUITES[@]} -gt 0 ]] || SUITES=(ConcurrencyTest RegistryConformanceTest)
+
+# Mangle exactly as registry::TestNames does: anything not [0-9a-zA-Z] becomes '_'.
+mangle() { printf '%s' "$1" | sed 's/[^0-9a-zA-Z]/_/g'; }
+
+rc=0
+for suite in "${SUITES[@]}"; do
+    bin="$BUILD_DIR/$suite"
+    if [[ ! -x "$bin" ]]; then
+        echo "qtest: $suite is not built in $BUILD_DIR -- skipping" >&2
+        rc=1; continue
+    fi
+    prefix="$(prefix_for "$suite")"
+    if [[ -z "$prefix" ]]; then
+        echo "qtest: $suite is not a per-queue typed suite" >&2
+        rc=1; continue
+    fi
+
+    filter=""
+    for n in "${NAMES[@]}"; do
+        filter+="${filter:+:}${prefix}/$(mangle "$n").*"
+    done
+
+    # The check the whole script exists for: a filter that selects nothing still exits 0.
+    selected=$("$bin" --gtest_list_tests --gtest_filter="$filter" 2>/dev/null \
+               | grep -cE '^  [A-Za-z]' || true)
+    if [[ "$selected" -eq 0 ]]; then
+        echo "qtest: filter '$filter' matched no tests in $suite" >&2
+        echo "       (names are mangled: '-' becomes '_'; try tools/qtest --list)" >&2
+        rc=1; continue
+    fi
+
+    echo "=== $suite: $selected test(s) matching $filter ==="
+    timeout "$TIMEOUT" "$bin" --gtest_filter="$filter" ${PASSTHRU[@]+"${PASSTHRU[@]}"}
+    status=$?
+    if [[ $status -eq 124 ]]; then
+        echo "qtest: $suite TIMED OUT after ${TIMEOUT}s -- a hang, not a failure" >&2
+        rc=124
+    elif [[ $status -ne 0 ]]; then
+        rc=$status
+    fi
+done
+exit $rc

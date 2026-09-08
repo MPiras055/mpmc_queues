@@ -1,6 +1,6 @@
 #pragma once
 /**
- * @file PRQ.hpp
+ * @file CRQ.hpp
  * @brief Fetch-add indexed ring with per-cell sequence numbers and an unsafe bit for consumer/producer races.
  * @ingroup algo
  */
@@ -14,12 +14,13 @@
 #include <util/bit.hpp>
 #include <util/align.hpp>
 #include <util/specs.hpp>
+#include <util/atomic/cas2.hpp>
 #include <atomic>
 #include <cassert>
 
 namespace algo {
 
-struct PRQOpt {
+struct CRQOpt {
     /**
      * @brief Take the capacity exactly as asked instead of rounding up to a power of two.
      *
@@ -60,39 +61,39 @@ struct PRQOpt {
  * sequence, then swap the payload in -- so the tagging policy must be able to mint
  * claims.
  *
- * @note **Linked-only.** PRQ closes itself when producers overshoot and then relies on a proxy to link a
+ * @note **Linked-only.** CRQ closes itself when producers overshoot and then relies on a proxy to link a
  * successor. Standalone there is nobody to link one, so producers spin on a full
  * ring while consumers drag the over-run tail back -- correct, but pathologically
  * slow (measured ~21k ops/s against ~12M for a plain Vyukov ring).
  *       The class template is constrained on linkage::Linked, so
- *       `algo::PRQ<T, Opt, linkage::None>` is not a nameable type.
+ *       `algo::CRQ<T, Opt, linkage::None>` is not a nameable type.
  *
  * @tparam Tag cell::ClaimingTag policy
  */
 template <typename T, typename Opt, typename Link,
           typename Tag = cell::MsbTag<T>>
-    requires meta::AcceptsOnly<Opt, typename PRQOpt::no_pow2, typename PRQOpt::no_cell_padding,
-                               meta::ValueOption<PRQOpt::max_dequeue_retries>,
-                               meta::ValueOption<PRQOpt::tail_reload_period>> &&
+    requires meta::AcceptsOnly<Opt, typename CRQOpt::no_pow2, typename CRQOpt::no_cell_padding,
+    meta::ValueOption<CRQOpt::max_dequeue_retries>,
+    meta::ValueOption<CRQOpt::tail_reload_period>> &&
              linkage::Linked<Link> && cell::ClaimingTag<Tag, T>
-class PRQ : public mem::SingleBlock<PRQ<T, Opt, Link, Tag>> {
-    using Self = PRQ<T, Opt, Link, Tag>;
+class CRQ : public mem::SingleBlock<CRQ<T, Opt, Link, Tag>> {
+using Self = CRQ<T, Opt, Link, Tag>;
 
     using word = typename Tag::word;
 
-    static constexpr bool pad_cells = !Opt::template has<typename PRQOpt::no_cell_padding>;
-    /// Index mapping is a mask rather than a modulo; see PRQOpt::no_pow2.
-    static constexpr bool pow2 = !Opt::template has<typename PRQOpt::no_pow2>;
+    static constexpr bool pad_cells = !Opt::template has<typename CRQOpt::no_cell_padding>;
+    /// Index mapping is a mask rather than a modulo; see CRQOpt::no_pow2.
+    static constexpr bool pow2 = !Opt::template has<typename CRQOpt::no_pow2>;
 
     static constexpr uint64_t kMaxRetryDeq = static_cast<uint64_t>(
-        Opt::template get<PRQOpt::max_dequeue_retries, uint64_t{4 * 1024}>);
+        Opt::template get<CRQOpt::max_dequeue_retries, uint64_t{4 * 1024}>);
 
     /// Expressed as a period rather than a mask: `(retry & mask) == 0` means "every Nth
     /// iteration", and saying so directly is what makes the power-of-two requirement checkable.
     static constexpr uint64_t kTailReloadPeriod = static_cast<uint64_t>(
-        Opt::template get<PRQOpt::tail_reload_period, uint64_t{1u << 8}>);
+        Opt::template get<CRQOpt::tail_reload_period, uint64_t{1u << 8}>);
     static_assert(kTailReloadPeriod != 0 && (kTailReloadPeriod & (kTailReloadPeriod - 1)) == 0,
-                  "PRQOpt::tail_reload_period must be a power of two: the dequeue loop tests "
+                  "CRQOpt::tail_reload_period must be a power of two: the dequeue loop tests "
                   "it as a mask");
     static constexpr uint64_t kReloadTailMask = kTailReloadPeriod - 1;
 
@@ -145,9 +146,9 @@ public:
         return p;
     }
 
-    PRQ(std::size_t n, mem::Blocks blk) noexcept
+    CRQ(std::size_t n, mem::Blocks blk) noexcept
         : capacity_{round_size(n)}, cells_{blk.template at<cell_type>(plan(n).regions[0])} {
-        assert(capacity_ != 0 && "PRQ: capacity must be non-null");
+        assert(capacity_ != 0 && "CRQ: capacity must be non-null");
         for (std::size_t i = 0; i < capacity_; ++i) {
             cells_[i].val.store(Tag::empty(), std::memory_order_relaxed);
             cells_[i].seq.store(i, std::memory_order_relaxed);
@@ -174,28 +175,13 @@ public:
             const uint64_t safe_seq = c.seq.load(std::memory_order_acquire);
             word val = c.val.load(std::memory_order_acquire);
             const bool unsafe = bit::get_msb(safe_seq) != 0;
-            const uint64_t seq = bit::clear_msb(safe_seq);
+            //not const because it's used as reference in p_atomic::dcas 
+            uint64_t seq = bit::clear_msb(safe_seq);
 
             if (Tag::is_empty(val) && seq <= t &&
-                (!unsafe || head_.load(std::memory_order_acquire) <= t)) {
-                const word token = Tag::claim();
-                if (c.val.compare_exchange_strong(val, token, std::memory_order_acq_rel,
-                                                  std::memory_order_acquire)) {
-                    uint64_t expect_seq = safe_seq;
-                    if (c.seq.compare_exchange_strong(expect_seq, t + capacity_,
-                                                      std::memory_order_acq_rel,
-                                                      std::memory_order_acquire)) {
-                        word expect_tok = token;
-                        if (c.val.compare_exchange_strong(expect_tok, Tag::encode(item),
-                                                          std::memory_order_acq_rel,
-                                                          std::memory_order_acquire))
-                            return true;
-                    } else {
-                        word expect_tok = token;
-                        (void)c.val.compare_exchange_strong(expect_tok, Tag::empty(),
-                                                            std::memory_order_acq_rel,
-                                                            std::memory_order_acquire);
-                    }
+                (!unsafe || head_.load(std::memory_order_acquire) < t)) {
+                if (p_atomic::dcas(&c, Tag::empty(), seq, item,t)) {
+                        return true;
                 }
             }
 
@@ -216,51 +202,38 @@ public:
             uint64_t tail_snap = 0;
 
             for (;;) {
-                const uint64_t safe_seq = c.seq.load(std::memory_order_acquire);
-                const bool unsafe = bit::get_msb(safe_seq) != 0;
+                //not const because we use it in p_atomic::dcas
+                uint64_t safe_seq = c.seq.load(std::memory_order_acquire);
+                const uint64_t unsafe = bit::get_msb(safe_seq);
                 const uint64_t seq = bit::clear_msb(safe_seq);
                 const word val = c.val.load(std::memory_order_acquire);
 
-                if (seq > h + capacity_) break; // cell belongs to a later lap
-                if (safe_seq != c.seq.load(std::memory_order_acquire)) continue; // torn read
-
+                if (seq > h) break; // cell belongs to a later lap
+                
                 if (Tag::is_payload(val)) {
-                    if (seq == h + capacity_) { // ours
-                        c.val.store(Tag::empty(), std::memory_order_relaxed);
-                        out = Tag::decode(val);
-                        return true;
-                    }
-                    // Payload from a different lap: mark unsafe so producers skip it.
-                    if (unsafe) {
-                        if (c.seq.load(std::memory_order_acquire) == safe_seq) break;
+                    if(seq == h) { //ours
+                        if (p_atomic::dcas(&c, val, safe_seq,
+                            Tag::empty(),unsafe | (h + capacity_))) {
+                                out = Tag::decode(val);
+                                return true;
+                        }
                     } else {
-                        uint64_t expect = safe_seq;
-                        if (c.seq.compare_exchange_strong(expect, bit::set_msb(seq),
-                                                          std::memory_order_acq_rel,
-                                                          std::memory_order_acquire))
-                            break;
+                        //Payload from a different lap: mark unsafe so producers skip it.
+                        if (p_atomic::dcas(&c, val, safe_seq,
+                            std::bit_cast<uint64_t>(val),bit::set_msb(seq)))
+                        break;
                     }
-                } else { // empty or claimed: consider stealing it from the producer
+                
+                } else { // empty or claimed: bump the seq to make it available in a newer lap
                     if ((retry & kReloadTailMask) == 0)
                         tail_snap = tail_.load(std::memory_order_acquire);
                     const uint64_t tail_idx = bit::clear_msb(tail_snap);
                     const bool closed = bit::get_msb(tail_snap) != 0;
 
                     if (unsafe || tail_idx < h + 1 || closed || retry > kMaxRetryDeq) {
-                        if (Tag::is_claim(val)) {
-                            word expect = val;
-                            if (!c.val.compare_exchange_strong(expect, Tag::empty(),
-                                                               std::memory_order_acq_rel,
-                                                               std::memory_order_acquire))
-                                continue;
-                        }
-                        uint64_t expect = safe_seq;
-                        const uint64_t desired =
-                            (unsafe ? bit::set_msb<uint64_t>(0) : 0) | (h + capacity_);
-                        if (c.seq.compare_exchange_strong(expect, desired,
-                                                          std::memory_order_acq_rel,
-                                                          std::memory_order_acquire))
+                        if (p_atomic::dcas(&c, val, safe_seq, val, unsafe | (h + capacity_))) {
                             break;
+                        }
                     }
                     ++retry;
                 }
@@ -363,12 +336,12 @@ private:
 
 } // namespace algo
 
-/// @brief Capabilities of algo::PRQ as a linked segment. Every field is mandatory:
+/// @brief Capabilities of algo::CRQ as a linked segment. Every field is mandatory:
 /// core::segment_traits has no primary definition, so omitting one is a compile error.
 template <typename T, typename Opt, typename Link, typename Tag>
-struct core::segment_traits<algo::PRQ<T, Opt, Link, Tag>> {
+struct core::segment_traits<algo::CRQ<T, Opt, Link, Tag>> {
     /**
-     * PRQ closes itself on overshoot and lets consumers steal cells from producers.
+     * CRQ closes itself on overshoot and lets consumers steal cells from producers.
      * Re-entering the enqueue loop on an already-closed segment forces consumers down
      * the unsafe-cell path; under a bounded proxy, where a fresh segment may not be
      * obtainable, that livelocks. Measured on the pooled proxy at 4P/4C x 100k items:
@@ -381,10 +354,10 @@ struct core::segment_traits<algo::PRQ<T, Opt, Link, Tag>> {
     static constexpr bool recyclable = true;
     static constexpr bool can_store_null = Tag::can_store_null;
 };
-MPMC_ASSERT_SEGMENT_TRAITS(algo::PRQ<int*, meta::EmptyOptions, linkage::Node<mem::PtrHandle>>);
+MPMC_ASSERT_SEGMENT_TRAITS(algo::CRQ<int*, meta::EmptyOptions, linkage::Node<mem::PtrHandle>>);
 
 namespace seg {
 template <typename T, typename Opt = meta::EmptyOptions, typename HP = mem::PtrHandle>
-/// PRQ as a linked segment. There is no standalone alias: see the class note.
-using PRQ = algo::PRQ<T, Opt, linkage::Node<HP>>;
+/// CRQ as a linked segment. There is no standalone alias: see the class note.
+using CRQ = algo::CRQ<T, Opt, linkage::Node<HP>>;
 }

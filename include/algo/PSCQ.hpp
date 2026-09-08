@@ -254,10 +254,24 @@ public:
                 }
             }
 
-            tail_snap = clean(tail_.load(std::memory_order_acquire));
-            if (tail_snap <= h + 1) {
-                fix_state(tail_snap, h + 1);
-                threshold_.fetch_sub(1, std::memory_order_release);
+
+            tail_snap = tail_.load(std::memory_order_acquire);
+            if (bit::clear_msb(tail_snap) <= h + 1) {
+                uint64_t head_snap;
+                // The guard below compares the RAW word on purpose. A closed segment
+                // carries the MSB, making tail_snap enormous, so the condition is false
+                // and the tail is left alone. Masking the MSB off here would let the CAS
+                // write a plain head value over the closed marker -- reopening a segment
+                // that has already been unlinked, so anything enqueued into it afterwards
+                // is silently lost.
+                do {
+                    head_snap = head_.load(std::memory_order_acquire);
+                } while (tail_snap < head_snap &&
+                         !tail_.compare_exchange_strong(tail_snap, head_snap,
+                            std::memory_order_acq_rel,
+                            std::memory_order_acquire));
+                //decrement the threshold before exiting
+                threshold_.fetch_sub(1,std::memory_order_release);               
                 return false;
             }
             if (threshold_.fetch_sub(1, std::memory_order_acq_rel) <= 0) return false;
