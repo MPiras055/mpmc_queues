@@ -423,7 +423,7 @@ private:
         else return clean(i) % size_;
     }
 
-    [[no_unique_address]] link_state link_{};
+    [[no_unique_address]] CACHE_LINE_MEMBER(link_state, link_,link_state{});
     const std::size_t size_;
     /// Only meaningful on the pow2 path; mod() divides instead when it is off.
     const std::size_t mask_;

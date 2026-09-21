@@ -330,7 +330,7 @@ DEFAULTS = {
     "scalability": (1.0, "Speedup vs baseline"),
     "slot-efficiency": (1.0, "Slot efficiency  i / (S*n)"),
     "segments-per-item": (1.0, "Segments per item  S / i"),
-    "backoff-grid": (1.0, "Throughput (median)"),
+    "backoff-grid": (1.0, "Throughput (median ops/sec)"),
 }
 
 

@@ -301,7 +301,7 @@ private:
     CACHE_ALIGN mutable std::atomic<uint32_t> lock_{0};
     CACHE_PAD(std::atomic<uint32_t>);
     std::size_t head_ = 0, tail_ = 0, count_ = 0;
-    [[no_unique_address]] link_state link_{};
+    [[no_unique_address]] CACHE_LINE_MEMBER(link_state, link_,link_state{});
     const std::size_t capacity_;
     T* const cells_;
 };

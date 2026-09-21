@@ -269,7 +269,7 @@ private:
         else return i % capacity_;
     }
 
-    [[no_unique_address]] link_state link_{};
+    [[no_unique_address]] CACHE_LINE_MEMBER(link_state, link_,link_state{});
     const std::size_t capacity_;
     cell_type* const cells_;
     CACHE_LINE_MEMBER(std::atomic<uint64_t>, tail_, {0});

@@ -133,7 +133,7 @@ public:
     FAAArray(std::size_t n, mem::Blocks blk) noexcept
         : capacity_{round_size(n)}, cells_{blk.template at<cell_type>(plan(n).regions[0])} {
         assert(n != 0 && "FAAArray: capacity must be non-null");
-        for (std::size_t i = 0; i < n; ++i)
+        for (std::size_t i = 0; i < capacity_; ++i)
             cells_[i].val.store(empty_w(), std::memory_order_relaxed);
     }
 
@@ -327,7 +327,7 @@ private:
 
     CACHE_LINE_MEMBER(std::atomic<uint64_t>, head_, {0});
     CACHE_LINE_MEMBER(std::atomic<uint64_t>, tail_, {0});
-    [[no_unique_address]] link_state link_{};
+    [[no_unique_address]] CACHE_LINE_MEMBER(link_state, link_,link_state{});
     const std::size_t capacity_;
     cell_type* const cells_;
     /// Which sentinel currently means empty. Written only by reopen(), read on every

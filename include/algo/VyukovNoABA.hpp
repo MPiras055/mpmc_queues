@@ -287,7 +287,7 @@ private:
         else return clean(i) / capacity_;
     }
 
-    [[no_unique_address]] link_state link_{};
+    [[no_unique_address]] CACHE_LINE_MEMBER(link_state, link_,link_state{});
     const std::size_t capacity_;
     /// Only meaningful on the pow2 path; zero otherwise, where lap() divides instead.
     const std::size_t shift_;

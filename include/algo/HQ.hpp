@@ -31,6 +31,8 @@ struct HQOpt {
      */
     struct no_pow2 {};
     struct force_cell_padding {};
+    struct force_slow_dequeue{};
+    struct force_slow_enqueue{};
 
     /**
      * @brief Loads a consumer spends waiting for a straggling producer before claiming a cell.
@@ -99,6 +101,8 @@ template <typename T, typename Opt, typename Link,
           typename Tag = cell::LowTag<T>>
     requires meta::AcceptsOnly<Opt, typename HQOpt::force_cell_padding,
                                typename HQOpt::no_pow2,
+                               typename HQOpt::force_slow_dequeue,
+                               typename HQOpt::force_slow_enqueue,
                                meta::ValueOption<HQOpt::patience>> &&
              linkage::Linked<Link> && cell::Tagging<Tag, T>
 class HQ : public mem::SingleBlock<HQ<T, Opt, Link, Tag>> {
@@ -109,10 +113,15 @@ class HQ : public mem::SingleBlock<HQ<T, Opt, Link, Tag>> {
     static constexpr bool pad_cells = Opt::template has<typename HQOpt::force_cell_padding>;
     /// Round the cell count up to a power of two; see HQOpt::no_pow2.
     static constexpr bool pow2 = !Opt::template has<typename HQOpt::no_pow2>;
+    static constexpr bool force_slow_deq = Opt::template has<typename HQOpt::force_slow_dequeue>;
+    static constexpr bool force_slow_enq = Opt::template has<typename HQOpt::force_slow_enqueue>;
+
+    static_assert(force_slow_enq? force_slow_deq : true && "HQ: slow enqueue can only be composed with slow dequeue");
+    
     /// Cast rather than trusted: `get` returns the option's own type when one is present, so
     /// `patience<8>` would otherwise arrive as `int`. See OptionsPack::get.
     static constexpr std::size_t kPatience =
-        static_cast<std::size_t>(Opt::template get<HQOpt::patience, std::size_t{1024}>);
+        static_cast<std::size_t>(Opt::template get<HQOpt::patience, std::size_t{0}>);
 
     static constexpr bool no_patience = kPatience == 0;
 
@@ -155,13 +164,36 @@ public:
     HQ(std::size_t n, mem::Blocks blk) noexcept
         : capacity_{round_size(n)}, cells_{blk.template at<cell_type>(plan(n).regions[0])} {
         assert(n != 0 && "HQ: capacity must be non-null");
-        for (std::size_t i = 0; i < n; ++i)
+        for (std::size_t i = 0; i < capacity_; ++i)
             cells_[i].val.store(empty_w(), std::memory_order_relaxed);
+    }
+
+
+    /// @brief Add a method using standard CAS loop for index increment
+    /// @note: this method is not safe to use concurrently with `bool enqueue(T item)`
+    FORCE_INLINE bool slow_enqueue(T item) noexcept {
+        assert((Tag::can_store_null || Tag::is_payload(Tag::encode(item))) && 
+            "HQ: this tagging policy cannot store that value (see can_store_null)");
+        
+        for(;;) {
+            //check if the tail is up to date
+            uint64_t t = tail_.load(std::memory_order_acquire);
+            if(t >= capacity_) return false;
+            else if (t != tail_.load(std::memory_order_acquire)) continue;
+
+            word exp = empty_w();
+            bool succ = cells_[t].val.compare_exchange_strong(exp,Tag::encode(item),std::memory_order_acq_rel,std::memory_order_relaxed);
+            tail_.compare_exchange_strong(t,t+1,std::memory_order_acq_rel,std::memory_order_relaxed);
+            if(succ) return true;
+        }  
     }
 
     /// @brief Add an item.
     /// @return false if the queue is full, or closed.
     FORCE_INLINE bool enqueue(T item) noexcept {
+        if constexpr (force_slow_enq) 
+            return slow_enqueue(item);
+        
         assert((Tag::can_store_null || Tag::is_payload(Tag::encode(item))) &&
                "HQ: this tagging policy cannot store that value (see can_store_null)");
         for (;;) {
@@ -187,7 +219,11 @@ public:
     /// @brief Take the oldest item.
     /// @return false if the queue is empty.
     FORCE_INLINE bool dequeue(T& out) noexcept {
+        if constexpr (!force_slow_deq) {
         return has_successor() ? fast_dequeue(out) : slow_dequeue(out);
+        } else {
+            return slow_dequeue(out);
+        }
     }
 
 
@@ -337,15 +373,6 @@ private:
             const uint64_t h = head_.fetch_add(1, std::memory_order_acq_rel);
             if (h >= capacity_) return false;
             cell_type& c = cells_[h];
-            // A pure delay, and deliberately so: the exchange below re-reads the cell, so
-            // this loop's value is never used. Its only job is to give a producer that is
-            // a few cycles behind time to land, because once the head has fetch-added past
-            // this index the slot is gone either way. Without the hint two dependent loads
-            // of an already-hot line retire in a handful of cycles and the wait is noise.
-            // for (std::size_t i = 0; i < kPatience; ++i) {
-            //     if (!is_empty_w(c.val.load(std::memory_order_acquire))) break;
-            //     SPIN_HINT();
-            // }
             const word w = c.val.exchange(consumed_w(), std::memory_order_acq_rel);
             if (Tag::is_payload(w)) {
                 out = Tag::decode(w);
@@ -354,65 +381,83 @@ private:
         }
     }
 
-    /// Non-destructive until patience runs out: advances head by CAS, not fetch-add.
+    /**
+     * @brief: cautious dequeue routine
+     * @note: 
+     */
     bool slow_dequeue(T& out) noexcept {
+        //head is only updated inside the loop
+        uint64_t h = head_.load(std::memory_order_acquire);
         for (;;) {
-            uint64_t h = head_.load(std::memory_order_relaxed);
+            //stale head update loop
             if (h >= capacity_) return false;
-
             cell_type& c = cells_[h];
-            word w = c.val.load(std::memory_order_acquire);
-            const uint64_t t = tail_.load(std::memory_order_acquire);
-
-            if (h != head_.load(std::memory_order_acquire)) continue; // someone moved head
-            if (h == t) return false;                                 // genuinely empty
-
-            if (is_consumed_w(w)) { // already taken; help head along
-                (void)head_.compare_exchange_weak(h, h + 1, std::memory_order_relaxed);
+            if (uint64_t h_snap = head_.load(std::memory_order_acquire); h != h_snap) {
+                h = h_snap; //update head and retry
                 continue;
             }
 
-            if (is_empty_w(w)) { // producer claimed this index but has not published
-                // Nothing is queued behind it, so there is no head-of-line blocking to
-                // break -- and breaking it is the *only* thing the destructive exchange
-                // below buys. Burning the cell here would cost capacity for nothing,
-                // which on a near-empty queue is precisely the pathology the slow path
-                // exists to avoid, and the old code still walked into it after two loads.
-                //
-                // Reporting empty is linearizable: it linearizes at the load of `w`
-                // above, and at that instant the producer's enqueue had not yet
-                // linearized -- it does so at the CAS that publishes the payload -- so
-                // the queue genuinely held no item.
-                if (t == h + 1) return false;
+            //nothing consumed
+            if (tail_.load(std::memory_order_acquire) == h) return false;
 
-                // Something *is* published behind this index, so the head has to get
-                // past it. Give the producer a bounded chance to land first.
-                if constexpr (!no_patience) {
-                    for (std::size_t i = 0; i < kPatience; ++i) {
-                        w = c.val.load(std::memory_order_acquire);
-                        if (!is_empty_w(w)) break; // resolved, either payload or consumed
-                    }
-                    if (is_consumed_w(w)) { // another consumer got there; help head along
-                        (void)head_.compare_exchange_weak(h, h + 1, std::memory_order_relaxed);
-                        continue;
-                    }
+            //load the cell and perform checks
+            word w = c.val.load(std::memory_order_acquire);
+
+            //cell is still empty
+            if (is_empty_w(w)) {
+                //the first cell was reserved but it's not yet written
+                if(tail_.load(std::memory_order_acquire) == h + 1) return false;
+                //cell is possibly empty and multiple producers have reserved cells 
+                //head of line blocking
+                //Reload the cell and possibly spin a bit (only if patience != 0)
+                w = await_producer(c);
+            } 
+
+            //if the cell was consumed we don't do exchange (should save a cache invalidation)
+            if(!is_consumed_w(w)) { 
+                w = c.val.exchange(consumed_w(),std::memory_order_acq_rel);
+                h = help_head(h);   //we try to advance head
+                if(Tag::is_payload(w)) {
+                    out = Tag::decode(w);
+                    return true;
                 }
-            }
 
-            // Patience exhausted or a payload is present: claim the cell. This races
-            // with the producer and may invalidate the slot -- the obstruction-free part.
-            w = c.val.exchange(consumed_w(), std::memory_order_acq_rel);
-            (void)head_.compare_exchange_weak(h, h + 1, std::memory_order_relaxed);
-            if (Tag::is_payload(w)) {
-                out = Tag::decode(w);
-                return true;
-            }
+            } else //cell was already consumed so we retry on a different cell
+                h = help_head(h);
         }
+    }
+    
+    /**
+     * @brief Reloads the content of a cell and possibly waits on an empty cell
+     * @note: the wait is a spin backoff hardcoded to the patience setted
+     */
+    FORCE_INLINE word await_producer(const cell_type& c) const noexcept {
+        if constexpr (no_patience) return c.val.load(std::memory_order_acquire);
+        else {
+            word w = c.val.load(std::memory_order_acquire);
+            for (std::size_t i = 1; i < kPatience && is_empty_w(w); ++i) {
+                w = c.val.load(std::memory_order_acquire);
+            }
+            return w;
+        }
+    }
+    
+    /**
+     * @brief: possibly advances head with CAS Retry loop and returns the freshest snapshot
+     * @note: optimized so that the CAS doesn't get attempted if the snapshot is invalid
+     */
+    FORCE_INLINE uint64_t help_head(uint64_t h) noexcept {
+        uint64_t head_snap = head_.load(std::memory_order_relaxed);
+        if(head_snap == h) {
+            head_snap += head_.compare_exchange_strong(head_snap,head_snap + 1)?
+                1 : 0;
+        }
+        return head_snap;
     }
 
     CACHE_LINE_MEMBER(std::atomic<uint64_t>, head_, {0});
     CACHE_LINE_MEMBER(std::atomic<uint64_t>, tail_, {0});
-    [[no_unique_address]] link_state link_{};
+    [[no_unique_address]] CACHE_LINE_MEMBER(link_state, link_,link_state{});
     const std::size_t capacity_;
     cell_type* const cells_;
     /// Which sentinel currently means empty. Written only by reopen(), read on every

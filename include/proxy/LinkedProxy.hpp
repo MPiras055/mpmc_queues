@@ -111,7 +111,7 @@ struct SegmentStatsOn {
     void absorb(const LocalSegmentStats<true>& stats) {
         if(stats.linked) linked_.fetch_add(stats.linked,std::memory_order_relaxed);
         if(stats.retired) retired_.fetch_add(stats.retired,std::memory_order_relaxed);
-        if(stats.discarded) discarded_.fetch_add(discarded_,std::memory_order_relaxed);
+        if(stats.discarded) discarded_.fetch_add(stats.discarded,std::memory_order_relaxed);
     }
 
     uint64_t linked() const noexcept { return linked_.load(std::memory_order_relaxed); }
@@ -407,6 +407,7 @@ public:
         while (h != Source::nil()) {
             Segment* s = source_.deref(h);
             const H nx = s->next();
+            g.payload().seg.on_retire();
             source_.discard(h);
             h = nx;
         }

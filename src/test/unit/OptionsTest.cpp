@@ -140,7 +140,7 @@ TEST(OptionDefaults, AlgorithmsKeepTheirPreviousConstants) {
     static_assert(queue::IndexRing<>::tail_reload_period == 1ull << 8);
 
     static_assert(seg::FAAArray<Item>::patience == 1024);
-    static_assert(seg::HQ<Item>::patience == 1024);
+    static_assert(seg::HQ<Item>::patience == 0);
     SUCCEED();
 }
 

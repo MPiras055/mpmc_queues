@@ -45,6 +45,27 @@ class TestLoading:
         df = dataio.load_results(p)
         assert list(df["Queue"]) == ["VyukovBuffer"]
 
+    def test_throughput_is_converted_to_ops(self, csv_file):
+        """The CSV counts items; an item is one enqueue plus one dequeue."""
+        df = dataio.load_results(csv_file)
+        row = df[(df["Queue"] == "vyukov") & (df["Producers"] == 1)].iloc[0]
+        assert row["Throughput_Mean"] == pytest.approx(100.0 * dataio.OPS_PER_ITEM)
+
+    def test_deviation_carries_the_same_factor(self, csv_file):
+        """sd(cX) = c*sd(X): scaling the centre without the spread halves the error bars."""
+        df = dataio.load_results(csv_file)
+        row = df[(df["Queue"] == "vyukov") & (df["Producers"] == 1)].iloc[0]
+        assert row["Throughput_StdDev"] == pytest.approx(1.0 * dataio.OPS_PER_ITEM)
+        # The relative spread is what the conversion must leave alone.
+        assert row["Throughput_StdDev"] / row["Throughput_Mean"] == pytest.approx(1.0 / 100.0)
+
+    def test_scalability_is_unaffected_by_the_conversion(self, csv_file):
+        """A ratio of two rescaled values: the factor cancels."""
+        df = dataio.load_results(csv_file)
+        by_queue = {n: g for n, g in dataio.scalability(df, 1)}
+        vy = by_queue["vyukov"]
+        assert vy[vy["Producers"] == 2]["Scalability"].iloc[0] == pytest.approx(180.0 / 100.0)
+
     def test_total_threads_is_derived(self, csv_file):
         assert set(dataio.load_results(csv_file)["Total_Threads"]) == {2, 4}
 
@@ -154,7 +175,9 @@ COMPARE_CSV = (
     ]
 )
 
-PANEL_MAX = 400.0
+# The largest value in the rows above, as the loader reports it: the CSV counts items and
+# the plots count operations, so everything read back carries dataio.OPS_PER_ITEM.
+PANEL_MAX = 400.0 * dataio.OPS_PER_ITEM
 
 
 @pytest.fixture(autouse=True)

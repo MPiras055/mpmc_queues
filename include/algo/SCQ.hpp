@@ -246,7 +246,7 @@ private:
     //     ~InflightGuard() { counter.fetch_sub(1, std::memory_order_release); }
     // };
 
-    [[no_unique_address]] link_state link_{};
+    [[no_unique_address]] CACHE_LINE_MEMBER(link_state, link_,link_state{});
     const std::size_t capacity_;
     Ring* free_ = nullptr;
     Ring* data_ = nullptr;

@@ -131,17 +131,17 @@ using Linked = meta::TypeList<
     Entry<"u-dcas", proxy::Unbounded<T, seg::VyukovDCAS<T>>>,
     Entry<"u-noaba", proxy::Unbounded<T, seg::VyukovNoABA<T>>>,
 
-    Entry<"item-vyukov", proxy::ItemBounded<T, seg::Vyukov<T>, kPoolSize>>,
-    Entry<"item-prq", proxy::ItemBounded<T, seg::PRQ<T>, kPoolSize>>,
-    Entry<"item-crq", proxy::ItemBounded<T, seg::CRQ<T>, kPoolSize>>,
-    Entry<"item-faa", proxy::ItemBounded<T, seg::FAAArray<T>, kPoolSize>>,
-    Entry<"item-hq", proxy::ItemBounded<T, seg::HQ<T>, kPoolSize>>,
-    Entry<"item-scq", proxy::ItemBounded<T, seg::SCQ<T>, kPoolSize>>,
-    Entry<"item-mutex", proxy::ItemBounded<T, seg::Mutex<T>, kPoolSize>>,
-    Entry<"item-spin", proxy::ItemBounded<T, seg::Spin<T>, kPoolSize>>,
-    Entry<"item-pscq", proxy::ItemBounded<T, seg::PSCQ<T>, kPoolSize>>,
-    Entry<"item-dcas", proxy::ItemBounded<T, seg::VyukovDCAS<T>, kPoolSize>>,
-    Entry<"item-noaba", proxy::ItemBounded<T, seg::VyukovNoABA<T>, kPoolSize>>,
+    // Entry<"item-vyukov", proxy::ItemBounded<T, seg::Vyukov<T>, kPoolSize>>,
+    // Entry<"item-prq", proxy::ItemBounded<T, seg::PRQ<T>, kPoolSize>>,
+    // Entry<"item-crq", proxy::ItemBounded<T, seg::CRQ<T>, kPoolSize>>,
+    // Entry<"item-faa", proxy::ItemBounded<T, seg::FAAArray<T>, kPoolSize>>,
+    // Entry<"item-hq", proxy::ItemBounded<T, seg::HQ<T>, kPoolSize>>,
+    // Entry<"item-scq", proxy::ItemBounded<T, seg::SCQ<T>, kPoolSize>>,
+    // Entry<"item-mutex", proxy::ItemBounded<T, seg::Mutex<T>, kPoolSize>>,
+    // Entry<"item-spin", proxy::ItemBounded<T, seg::Spin<T>, kPoolSize>>,
+    // Entry<"item-pscq", proxy::ItemBounded<T, seg::PSCQ<T>, kPoolSize>>,
+    // Entry<"item-dcas", proxy::ItemBounded<T, seg::VyukovDCAS<T>, kPoolSize>>,
+    // Entry<"item-noaba", proxy::ItemBounded<T, seg::VyukovNoABA<T>, kPoolSize>>,
 
     Entry<"chunk-vyukov", proxy::ChunkBounded<T, seg::Vyukov<T>, kPoolSize>>,
     Entry<"chunk-prq", proxy::ChunkBounded<T, seg::PRQ<T>, kPoolSize>>,
@@ -153,22 +153,22 @@ using Linked = meta::TypeList<
     Entry<"chunk-spin", proxy::ChunkBounded<T, seg::Spin<T>, kPoolSize>>,
     Entry<"chunk-pscq", proxy::ChunkBounded<T, seg::PSCQ<T>, kPoolSize>>,
     Entry<"chunk-dcas", proxy::ChunkBounded<T, seg::VyukovDCAS<T>, kPoolSize>>,
-    Entry<"chunk-noaba", proxy::ChunkBounded<T, seg::VyukovNoABA<T>, kPoolSize>>,
+    Entry<"chunk-noaba", proxy::ChunkBounded<T, seg::VyukovNoABA<T>, kPoolSize>>
 
     // Pooled: the bound is the pool running dry, so the admission policy is None. FAAArray
     // and HQ are here now that their reopen() flips a generation flag instead of failing;
     // before that they were not recyclable and mem::source::Pool refused them outright.
-    Entry<"mem-vyukov", proxy::MemBounded<T, IdxVyukov<T>, kPoolSize>>,
-    Entry<"mem-prq", proxy::MemBounded<T, IdxPRQ<T>, kPoolSize>>,
-    Entry<"mem-crq", proxy::MemBounded<T, IdxCRQ<T>, kPoolSize>>,
-    Entry<"mem-scq", proxy::MemBounded<T, IdxSCQ<T>, kPoolSize>>,
-    Entry<"mem-faa", proxy::MemBounded<T, IdxFAAArray<T>, kPoolSize>>,
-    Entry<"mem-hq", proxy::MemBounded<T, IdxHQ<T>, kPoolSize>>,
-    Entry<"mem-mutex", proxy::MemBounded<T, IdxMutex<T>, kPoolSize>>,
-    Entry<"mem-spin", proxy::MemBounded<T, IdxSpin<T>, kPoolSize>>,
-    Entry<"mem-pscq", proxy::MemBounded<T, IdxPSCQ<T>, kPoolSize>>,
-    Entry<"mem-dcas", proxy::MemBounded<T, IdxDCAS<T>, kPoolSize>>,
-    Entry<"mem-noaba", proxy::MemBounded<T, IdxNoABA<T>, kPoolSize>>
+    // Entry<"mem-vyukov", proxy::MemBounded<T, IdxVyukov<T>, kPoolSize>>,
+    // Entry<"mem-prq", proxy::MemBounded<T, IdxPRQ<T>, kPoolSize>>,
+    // Entry<"mem-crq", proxy::MemBounded<T, IdxCRQ<T>, kPoolSize>>,
+    // Entry<"mem-scq", proxy::MemBounded<T, IdxSCQ<T>, kPoolSize>>,
+    // Entry<"mem-faa", proxy::MemBounded<T, IdxFAAArray<T>, kPoolSize>>,
+    // Entry<"mem-hq", proxy::MemBounded<T, IdxHQ<T>, kPoolSize>>,
+    // Entry<"mem-mutex", proxy::MemBounded<T, IdxMutex<T>, kPoolSize>>,
+    // Entry<"mem-spin", proxy::MemBounded<T, IdxSpin<T>, kPoolSize>>,
+    // Entry<"mem-pscq", proxy::MemBounded<T, IdxPSCQ<T>, kPoolSize>>,
+    // Entry<"mem-dcas", proxy::MemBounded<T, IdxDCAS<T>, kPoolSize>>,
+    // Entry<"mem-noaba", proxy::MemBounded<T, IdxNoABA<T>, kPoolSize>>
     >;
 
 /**
@@ -209,6 +209,12 @@ using Instrumented = meta::TypeList<
     Entry<"i-u-vdcas", proxy::Unbounded<T, seg::VyukovDCAS<T>, meta::EmptyOptions, Stats<T>>>
 >;
 
+template<typename T>
+using HQ_Slow_Deq = seg::HQ<T,meta::OptionsPack<algo::HQOpt::force_slow_dequeue>>;
+
+template<typename T>
+using HQ_Slow = seg::HQ<T,meta::OptionsPack<algo::HQOpt::force_slow_dequeue,algo::HQOpt::force_slow_enqueue>>;
+
 /// The backoff grid. `p0` is the no-backoff case the notes expect to fail pathologically.
 template <typename T>
 using Backoff = meta::TypeList<
@@ -223,7 +229,9 @@ using Backoff = meta::TypeList<
     Entry<"u-hq-p64", proxy::Unbounded<T, HQp<T, 64>, meta::EmptyOptions, Stats<T>>>,
     Entry<"u-hq-p256", proxy::Unbounded<T, HQp<T, 256>, meta::EmptyOptions, Stats<T>>>,
     Entry<"u-hq-p1024", proxy::Unbounded<T, HQp<T, 1024>, meta::EmptyOptions, Stats<T>>>,
-    Entry<"u-hq-p4096", proxy::Unbounded<T, HQp<T, 4096>, meta::EmptyOptions, Stats<T>>>>;
+    Entry<"u-hq-p4096", proxy::Unbounded<T, HQp<T, 4096>, meta::EmptyOptions, Stats<T>>>,
+    Entry<"u-hq-slow-deq",proxy::Unbounded<T,HQ_Slow_Deq<T>,meta::EmptyOptions,Stats<T>>>,
+    Entry<"u-hq-slow",proxy::Unbounded<T,HQ_Slow<T>,meta::EmptyOptions,Stats<T>>>>;
 
 /// What `mpmc_tune` sweeps.
 template <typename T>
@@ -247,7 +255,30 @@ using CasCompare = meta::TypeList<
     Entry<"vdcas", queue::VyukovDCAS<T>>
 >;
 
+/**
+ * @brief Shard blocks: a P x C matrix of SPSC buffers, sized by the thread shape at startup.
+ *
+ * One entry covers every `(p, c)` -- the degree is a runtime value, so `a2a` at `1 x c` is the
+ * farm emitter and at `p x 1` the collector. The two differ only in dispatch strategy.
+ *
+ * Kept out of `All` for the `CasCompare` reason: a type that needs the harness to know
+ * something special about it does not belong in the general list. These need the block built
+ * for the exact thread counts (core::ShapeConstructed), one role per thread, and every consumer
+ * draining to the end -- which the benchmark provides and ConcurrencyTest's fixed shapes and
+ * RegistryConformanceTest's global-FIFO assertion do not. See queue::ShardQueue.
+ */
+template <typename T>
+using Shard = meta::TypeList<
+    Entry<"a2a", queue::ShardQueue<block::AllToAll<T, block::RoundRobin>>>,
+    Entry<"a2a-sticky", queue::ShardQueue<block::AllToAll<T, block::Sticky>>>
+>;
+
 /// Everything, for the benchmark.
+///
+/// `Tuning` stays out: `mpmc_tune` sweeps it (see `BenchSet` in src/bench/main.cpp), and the
+/// instrumented entries put atomics on the link path, so folding them in here would mix a
+/// counter run into the throughput run. Correctness is a different question -- ConcurrencyTest
+/// runs `All` **and** `Tuning`, because a tuning knob that loses an item is still a bug.
 template <typename T>
 using All = meta::concat<Standalone<T>, Linked<T>>;
 
@@ -255,7 +286,8 @@ using All = meta::concat<Standalone<T>, Linked<T>>;
  * @brief Owns one instance of any registered queue, however it happens to be built.
  *
  * A standalone queue is a single block and comes from Q::create(capacity); a proxy is an
- * ordinary object taking (segment_capacity). This hides that difference so
+ * ordinary object taking (segment_capacity); a shard block also needs the thread shape,
+ * Q::create(capacity, producers, consumers). This hides that difference so
  * one benchmark body can drive both -- which is what the old
  * `Benchmark<template<typename> typename>` could not express, and why no proxy was ever
  * benchmarkable.
@@ -265,21 +297,38 @@ class Instance {
     // Declared, not probed. `Constructible` holds only when exactly one shape applies, so
     // a queue that supports both, or neither, is a diagnosable error here rather than a
     // silent wrong branch followed by a confusing constructor failure elsewhere.
-    static_assert(core::BlockAllocated<Q> || core::DirectConstructed<Q>,
-                  "registry entry is neither block-allocated (Q::create(capacity)) nor "
-                  "directly constructible from (segment_capacity)");
+    static_assert(core::BlockAllocated<Q> || core::DirectConstructed<Q> ||
+                      core::ShapeConstructed<Q>,
+                  "registry entry is neither block-allocated (Q::create(capacity)), "
+                  "directly constructible from (segment_capacity), nor shape-constructed "
+                  "(Q::create(capacity, producers, consumers))");
     static_assert(core::Constructible<Q>,
-                  "registry entry satisfies both construction shapes; which one applies "
-                  "is ambiguous");
+                  "registry entry satisfies more than one construction shape; which one "
+                  "applies is ambiguous");
+
+    /// Releases a shape-constructed queue through its own destroy().
+    struct ShapeDestroy {
+        void operator()(Q* q) const noexcept {
+            if constexpr (core::ShapeConstructed<Q>) Q::destroy(q);
+        }
+    };
 
 public:
-    explicit Instance(std::size_t capacity) {
+    explicit Instance(std::size_t capacity)
+        requires(!core::ShapeConstructed<Q>)
+    {
         if constexpr (core::BlockAllocated<Q>) block_.reset(Q::create(capacity));
         else owned_ = std::make_unique<Q>(capacity);
     }
 
+    /// For a queue sized by the thread shape as well as the capacity. See core::ShapeConstructed.
+    Instance(std::size_t capacity, std::size_t producers, std::size_t consumers)
+        requires core::ShapeConstructed<Q>
+        : shaped_{Q::create(capacity, producers, consumers)} {}
+
     Q& get() noexcept {
         if constexpr (core::BlockAllocated<Q>) return *block_;
+        else if constexpr (core::ShapeConstructed<Q>) return *shaped_;
         else return *owned_;
     }
 
@@ -301,6 +350,7 @@ public:
 private:
     mem::unique_block<Q> block_{};
     std::unique_ptr<Q> owned_{};
+    std::unique_ptr<Q, ShapeDestroy> shaped_{};
 };
 
 namespace detail {

@@ -42,7 +42,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-option(SANITIZE_ADDR      "Build tests with AddressSanitizer" OFF)
+option(SANITIZE_ADDR      "Build tests with AddressSanitizer" ON)
 option(SANITIZE_THREAD    "Build tests with ThreadSanitizer"  OFF)
 option(BUILD_BENCHMARK    "Build the throughput benchmark"    ON)
 option(BUILD_TESTING_MPMC "Build the unit tests"              ON)
@@ -246,6 +246,7 @@ if(BUILD_TESTING_MPMC)
         ProxyAccountingTest       # size() across threads that join and leave
         OptionsTest               # option packs, value options, and segment stats
         BucketTest                # the phased and cache index buckets
+        ShardBlockTest            # SPSC buffers, the all-to-all block, both strategies
     )
 
     foreach(test_name IN LISTS UNIT_TESTS)

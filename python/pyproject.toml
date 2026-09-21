@@ -14,14 +14,21 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=7.0"]
+# The plotting window. Qt draws the live view; matplotlib still draws every export.
+gui = ["PySide6-Essentials>=6.6", "pyqtgraph>=0.13"]
 
 [project.scripts]
 mpmc-run = "mpmc_bench.runner:main"
 mpmc-plot = "mpmc_bench.plotting.plots:main"
+mpmc-plot-ui = "mpmc_bench.qt.app:main"
+mpmc-plot-ui-tk = "mpmc_bench.gui.app:main"
 mpmc-topology = "mpmc_bench.topology.generator:main"
 
 [tool.setuptools.packages.find]
 include = ["mpmc_bench*"]
+
+[tool.setuptools.package-data]
+"mpmc_bench.qt" = ["icons/*.svg"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

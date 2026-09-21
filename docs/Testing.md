@@ -7,7 +7,7 @@ concurrency bugs in this tree.
 
 ## The suites
 
-Twelve GoogleTest binaries, registered in the `UNIT_TESTS` list in `CMakeLists.txt`. Adding a
+Thirteen GoogleTest binaries, registered in the `UNIT_TESTS` list in `CMakeLists.txt`. Adding a
 name there is all it takes; the file is `src/test/unit/<Name>.cpp`.
 
 | suite | pins down | threaded |
@@ -23,10 +23,16 @@ name there is all it takes; the file is `src/test/unit/<Name>.cpp`.
 | `ThreadRegistryTest` | the lock-free registry both reclamation sources rest on | ✓ |
 | `ThreadPinnerTest` | core placement and topology parsing, on any shape of machine | |
 | `ProxyAccountingTest` | what the proxy still knows after a thread has left | ✓ |
+| `ShardBlockTest` | the SPSC buffers, the all-to-all block's arena layout, both dispatch strategies' refusal contract, and the `ShardQueue` bridge | ✓ |
 | `ConcurrencyTest` | loss, duplication and per-producer FIFO across every registered queue | ✓✓ |
 
 `ConcurrencyTest` is the slow one — every registered implementation across five thread shapes,
 several minutes. Everything else finishes in well under a second.
+
+`ShardBlockTest` splits cleanly: `--gtest_filter='-Threaded*'` is the single-threaded half
+(protocol, layout, strategies, bridge) and finishes instantly; `--gtest_filter='Threaded*'` is
+loss / duplication / per-pair FIFO at seven `(P, C)` shapes under both strategies. The shard
+blocks are deliberately **not** in `ConcurrencyTest` -- see `registry::Shard` for why.
 
 ### Two suites carry more weight than their size suggests
 
@@ -333,7 +339,7 @@ Two binaries over the same harness, so they cannot drift in how they measure:
 ./build/mpmc_tune  --list                                 # 19 names
 
 # <name> <producers> <consumers> <items> <capacity> [pin] [prod_ticks amp] [cons_ticks amp]
-./build/benchmark u-faa 4 4 1000000 1024                  # one bare number: ops/sec
+./build/benchmark u-faa 4 4 1000000 1024                  # one bare number: items/sec
 ./build/mpmc_tune  u-faa-p0 4 4 1000000 1024 --metrics    # key=value lines
 ```
 
@@ -412,6 +418,14 @@ it opens a window; with it, writes a PNG and prints where.
 The y-axis defaults follow the kind: throughput divides by `1e6` and is labelled "Millions of
 ops/sec", the ratios do not. Override with `--scale` and `--ylabel` if you need to.
 
+**Items in the CSV, operations in the plot.** The binaries report *items* per second — each
+producer is handed a slice of the item count and the total is divided by wall time — but every
+item costs the queue one enqueue *and* one dequeue. The loader therefore multiplies every
+throughput column by `dataio.OPS_PER_ITEM` (= 2) on read, so a plotted figure is twice the
+number in the CSV. The standard deviation carries the same factor: the conversion rescales each
+underlying sample, so `sd(2X) = 2·sd(X)` and the error bars keep their true relative size.
+Ratios — `scalability`, `slot-efficiency` — are unchanged, because the factor cancels.
+
 #### Narrowing what is drawn
 
 `--list` prints the queues present in the CSV, which is the quickest way to see what a sweep
@@ -484,6 +498,208 @@ than guessed.
 `backoff-grid` recovers the patience value from the entry *name*, so it only works on names
 ending `-p<N>` — the `registry::Tuning` entries do (`u-faa-p0`, `u-hq-p1024`). It sorts them
 numerically, not lexically, or 1024 would come before 16.
+
+#### The plotting app
+
+The same plots, driven from a window instead of flags:
+
+```bash
+cd python
+pip install -e ".[gui]"                                      # PySide6 + pyqtgraph
+mpmc-plot-ui ../titanic/hq_validation/hq64_balanced.csv
+python -m mpmc_bench.qt ../titanic/hq_validation/*.csv       # no reinstall needed
+python -m mpmc_bench.qt --session figure.json                # reopen a saved figure
+```
+
+It uses the CLI's loader, so every number matches `mpmc-plot` (including the ×2 ops
+conversion). Three tabs on the left, the figure on the right, four tabs of readout underneath.
+
+##### Qt draws the view, matplotlib draws the file
+
+The window is **PySide6**, and the live chart is **pyqtgraph**. The earlier Tk window rendered a
+matplotlib figure to a bitmap and uploaded it on every change, which cost 650–960 ms a frame and
+made zoom and pan re-renders. Here the series are scene-graph items, so the interaction is free
+and a redraw is a property assignment.
+
+Exports did not change. **Save figure** still runs `model.save_figure` — the same matplotlib
+code, the same `PlotState`, the same publication-grade PNG/SVG/PDF — on a worker thread. The
+split is the point: an interactive view and a print figure want different things, and the old
+design paid the print price on every keystroke.
+
+Measured on the two HQ files, ten series across two plots:
+
+| edit | cost |
+| --- | --- |
+| colour, marker, line style, width | **12 ms** |
+| filter, metric, axis change (pandas + rebuild) | ~160 ms, off the UI thread |
+| zoom, pan, hover | free — no redraw at all |
+| first draw after loading | ~480 ms |
+
+Three things get it there, and each is a test: a cosmetic edit never re-uploads the point arrays
+(`test_the_chart_reuses_curves_across_a_restyle`); an unchanged style is not re-applied, because
+every pyqtgraph setter repaints; and of the three readout tables, only the one on screen is
+populated (`test_populates_the_visible_tab_only`) — filling three was 70 ms of every refresh.
+
+##### The three tabs
+
+**Data** — loaded files, titles, what to plot, the baseline, and the filters.
+**Series** — one row per series: visible, colour, name, marker, line style, width, plus the
+style library. **Axes** — which plot you are editing, then its labels, log scales, limits,
+ticks, legend placement and grid; plus the plot grid, the shared axes and the export size,
+which belong to the whole figure.
+
+##### Reading the numbers, not just the shape
+
+Four tabs under the chart, and a hover readout in the status bar naming the series, x, y and the
+error range of the nearest point.
+
+| tab | what it answers |
+| --- | --- |
+| **Table** | exactly what is plotted, one row per point, sortable; `Ctrl+K` → *Copy the table* pastes it into a spreadsheet |
+| **Ranking** | at every thread count: the winner, the runner-up and the margin between them |
+| **Summary** | per series: peak value, the x it peaks at, the final value, how many points |
+| **Notes** | split-line explanations, dropped baselines, and colours too close to tell apart |
+
+The table is also the **relief** the palette owes: three light-mode hues sit under 3:1 contrast,
+and the rule in `plotting/theme.py` is that they are allowed only where the values are also
+readable as text.
+
+##### Baseline mode
+
+`Data → Baseline` turns absolute throughput into a comparison, which is usually the real
+question:
+
+- **A series in each plot** — every line becomes a ratio (or a % difference) against one queue.
+  The baseline stays, flat at 1.0 or 0%, because a reader needs to see where the axis crosses.
+- **The same series in another plot** — the before/after comparison of two runs of the same
+  queues, one CSV against another.
+
+Points the baseline never measured are dropped rather than divided by something absent, and the
+note says how many. Error bars are converted with the values. The source data is untouched:
+switching back to *Absolute values* is exact, not a re-derivation.
+
+The baseline is **remembered**. It used to be overwritten the moment the chosen series was
+missing from a build — and switching metric can drop one for a single draw — so a round trip
+through another metric silently reset the comparison. Now the choice is kept, an unusable one
+falls back to absolute values *for that draw* and says so in Notes, and it round-trips through a
+saved session. It is also applied by `model.render()`, so a saved PNG shows the ratios the
+preview did rather than absolute values under a relative axis label.
+
+##### The style library
+
+A colour picked for `u-pscq` should be `u-pscq`'s colour in every figure, or two plots of one
+experiment cannot be read side by side. `Series → Style library` pins the current overrides
+**per queue** — the split is deliberately discarded, so a colour chosen while looking at size
+1024 applies to that implementation everywhere — and writes them to
+`$XDG_CONFIG_HOME/mpmc-bench/styles.json`.
+
+Precedence is lowest first: the theme's palette slot, then the library, then anything you have
+changed in this session. Pinning can therefore never silently overrule what is in front of you.
+
+##### Loaded files, and which of them are plotted
+
+Loading and plotting are separate. Every CSV you open stays parsed and cached; the tick box in
+the first column decides what is drawn. Tick one to see it alone, tick several for side-by-side
+plots sharing a y axis. Double-click, or **Only this**, switches in one step and costs nothing,
+because nothing is re-read. The last ticked file cannot be unticked.
+
+**"Normalise y across plots" means the union**, not one plot's. pyqtgraph's own view linking
+takes a single range, which drew a file peaking at 12 M ops/s entirely above its own axis when
+it sat beside one peaking at 1 M; the range is computed across every plot and applied to each,
+which is what matplotlib does on export. `test_shared_y_is_the_union_not_one_plot` holds it
+there.
+
+##### Filters: one value, or a comparison
+
+Every run parameter becomes a group of tick boxes with a **compare** switch, and the switch is
+what the boxes mean:
+
+| compare | what a second ticked value does |
+| --- | --- |
+| off (default) | nothing — it is a radio button. Ticking 4096 unticks 1024, which is what *switching* queue size should do. The last ticked value cannot be unticked, because an empty filter draws nothing and reads as a bug. |
+| on → **separate plots** | a plot per value, side by side: `size 1024`, `size 4096`, `size 16384`. The plot you were reading is still there. |
+| on → **same plot** | the lines **split** per value on one axes (`u-pscq (size 1024)`), which is right for a sweep and wrong for a comparison. |
+
+Separate plots is the default once compare is on, because "compare two sizes" nearly always
+means side by side. Comparing two parameters at once multiplies: two sizes and two pinnings is
+four plots, and the count is capped at `MAX_PLOTS` with a note rather than filling the window
+with strips.
+
+The parameter on the **x axis** is locked to *same plot* and says so: every value of it is the
+sweep, so one plot each would be one point each.
+
+A plot is therefore a *slot* — a file under a set of compared values — not a file. Everything
+per-plot is keyed by that (`<csv>|Size=4096`), so reordering the files does not move one plot's
+settings onto another.
+
+Which filters move together is read out of the data, not hardcoded: `A` links to `B` when every
+value of A appears beside exactly one value of B. In these files that finds producer delay ↔
+consumer delay and both → their amplitudes; each group says what it moves, and **Link related
+filters** turns it off. Load a 1:3 sweep beside a balanced one and the producers/consumers link
+disappears by itself, because 4 producers then sits beside two different consumer counts.
+
+##### Ticks
+
+X: automatic, every data value, every Nth data value, a fixed spacing, or hidden. Y: automatic,
+a fixed spacing, about N ticks, or hidden. The number box beside each is N or the spacing. A log
+x axis is ticked at the data values, labelled as the numbers themselves, rather than as powers
+of ten — matplotlib draws the export with a base-2 log axis and a plain formatter, and the
+preview has to agree with it.
+
+##### Editing one plot
+
+`Axes → Which plot` picks what the rest of the tab edits: **All plots**, or one of them.
+Clicking a plot on the chart selects it too — it gets an accent border — and opens this tab.
+Per plot: the title, the x and y labels, the log scales, the y limits, both tick specs, the grid
+and the legend placement. **Reset this plot** gives it back to the figure, and the line under
+the picker names what it currently overrides.
+
+Two settings cannot be per-plot while the axis is shared, and the app says so instead of
+ignoring you quietly: a y limit or a log y needs **Normalise y** off, and a log x needs
+**Normalise x** off. A shared axis has one range and one scale by definition.
+
+The legend is all-or-nothing: as soon as one plot asks for its own placement, the figure-wide
+legend goes and *only the plots that asked* get one. A figure legend beside a per-plot one
+lists every series twice, and repeating the same ten names beside every plot is wallpaper.
+
+##### Zoom, pan and the legend
+
+Wheel to zoom, drag to pan, **Reset view** (Ctrl+0) to fit — all free, since nothing is
+redrawn. The legend sits in its own column rather than on top of the data: inside the axes it
+covered the lines it was naming as soon as there were more than a handful of series, and with
+ten queues that is the normal case. Clicking a legend entry hides or shows that series.
+
+**Reset view** re-applies the configured limits, not just autorange. It used to leave the plots
+autoranging, which quietly dropped *start y at zero* and any y limit — the limit pass skipped
+its work because, from its point of view, nothing about the ranges had changed.
+
+`Y minimum` and `Y maximum` are in **the units on the axis** — the ones the table shows. The
+preview used to divide them by the metric's scale as well, so a limit of 5 flattened the chart
+while the export, which applies them as written, was right.
+
+##### Saving
+
+**Save figure…** (Ctrl+S) writes PNG, SVG or PDF at the size and DPI on the Axes tab, re-drawn
+by matplotlib at that size rather than scaled from the view, so the legend and layout suit the
+file. **Export data…** (Ctrl+E) writes the plotted values as CSV. Both run off the UI thread.
+
+##### Everything else
+
+**Save/Open session** (Ctrl+Shift+S / Ctrl+L) stores the whole figure as JSON — files, which are
+ticked, filters, names, colours, axes — and sessions written by the Tk version still load.
+**Ctrl+K** opens a command palette with every action in one searchable list, which is the
+keyboard route to the ones with no button. Files are re-read when they change on disk;
+**Ctrl+R** forces it.
+
+**Colour warnings.** A colour you pick is checked against the others on screen with the same
+measure as the palette validator (OKLab ΔE, with colour-blindness simulation), and the Notes tab
+names the pair that is too close. It warns, never blocks.
+
+##### The Tk window is still there
+
+`mpmc-plot-ui-tk` runs the previous window, and its `gui/` package and tests are untouched —
+`gui/model.py` is the shared headless core both front ends are built on, so the loader, filters,
+correlations, series building, styling and export have exactly one implementation.
 
 ### 7. Ad-hoc harnesses — the ones that actually found the bugs
 

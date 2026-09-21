@@ -39,7 +39,8 @@ template <typename T> using BenchSet = registry::Tuning<T>;
 #elif defined(MPMC_BENCH_CAS)
 template <typename T> using BenchSet = registry::CasCompare<T>;
 #else
-template <typename T> using BenchSet = registry::All<T>;
+/// The shard blocks ride along in the headline binary: one CSV, directly comparable rows.
+template <typename T> using BenchSet = meta::concat<registry::All<T>, registry::Shard<T>>;
 #endif
 
 /// Optional simulated per-operation work, so contention can be varied.
@@ -90,7 +91,7 @@ public:
 
     Benchmark(size_t producers, size_t consumers, uint64_t items, size_t capacity)
         : producers_{producers}, consumers_{consumers}, items_{items},
-          instance_{capacity} {
+          instance_{make_instance(capacity, producers, consumers)} {
         assert(producers_ != 0 && consumers_ != 0 && items_ != 0);
 #ifdef MPMC_BENCH_CAS
         // Read back from the constructed queue, not from the request: both algorithms round the
@@ -98,6 +99,15 @@ public:
         value_span_ = 2 * static_cast<uint64_t>(instance_.get().capacity());
         assert(value_span_ > 2 && "CAS comparison needs a ring with room for at least one value");
 #endif
+    }
+
+    /// A shard block is built for the thread shape it is about to run; everything else is not.
+    static registry::Instance<Queue> make_instance(size_t capacity, size_t producers,
+                                                   size_t consumers) {
+        if constexpr (core::ShapeConstructed<Queue>)
+            return registry::Instance<Queue>(capacity, producers, consumers);
+        else
+            return registry::Instance<Queue>(capacity);
     }
 
     void set_pinning() { pinning_ = true; }
@@ -224,7 +234,7 @@ void emit_metrics(B& bench, long double rate, uint64_t items) {
         if constexpr (requires {bench.queue().segment_capacity();}) {
             //compute waste and efficiency slots metrics
             const uint32_t linked = bench.queue().segments_linked();
-            const uint32_t wasted_total   = (linked * bench.queue().segment_capacity()) - items;
+            const uint32_t wasted_total   = (linked - (std::ceil(static_cast<float>(items) / bench.queue().segment_capacity()))) * bench.queue().segment_capacity();
             const float wasted_average = static_cast<float>(wasted_total) / linked;
             const float efficiency     = 1 - (wasted_average / static_cast<float>(bench.queue().segment_capacity()));
             std::cout   << "slot wasted (total)=" << wasted_total << "\n"

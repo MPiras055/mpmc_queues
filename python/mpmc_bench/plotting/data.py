@@ -11,7 +11,17 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["Filters", "load_results", "apply_filters", "REQUIRED_COLUMNS"]
+__all__ = ["Filters", "load_results", "apply_filters", "REQUIRED_COLUMNS", "OPS_PER_ITEM"]
+
+#: Queue operations per item transported: every item is enqueued once and dequeued once.
+#:
+#: The harness measures *items*: `src/bench/main.cpp` hands each producer a slice of `items_`
+#: and divides the total by wall time, so the CSV column counts transported items per second
+#: and reports half the work the queue actually performed. The plots are labelled ops/sec, so
+#: the conversion happens here -- once, on load, before any statistic is read -- rather than
+#: being repeated (and forgotten) in each plot function. The CSV itself is left alone: it is
+#: the raw record, and rewriting its meaning would make old and new files incomparable.
+OPS_PER_ITEM = 2
 
 REQUIRED_COLUMNS = [
     "Queue", "Producers", "Consumers", "Size", "Pinning",
@@ -81,6 +91,15 @@ def load_results(csv_path: str | Path) -> pd.DataFrame:
         ).fillna(0.0)
     else:
         df["Throughput_StdDev"] = 0.0
+
+    # Items/sec -> ops/sec. Applied to the deviation as well as the centre, because this is a
+    # linear rescaling of every underlying sample: sd(cX) = c*sd(X), and likewise for the
+    # median, min and max. Doubling the centre alone would draw error bars at half their real
+    # size. The variance would scale by c^2, but nothing here plots a variance.
+    for col in ("Throughput_Mean", "Throughput_Median", "Throughput_Min",
+                "Throughput_Max", "Throughput_StdDev"):
+        if col in df.columns:
+            df[col] = df[col] * OPS_PER_ITEM
 
     df["Total_Threads"] = df["Producers"] + df["Consumers"]
     return df

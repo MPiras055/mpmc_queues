@@ -9,6 +9,7 @@ do not depend on each other.
 | an object with co-allocated arrays | [Block construction](#block-construction) |
 | a tagging / linkage / admission policy, or an option | [A new policy](#a-new-policy) |
 | a place segments come from | [A new source](#a-new-source) |
+| a topology-aware block of SPSC buffers | [A new block](#a-new-block) |
 
 Every section ends with the same [checklist](#the-checklist). Skipping it is how the two worst
 bugs in this tree shipped.
@@ -420,6 +421,68 @@ Points that are easy to get wrong:
 - **If you spin while holding protection, bound it.** In `Pool` the spin runs while pinned, and
   two threads pinned a stage apart can each wait for the other; giving up is what drops the pin
   the other is blocked on. An unbounded spin there is a livelock, not a slowdown.
+
+---
+
+## A new block {#a-new-block}
+
+A block is not a queue. It is a fixed topology -- producer *i* only ever hands work to consumer
+*j* -- realised as a matrix of SPSC buffers, one per pair, so nothing on the hot path is a
+compare-and-swap. `block::AllToAll` is the one block type in the tree; the farm emitter and
+collector are the same block at `P = 1` and `C = 1`.
+
+### The pieces
+
+| header | provides |
+| --- | --- |
+| `spsc/Buffer.hpp` | `spsc::Ring` (circular, padded cells) and `spsc::Linear` (fills once, packed cells). One atomic word per cell, no shared index, `T{}` reserved as empty. |
+| `spsc/Unbounded.hpp` | a chunk list of `spsc::Linear`, freed without hazard pointers or epochs |
+| `block/Strategy.hpp` | `block::RoundRobin`, `block::Sticky` |
+| `block/AllToAll.hpp` | the arena, the matrix, `producer(i)` / `consumer(j)` handles |
+| `registry/Adapters.hpp` | `queue::ShardQueue<Block>`, the `core::Queue` bridge for the benchmark |
+
+```cpp
+auto* b = block::AllToAll<Item, block::Sticky>::create(/*total=*/4096, /*P=*/4, /*C=*/4);
+auto p = b->producer(i);   // once per thread; carries its row, its cursors, its strategy state
+p.enqueue(item);
+block::AllToAll<Item, block::Sticky>::destroy(b);
+```
+
+### A new buffer flavour
+
+Model the shape `spsc::Ring` and `spsc::Linear` share: `cell_type`, `static capacity_for(n)`, a
+`(capacity, cell_type*)` constructor that initialises cells it does **not** own, `put(w, v)` /
+`take(r, out)` on the caller's private cursor, `write_index()` / `read_index()`, `size()`,
+`capacity()`, `cells()`. Then it drops into `AllToAll<T, Strategy, YourBuffer>` unchanged.
+
+Decide padding by the access pattern, not by habit: cells two sides *chase each other* around
+are contended and get a line each; cells swept once in one direction share a line only at the
+frontier and stay packed. The arena's stride keeps different buffers apart either way.
+
+### A new strategy
+
+A struct with one static function, `run(cursor, degree, attempt)`. The obligation it must keep
+is not expressible as a concept:
+
+> Report full only when **all D** buffers refused; report empty only when all D were empty.
+
+A strategy that gives up early does not crash -- it makes the benchmark's final drain stop short,
+which is reported as lost items. `ShardBlockTest`'s
+`AColumnHoldingOneItemInItsLastBufferIsStillDequeued` is the test for it; run it against the new
+strategy by adding it to `StrategyTypes`.
+
+### Reaching the benchmark
+
+A block is built for a thread shape, so its adapter models `core::ShapeConstructed`:
+`Q::create(capacity, producers, consumers)` plus `Q::destroy`. `registry::Instance` and the
+benchmark pick that shape up on their own. Register it in `registry::Shard`, **not** `All`: the
+general suites assume any thread may call any operation, and that a consumer may stop early,
+neither of which a block can honour.
+
+@warning Do not derive a block from `mem::SingleBlock`. Its variadic `create(n, Args...)`
+answers `create(n)` for any arity, so the block would be classified as a plain block-allocated
+queue and built with the wrong arguments. Reuse `mem::LayoutBuilder` / `mem::Plan` / `mem::Blocks`
+and keep the compile-time `plan(...).valid(sizeof(...))` guard, as `AllToAll::create` does.
 
 ---
 

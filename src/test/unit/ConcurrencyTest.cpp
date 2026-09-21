@@ -146,8 +146,24 @@ void expect_clean(const Outcome& o, uint64_t expected, const char* what) {
 template <typename Q>
 class Mpmc : public ::testing::Test {};
 
-using AllTypes = registry::AsTypes<registry::All<Item>>::apply<::testing::Types>;
-TYPED_TEST_SUITE(Mpmc, AllTypes, registry::TestNames<registry::All<Item>>);
+/// Every registered queue, plus the tuning variants.
+///
+/// `registry::All` is the *benchmark* set, and `registry::Tuning` is deliberately not in it:
+/// the instrumented entries put atomics on the link path, so a throughput sweep must not see
+/// them. Correctness has no such conflict. A patience value, a forced-slow-path flag or a
+/// segment counter changes which interleavings a queue reaches, and `u-hq-p0` -- the
+/// no-backoff case the notes expect to behave pathologically -- exercises the burn-on-empty
+/// path far harder than the default entry does. Those are exactly the configurations worth
+/// holding to no-loss/no-duplication, so the suite concatenates both lists rather than
+/// widening `All` and dragging the counters into every benchmark run.
+///
+/// @note This roughly doubles the entry count, and each entry runs five shapes MPMC_REPEATS
+///       times. Use `tools/qtest --suite ConcurrencyTest <name>...` to run one.
+template <typename T>
+using UnderTest = meta::concat<registry::All<T>, registry::Tuning<T>>;
+
+using AllTypes = registry::AsTypes<UnderTest<Item>>::apply<::testing::Types>;
+TYPED_TEST_SUITE(Mpmc, AllTypes, registry::TestNames<UnderTest<Item>>);
 
 TYPED_TEST(Mpmc, NoLossNoDuplicationPerProducerFifo) {
     for (int attempt = 0; attempt < MPMC_REPEATS; ++attempt) {
